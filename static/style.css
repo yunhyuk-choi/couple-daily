@@ -23,7 +23,14 @@ body {
     "Apple SD Gothic Neo", Roboto, sans-serif;
   background: linear-gradient(180deg, var(--bg), var(--cream));
   color: var(--ink);
+  /* Robust full-height WITHOUT overflow: a flex column where the header keeps
+     its natural height and <main> fills the remaining space. No 100vh/100dvh on
+     inner content (which would ignore the header and force a phantom scroll on
+     short pages). dvh handles mobile browser chrome; vh is the fallback. */
   min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
   line-height: 1.6;
 }
 
@@ -89,7 +96,82 @@ body {
   box-shadow: 0 0 0 1px rgba(255, 107, 157, 0.35);
 }
 
-.wrap { max-width: 640px; margin: 0 auto; padding: 20px 16px 60px; }
+/* <main> fills the space left by the natural-height header, so short pages
+   never overflow the viewport (no phantom scrollbar); only long content
+   scrolls. width:100% + max-width + margin auto keeps it centered. */
+.wrap {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 20px 16px 60px;
+}
+/* leave room for the fixed bottom tab bar (+ iOS home-indicator safe area) so
+   content isn't hidden behind it and there's no accidental extra scroll */
+.wrap.has-tabbar { padding-bottom: calc(78px + env(safe-area-inset-bottom)); }
+
+/* fixed bottom tab bar (primary mobile nav) */
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  display: flex;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -4px 20px rgba(255, 107, 157, 0.08);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 4px 7px;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 700;
+  min-width: 0;
+}
+.tab-icon {
+  width: 26px;
+  height: 26px;
+  display: block;
+  opacity: 0.5;
+  filter: grayscale(0.55);
+  transition: opacity 0.15s, filter 0.15s;
+}
+.tab-label { font-size: 0.68rem; line-height: 1; }
+.tab.active { color: var(--pink); }
+.tab.active .tab-icon { opacity: 1; filter: none; }
+.tab-icon-wrap { position: relative; display: inline-flex; }
+.tab-dot {
+  position: absolute;
+  top: -1px;
+  right: -4px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--pink);
+  border: 2px solid #fff;
+}
+/* keep the bar phone-width and centered on wide desktop screens */
+@media (min-width: 560px) {
+  .tabbar {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    width: 520px;
+    max-width: calc(100% - 24px);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    bottom: 16px;
+    box-shadow: 0 8px 28px rgba(255, 107, 157, 0.18);
+  }
+}
 
 /* cards */
 .card {
@@ -351,6 +433,179 @@ code { background: var(--pink-soft); padding: 2px 6px; border-radius: 6px; font-
 .notif-empty .emoji { width: 48px; height: 48px; display: block; margin: 0 auto 12px; }
 
 /* memories (추억) gallery */
+/* upload drop-zone + multi-file preview */
+.upload-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 22px 16px;
+  border: 2px dashed var(--pink-soft);
+  border-radius: 14px;
+  background: #fffafc;
+  cursor: pointer;
+  text-align: center;
+  font-weight: 600;
+  transition: border-color 0.15s, background 0.15s;
+}
+.upload-drop:hover { border-color: var(--pink); background: #fff5f9; }
+.upload-drop .emoji { width: 34px; height: 34px; }
+.upload-drop-title { font-weight: 800; color: var(--pink); }
+.upload-preview { display: flex; flex-wrap: wrap; gap: 8px; }
+.preview-thumb {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--pink-soft);
+}
+
+/* floating action button (+) — the only entry to adding photos */
+.fab {
+  position: fixed;
+  right: 16px;
+  /* sit clear ABOVE the fixed bottom tab bar (+ iOS home-indicator) */
+  bottom: calc(80px + env(safe-area-inset-bottom));
+  z-index: 40;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: #fff;
+  /* frosted, pink-tinted glass */
+  background: rgba(255, 107, 157, 0.82);
+  backdrop-filter: blur(10px) saturate(1.3);
+  -webkit-backdrop-filter: blur(10px) saturate(1.3);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 8px 24px rgba(255, 107, 157, 0.42);
+  transition: transform 0.08s, filter 0.15s;
+}
+.fab:hover { filter: brightness(1.04); }
+.fab:active { transform: translateY(1px) scale(0.97); }
+.fab-plus { font-size: 2rem; font-weight: 300; line-height: 1; margin-top: -2px; }
+
+/* upload modal (bottom sheet, frosted glass) */
+body.modal-open { overflow: hidden; }
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(40, 22, 31, 0.45);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+.modal-sheet {
+  width: 100%;
+  max-width: 560px;
+  border-radius: 22px 22px 0 0;
+  padding: 18px 20px calc(24px + env(safe-area-inset-bottom));
+  animation: sheet-up 0.22s ease;
+}
+.modal-sheet.glass {
+  background: rgba(255, 248, 250, 0.86);
+  backdrop-filter: blur(22px) saturate(1.4);
+  -webkit-backdrop-filter: blur(22px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  box-shadow: 0 -12px 44px rgba(255, 107, 157, 0.2);
+}
+@keyframes sheet-up { from { transform: translateY(100%); } to { transform: none; } }
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.modal-head h2 { margin: 0; font-size: 1.15rem; }
+.modal-close {
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(61, 43, 52, 0.08);
+  color: var(--ink);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.modal-close:hover { background: rgba(61, 43, 52, 0.14); }
+/* on wider screens the sheet becomes a centered dialog + FAB clears the pill nav */
+@media (min-width: 560px) {
+  .modal-overlay { align-items: center; }
+  .modal-sheet { border-radius: 22px; max-width: 480px; }
+  .fab { bottom: calc(94px + env(safe-area-inset-bottom)); }
+}
+
+/* lightbox (확대 보기) */
+body.lb-open { overflow: hidden; }
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: calc(20px + env(safe-area-inset-top)) 16px calc(20px + env(safe-area-inset-bottom));
+  background: rgba(40, 22, 31, 0.92);
+  backdrop-filter: blur(4px);
+}
+.lb-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.lb-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.lb-meta {
+  width: 100%;
+  max-width: 560px;
+  text-align: center;
+  color: #fff;
+  flex: none;
+}
+.lb-caption { margin: 0 0 10px; font-size: 1.02rem; font-weight: 600; line-height: 1.5; }
+.lb-tags { justify-content: center; margin-bottom: 12px; }
+.lb-download { display: inline-block; }
+.lb-close {
+  position: absolute;
+  top: calc(10px + env(safe-area-inset-top));
+  right: 14px;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.lb-close:hover { background: rgba(255, 255, 255, 0.3); }
+
+.photo-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
 .memory-upload input[type="file"] {
   padding: 10px 12px;
   font-size: 0.9rem;
