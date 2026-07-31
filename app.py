@@ -35,7 +35,16 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
 import insights
-from models import Answer, Couple, DailyQuestion, Setting, User, db, run_startup_migrations
+from models import (
+    Answer,
+    Comment,
+    Couple,
+    DailyQuestion,
+    Setting,
+    User,
+    db,
+    run_startup_migrations,
+)
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +223,31 @@ def get_or_create_today_question(couple: Couple) -> DailyQuestion:
     return q
 
 
+def build_comment_thread(q: DailyQuestion):
+    """Return ``[(top_comment, [replies…]), …]`` for a question, oldest-first.
+
+    Comments form an adjacency list (``parent_id``). For a calm, readable UI we
+    render exactly two visual levels: each top-level comment, then a *flat* list
+    of all its descendants (any depth) at a single reply indent. Returns the
+    grouped thread plus the total comment count.
+    """
+    comments = q.ordered_comments()  # already oldest-first
+    by_id = {c.id: c for c in comments}
+    tops = []
+    replies_of = {}
+    for c in comments:
+        # Walk up to the top-level ancestor (guards against orphaned parents).
+        root = c
+        while root.parent_id and root.parent_id in by_id:
+            root = by_id[root.parent_id]
+        if root.id == c.id:
+            tops.append(c)
+        else:
+            replies_of.setdefault(root.id, []).append(c)
+    thread = [(t, replies_of.get(t.id, [])) for t in tops]
+    return thread, len(comments)
+
+
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
@@ -225,6 +259,25 @@ def _register_routes(app: Flask):
             "me": current_user(),
             "kakao_enabled": kakao_enabled(),
         }
+
+    @app.template_filter("timeago")
+    def _timeago(dt):
+        """Short Korean relative time. Comment timestamps are UTC (utcnow)."""
+        if not dt:
+            return ""
+        secs = (datetime.utcnow() - dt).total_seconds()
+        if secs < 60:
+            return "방금"
+        mins = int(secs // 60)
+        if mins < 60:
+            return f"{mins}분 전"
+        hours = int(mins // 60)
+        if hours < 24:
+            return f"{hours}시간 전"
+        days = int(hours // 24)
+        if days < 7:
+            return f"{days}일 전"
+        return dt.strftime("%Y.%m.%d")
 
     # ---- landing / dashboard ----
     @app.route("/")
@@ -255,6 +308,7 @@ def _register_routes(app: Flask):
         my_ans = q.answer_by(u.id)
         partner_ans = q.answer_by(partner.id) if partner else None
         revealed = q.both_answered
+        thread, comment_count = build_comment_thread(q) if revealed else ([], 0)
         return render_template(
             "dashboard.html",
             question=q,
@@ -263,6 +317,8 @@ def _register_routes(app: Flask):
             partner=partner,
             revealed=revealed,
             today=q.q_date,
+            thread=thread,
+            comment_count=comment_count,
         )
 
     # ---- auth ----
@@ -443,6 +499,14 @@ def _register_routes(app: Flask):
         nickname = (
             kprofile.get("nickname") or props.get("nickname") or "카카오 사용자"
         )[:60]
+        # Optional profile photo. Newer consent exposes it under
+        # kakao_account.profile.profile_image_url; older/simple scope puts it in
+        # properties.profile_image. Absent is fine — never crash on it.
+        profile_image_url = (
+            kprofile.get("profile_image_url") or props.get("profile_image") or None
+        )
+        if profile_image_url:
+            profile_image_url = str(profile_image_url)[:512]
 
         # ---- link-to-existing-account flow ------------------------------- #
         # A logged-in email user chose "connect Kakao" in settings. Attach this
@@ -460,6 +524,8 @@ def _register_routes(app: Flask):
                     flash("이 카카오 계정은 이미 다른 계정에 연결돼 있어.", "error")
                     return redirect(url_for("settings"))
                 me.kakao_id = kakao_id
+                if profile_image_url:
+                    me.profile_image_url = profile_image_url
                 db.session.commit()
                 flash(
                     "카카오 계정이 연결됐어! 이제 카카오로도 로그인할 수 있어.", "ok"
@@ -467,9 +533,12 @@ def _register_routes(app: Flask):
                 return redirect(url_for("settings"))
             # Link mode but somehow not logged in → fall through to normal login.
 
-        # Existing Kakao user → just log in.
+        # Existing Kakao user → just log in. Keep their photo current.
         user = User.query.filter_by(kakao_id=kakao_id).first()
         if user:
+            if profile_image_url and user.profile_image_url != profile_image_url:
+                user.profile_image_url = profile_image_url
+                db.session.commit()
             session.clear()
             session["user_id"] = user.id
             session.permanent = True
@@ -478,6 +547,7 @@ def _register_routes(app: Flask):
         # New Kakao user → needs to choose/join a couple space next.
         session["pending_kakao_id"] = kakao_id
         session["pending_kakao_nickname"] = nickname
+        session["pending_kakao_profile_image"] = profile_image_url
         return redirect(url_for("kakao_connect"))
 
     @app.route("/auth/kakao/connect", methods=["GET", "POST"])
@@ -486,6 +556,7 @@ def _register_routes(app: Flask):
             return redirect(url_for("index"))
         kakao_id = session.get("pending_kakao_id")
         nickname = session.get("pending_kakao_nickname")
+        profile_image_url = session.get("pending_kakao_profile_image")
         if not kakao_id:
             # No pending Kakao identity — start over.
             return redirect(url_for("login"))
@@ -495,6 +566,7 @@ def _register_routes(app: Flask):
             if User.query.filter_by(kakao_id=kakao_id).first():
                 session.pop("pending_kakao_id", None)
                 session.pop("pending_kakao_nickname", None)
+                session.pop("pending_kakao_profile_image", None)
                 flash("이미 연결된 카카오 계정이야. 다시 로그인해줘.", "error")
                 return redirect(url_for("login"))
 
@@ -515,6 +587,7 @@ def _register_routes(app: Flask):
                 )
             user = User(
                 kakao_id=kakao_id,
+                profile_image_url=profile_image_url,
                 display_name=display_name,
                 couple_id=couple.id,
                 is_admin=is_admin,
@@ -527,6 +600,7 @@ def _register_routes(app: Flask):
                 db.session.rollback()
                 flash("연결 중 문제가 생겼어. 다시 시도해줘.", "error")
                 return redirect(url_for("login"))
+            session.pop("pending_kakao_profile_image", None)
 
             session.clear()
             session["user_id"] = user.id
@@ -589,6 +663,51 @@ def _register_routes(app: Flask):
             db.session.rollback()
         return redirect(url_for("index"))
 
+    # ---- comments on a day's revealed answers ----
+    @app.route("/question/<int:qid>/comment", methods=["POST"])
+    @active_couple_required
+    def add_comment(qid):
+        u = current_user()
+        q = db.session.get(DailyQuestion, qid)
+        # Must be this couple's question, and only after both answered (reveal).
+        if q is None or q.couple_id != u.couple_id:
+            abort(404)
+        if not q.both_answered:
+            abort(403)
+
+        text = (request.form.get("text") or "").strip()[:1000]
+        parent_id_raw = request.form.get("parent_id")
+        parent = None
+        if parent_id_raw:
+            try:
+                parent = db.session.get(Comment, int(parent_id_raw))
+            except (TypeError, ValueError):
+                parent = None
+            # A reply's parent must be an existing comment on the SAME question.
+            if parent is None or parent.question_id != q.id:
+                abort(400)
+
+        if not text:
+            flash("댓글을 입력해줘.", "error")
+            return _redirect_after_comment(q)
+
+        db.session.add(
+            Comment(
+                question_id=q.id,
+                author_id=u.id,
+                parent_id=parent.id if parent else None,
+                text=text,
+            )
+        )
+        db.session.commit()
+        return _redirect_after_comment(q)
+
+    def _redirect_after_comment(q):
+        anchor = f"#c-q{q.id}"
+        if q.q_date == date.today():
+            return redirect(url_for("index") + anchor)
+        return redirect(url_for("history") + anchor)
+
     # ---- history ----
     @app.route("/history")
     @active_couple_required
@@ -604,13 +723,18 @@ def _register_routes(app: Flask):
         for q in qs:
             my = q.answer_by(u.id)
             pa = q.answer_by(partner.id) if partner else None
+            revealed = q.both_answered
+            thread, comment_count = build_comment_thread(q) if revealed else ([], 0)
             items.append(
                 {
+                    "qid": q.id,
                     "date": q.q_date,
                     "question": q.text,
-                    "revealed": q.both_answered,
+                    "revealed": revealed,
                     "mine": my.text if my else None,
-                    "partner": pa.text if (pa and q.both_answered) else None,
+                    "partner": pa.text if (pa and revealed) else None,
+                    "thread": thread,
+                    "comment_count": comment_count,
                 }
             )
         return render_template("history.html", items=items, partner=partner)
