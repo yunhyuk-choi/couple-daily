@@ -59,11 +59,17 @@
     </div>
   </div>
 
-  <!-- Qualitative: grounded in real answers via claude -p -->
+  <!-- Qualitative: grounded in real answers via claude -p (DB-cached) -->
   <div class="card insight-card">
     <div class="q-head">
       <img class="emoji" src="{{ url_for('static', filename='emoji/sparkles.svg') }}" alt="" />
       <span>이번 달, 두 사람의 이야기</span>
+      {% if qualitative and refreshing %}
+      {# Content exists AND a background refresh is running: keep showing the
+         OLD report (stale-while-revalidate) with a subtle, non-disruptive hint.
+         The auto-reload below swaps it to the fresh report when ready. #}
+      <span class="refresh-badge" title="새 답변을 반영해 다시 정리하고 있어. 준비되면 자동으로 바뀔게.">새 내용 반영 중…</span>
+      {% endif %}
     </div>
     {% if qualitative %}
       {% if qualitative.summary %}<p class="insight-summary">{{ qualitative.summary }}</p>{% endif %}
@@ -94,10 +100,12 @@
 {% endblock %}
 
 {% block scripts %}
-  {% if pending %}
-  {# While a report is being generated in the background, gently auto-reload so
-     the finished insight appears without the user manually refreshing. Only
-     rendered in the generating state. #}
+  {% if auto_refresh %}
+  {# A background (re)build is in flight — gently auto-reload so the display
+     swaps to the finished/refreshed insight without a manual reload. Rendered
+     both while building the first report (placeholder) and while refreshing
+     existing content in place (stale-while-revalidate). Not rendered once the
+     report is ready and idle. #}
   <script>
     setTimeout(function () { window.location.reload(); }, 12000);
   </script>
