@@ -44,6 +44,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
 import insights
+import onedrive
 from models import (
     Answer,
     Comment,
@@ -51,6 +52,7 @@ from models import (
     DailyQuestion,
     MonthlyReport,
     Notification,
+    Photo,
     PushSubscription,
     Setting,
     User,
@@ -544,6 +546,7 @@ def _register_routes(app: Flask):
             "me": me,
             "kakao_enabled": kakao_enabled(),
             "push_enabled": push_enabled(),
+            "onedrive_enabled": onedrive.onedrive_enabled(),
             "notif_unread": notif_unread,
         }
 
@@ -1091,6 +1094,128 @@ def _register_routes(app: Flask):
                 }
             )
         return render_template("history.html", items=items, partner=partner)
+
+    # ---- 추억 (memories): photos stored in OneDrive ----
+    _ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+    _MAX_PHOTO_BYTES = 15 * 1024 * 1024  # 15 MB
+
+    @app.route("/memories")
+    @active_couple_required
+    def memories():
+        """Gallery of the couple's photos (newest first) + an upload form.
+
+        When OneDrive isn't configured we do NOT crash — we render a friendly
+        "connect OneDrive" note and hide the upload form. Thumbnails use Graph's
+        short-lived direct download URL, fetched through a brief in-process cache
+        so a gallery of N photos doesn't trigger N refetches on every render.
+        """
+        u = current_user()
+        if not onedrive.onedrive_enabled():
+            return render_template(
+                "memories.html", enabled=False, reconnect=False, photos=[]
+            )
+
+        rows = (
+            Photo.query.filter_by(couple_id=u.couple_id)
+            .order_by(Photo.created_at.desc(), Photo.id.desc())
+            .all()
+        )
+        photos = []
+        reconnect = False
+        for p in rows:
+            url = None
+            try:
+                url = onedrive.get_download_url_cached(p.onedrive_item_id)
+            except onedrive.OneDriveError:
+                # One bad item (or a dead token) must not blank the whole page.
+                log.warning("could not get download url for photo %s", p.id)
+                if onedrive.reconnect_needed():
+                    reconnect = True
+            photos.append(
+                {
+                    "id": p.id,
+                    "url": url,
+                    "caption": p.caption,
+                    "original_name": p.original_name,
+                    "uploaded_by": p.uploaded_by,
+                    "created_at": p.created_at,
+                }
+            )
+        return render_template(
+            "memories.html", enabled=True, reconnect=reconnect, photos=photos
+        )
+
+    @app.route("/memories/upload", methods=["POST"])
+    @active_couple_required
+    def memories_upload():
+        u = current_user()
+        if not onedrive.onedrive_enabled():
+            flash("OneDrive 연결이 필요해.", "error")
+            return redirect(url_for("memories"))
+
+        file = request.files.get("photo")
+        if file is None or not file.filename:
+            flash("사진을 선택해줘.", "error")
+            return redirect(url_for("memories"))
+
+        # Validate it's an image by extension AND declared content-type.
+        ext = os.path.splitext(file.filename)[1].lower()
+        ctype = (file.mimetype or "").lower()
+        if ext not in _ALLOWED_IMAGE_EXTS and not ctype.startswith("image/"):
+            flash("이미지 파일만 올릴 수 있어.", "error")
+            return redirect(url_for("memories"))
+
+        data = file.read()
+        if not data:
+            flash("빈 파일이야. 다시 시도해줘.", "error")
+            return redirect(url_for("memories"))
+        if len(data) > _MAX_PHOTO_BYTES:
+            flash("사진은 15MB 이하로 올려줘.", "error")
+            return redirect(url_for("memories"))
+
+        try:
+            item_id, stored_name = onedrive.upload_photo(data, file.filename)
+        except onedrive.OneDriveError:
+            log.exception("OneDrive upload failed for couple %s", u.couple_id)
+            if onedrive.reconnect_needed():
+                flash("OneDrive 재연결이 필요해. 잠시 후 다시 시도해줘.", "error")
+            else:
+                flash("사진 업로드에 실패했어. 잠시 후 다시 시도해줘.", "error")
+            return redirect(url_for("memories"))
+
+        caption = (request.form.get("caption") or "").strip()[:1000] or None
+        photo = Photo(
+            couple_id=u.couple_id,
+            onedrive_item_id=item_id,
+            filename=stored_name[:255],           # the real name stored in OneDrive
+            original_name=file.filename[:255],    # the user's original filename
+            uploaded_by=u.id,
+            caption=caption,
+        )
+        db.session.add(photo)
+        db.session.commit()
+        flash("추억을 저장했어! 💖", "ok")
+        return redirect(url_for("memories"))
+
+    @app.route("/memories/<int:photo_id>/delete", methods=["POST"])
+    @active_couple_required
+    def memories_delete(photo_id):
+        u = current_user()
+        photo = db.session.get(Photo, photo_id)
+        # Only this couple's members may delete this couple's photo.
+        if photo is None or photo.couple_id != u.couple_id:
+            abort(404)
+        try:
+            onedrive.delete_photo(photo.onedrive_item_id)
+        except onedrive.OneDriveError:
+            # Remote delete failed — keep the row so we can retry; don't orphan.
+            log.exception("OneDrive delete failed for photo %s", photo.id)
+            flash("사진 삭제에 실패했어. 잠시 후 다시 시도해줘.", "error")
+            return redirect(url_for("memories"))
+        db.session.delete(photo)
+        db.session.commit()
+        flash("사진을 삭제했어.", "ok")
+        return redirect(url_for("memories"))
 
     # ---- monthly insight ----
     @app.route("/insight")

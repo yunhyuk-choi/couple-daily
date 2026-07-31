@@ -31,6 +31,11 @@
         <a href="{{ url_for('insight') }}" title="월간 인사이트">
           <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="인사이트" />
         </a>
+        {% if onedrive_enabled %}
+        <a href="{{ url_for('memories') }}" title="추억">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="추억" />
+        </a>
+        {% endif %}
         <a href="{{ url_for('notifications') }}" title="알림"
            class="bell-link{% if notif_unread %} has-unread{% endif %}">
           <img class="emoji" src="{{ url_for('static', filename='emoji/bell.svg') }}" alt="알림" />
