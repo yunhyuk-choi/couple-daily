@@ -9,6 +9,14 @@
   <h1>월간 관계 인사이트</h1>
 </div>
 
+{% if no_partner %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+    <h2>아직 파트너가 없어요</h2>
+    <p class="muted">파트너가 함께하면 이번 달 우리 이야기를 보여줄게요.</p>
+    <a class="btn primary" href="{{ url_for('index') }}">홈으로 돌아가기</a>
+  </div>
+{% else %}
 <div class="month-nav">
   <a class="btn ghost sm" href="{{ url_for('insight', year=prev[0], month=prev[1]) }}">← 이전 달</a>
   <span class="month-label">{{ stats.month_label }}</span>
@@ -78,5 +86,6 @@
       <p class="muted">이번 달 이야기를 정리하지 못했어 (AI 생성 일시 실패). 잠시 후 다시 열어봐.</p>
     {% endif %}
   </div>
+{% endif %}
 {% endif %}
 {% endblock %}

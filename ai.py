@@ -135,8 +135,11 @@ def generate_monthly_qualitative(month_label, name_a, name_b, qa_items):
     qa_items: list of {date, question, a, b} dicts.
     Returns a dict with keys: themes(list[str]), tone(str),
     divergent_question(str), summary(str), fun(str). Returns None on failure.
+
+    Defensive: if there is no partner yet (``name_b`` is falsy) there is no
+    two-person conversation to summarize, so return None instead of raising.
     """
-    if not qa_items:
+    if not qa_items or not name_a or not name_b:
         return None
 
     lines = []
