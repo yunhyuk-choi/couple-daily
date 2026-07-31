@@ -42,8 +42,17 @@
         <figure class="photo-card">
           <img class="photo-img" src="{{ url_for('memory_image', photo_id=p.id) }}"
                loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
-          {% if p.caption %}
-            <figcaption class="photo-caption">{{ p.caption }}</figcaption>
+          {% if p.caption_status == 'ready' and p.caption %}
+            <figcaption class="photo-caption">
+              {{ p.caption }}
+              {% if p.tags %}
+                <span class="photo-tags">
+                  {% for t in p.tags %}<span class="chip small">#{{ t }}</span>{% endfor %}
+                </span>
+              {% endif %}
+            </figcaption>
+          {% elif p.caption_status == 'pending' %}
+            <figcaption class="photo-caption photo-analyzing muted small">📝 분석 중…</figcaption>
           {% endif %}
           <form method="post" action="{{ url_for('memories_delete', photo_id=p.id) }}"
                 class="photo-delete"
@@ -55,4 +64,15 @@
     </div>
   {% endif %}
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {% if any_pending %}
+  {# At least one photo is still being captioned in the background — gently
+     auto-reload so its caption appears without a manual refresh. Same idea as
+     the insight page; only rendered while something is pending. #}
+  <script>
+    setTimeout(function () { window.location.reload(); }, 15000);
+  </script>
+  {% endif %}
 {% endblock %}
