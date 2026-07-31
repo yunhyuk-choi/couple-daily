@@ -18,6 +18,9 @@ import subprocess
 import sys
 
 CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
+# Vision (reading an image off disk) is markedly slower than a text prompt on
+# the 0.1-CPU free tier — give it generous headroom so it isn't killed mid-read.
+CAPTION_TIMEOUT = 180
 
 # Gentle fallbacks used only if the CLI is unavailable / errors out.
 FALLBACK_QUESTIONS = [
@@ -179,4 +182,45 @@ def generate_monthly_qualitative(month_label, name_a, name_b, qa_items):
         }
     except Exception as e:  # noqa: BLE001
         print(f"[ai] monthly insight generation failed: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Photo captioning via claude vision (reads an image file off disk)
+# ---------------------------------------------------------------------------
+def caption_image(image_path):
+    """Caption a local image file using `claude` vision. Returns a dict or None.
+
+    Passing a file path to ``claude -p`` makes it read + describe the image (the
+    CLI's own Read tool ingests the file), so we embed the temp image path in the
+    prompt and instruct strict-JSON output. This is a slow agent+vision pass, so
+    the caller MUST run it in a background thread — never on the request path.
+
+    Returns ``{"caption": <한국어 한 문장>, "tags": [<한국어 키워드>, ...]}`` on
+    success, or ``None`` on any failure/timeout/parse error (never raises).
+    """
+    if not image_path:
+        return None
+    prompt = (
+        f"다음 경로의 이미지 파일을 읽어서 무엇이 담겨 있는지 보고 답해줘: {image_path}\n\n"
+        "너는 연인 두 사람의 추억 사진첩을 정리하는 다정한 도우미야. 이 사진을 보고:\n"
+        "- caption: 사진에 실제로 보이는 것을 담은 자연스럽고 다정한 한국어 한 문장.\n"
+        "- tags: 사진에 실제로 보이는 사물/장면/색/글자 등을 나타내는 한국어 키워드 2~6개.\n"
+        "실제로 보이는 것만 근거로 해. 보이지 않는 걸 지어내지 마.\n\n"
+        "출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+        '{"caption": "...", "tags": ["...", "..."]}'
+    )
+    try:
+        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT)
+        data = _extract_json(raw)
+        caption = (data.get("caption") or "").strip()
+        raw_tags = data.get("tags") or []
+        if not isinstance(raw_tags, list):
+            raw_tags = []
+        tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        if not caption:
+            raise ValueError("empty caption field")
+        return {"caption": caption, "tags": tags}
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] image captioning failed: {e}", file=sys.stderr)
         return None
