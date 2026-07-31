@@ -24,7 +24,19 @@
   {% if me.couple %}
   <p class="muted small">초대 코드: <code>{{ me.couple.invite_code }}</code></p>
   {% endif %}
-  <form method="post" action="{{ url_for('logout') }}">
+
+  {% if me.kakao_id %}
+  <p class="muted small">✓ 카카오 연결됨</p>
+  {% if me.email %}
+  <form method="post" action="{{ url_for('kakao_unlink') }}" class="stack-sm">
+    <button class="btn ghost" type="submit">카카오 연결 해제</button>
+  </form>
+  {% endif %}
+  {% elif kakao_enabled %}
+  <a class="btn kakao" href="{{ url_for('kakao_link') }}">카카오 계정 연결하기</a>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('logout') }}" class="stack-sm">
     <button class="btn ghost" type="submit">로그아웃</button>
   </form>
 </div>
