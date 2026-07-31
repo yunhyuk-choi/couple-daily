@@ -1217,6 +1217,7 @@ def _register_routes(app: Flask):
     # ---- 추억 (memories): photos stored in OneDrive ----
     _ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
     _MAX_PHOTO_BYTES = 15 * 1024 * 1024  # 15 MB
+    _MAX_UPLOAD_BATCH = 20               # cap files per bulk upload request
     _EXT_CONTENT_TYPES = {
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
         ".gif": "image/gif", ".webp": "image/webp",
@@ -1226,6 +1227,21 @@ def _register_routes(app: Flask):
     def _content_type_for(name):
         ext = os.path.splitext(name or "")[1].lower()
         return _EXT_CONTENT_TYPES.get(ext, "image/jpeg")
+
+    def _attachment_disposition(name):
+        """Build a Content-Disposition: attachment header that survives non-ASCII
+        (Korean) filenames. Provides an ASCII fallback plus RFC 5987 ``filename*``
+        so browsers download with the user's original name."""
+        from urllib.parse import quote
+
+        safe = name or "photo.jpg"
+        # ASCII fallback: strip quotes/backslashes and drop non-latin1 chars.
+        ascii_name = safe.replace('"', "").replace("\\", "")
+        ascii_name = ascii_name.encode("ascii", "ignore").decode("ascii") or "photo.jpg"
+        return (
+            f"attachment; filename=\"{ascii_name}\"; "
+            f"filename*=UTF-8''{quote(safe)}"
+        )
 
     @app.route("/memories")
     @active_couple_required
@@ -1300,6 +1316,41 @@ def _register_routes(app: Flask):
             ctype = _content_type_for(photo.filename or photo.original_name)
         resp = app.response_class(data, mimetype=ctype)
         resp.headers["Cache-Control"] = "private, max-age=3600"
+        # ?download=1 → force a browser download of the ORIGINAL file bytes with
+        # the user's original filename (the lightbox 다운로드 button uses this).
+        if request.args.get("download"):
+            resp.headers["Content-Disposition"] = _attachment_disposition(
+                photo.original_name or photo.filename or f"photo-{photo.id}.jpg"
+            )
+        return resp
+
+    @app.route("/memories/<int:photo_id>/thumb")
+    @active_couple_required
+    def memory_thumb(photo_id):
+        """Fast gallery thumbnail: stream a SMALL OneDrive-rendered thumbnail.
+
+        Serves ``get_thumbnail`` (a few-KB image) instead of proxying the full
+        original, so the grid loads quickly on the free tier. Falls back to the
+        full-res ``memory_image`` proxy when a thumbnail isn't available for the
+        item yet. Cached for a day in the browser. 404 unless the photo belongs
+        to the requester's couple.
+        """
+        u = current_user()
+        photo = db.session.get(Photo, photo_id)
+        if photo is None or photo.couple_id != u.couple_id:
+            abort(404)
+        try:
+            data, ctype = onedrive.get_thumbnail(photo.onedrive_item_id, size="medium")
+        except onedrive.OneDriveError:
+            log.exception("could not fetch thumbnail for photo %s", photo.id)
+            data, ctype = None, None
+        if data is None:
+            # No thumbnail (yet) → fall back to the full-res proxy.
+            return redirect(url_for("memory_image", photo_id=photo.id))
+        if not ctype or not ctype.startswith("image/"):
+            ctype = "image/jpeg"
+        resp = app.response_class(data, mimetype=ctype)
+        resp.headers["Cache-Control"] = "private, max-age=86400"
         return resp
 
     @app.route("/memories/upload", methods=["POST"])
@@ -1310,68 +1361,91 @@ def _register_routes(app: Flask):
             flash("OneDrive 연결이 필요해.", "error")
             return redirect(url_for("memories"))
 
-        file = request.files.get("photo")
-        if file is None or not file.filename:
+        # Bulk-capable: the form posts name="photos" (multiple). Fall back to the
+        # legacy single name="photo" so an old cached form still works.
+        files = request.files.getlist("photos") or request.files.getlist("photo")
+        files = [f for f in files if f and f.filename]
+        if not files:
             flash("사진을 선택해줘.", "error")
             return redirect(url_for("memories"))
-
-        # Validate it's an image by extension AND declared content-type.
-        ext = os.path.splitext(file.filename)[1].lower()
-        ctype = (file.mimetype or "").lower()
-        if ext not in _ALLOWED_IMAGE_EXTS and not ctype.startswith("image/"):
-            flash("이미지 파일만 올릴 수 있어.", "error")
+        if len(files) > _MAX_UPLOAD_BATCH:
+            flash(f"한 번에 최대 {_MAX_UPLOAD_BATCH}장까지 올릴 수 있어.", "error")
             return redirect(url_for("memories"))
 
-        data = file.read()
-        if not data:
-            flash("빈 파일이야. 다시 시도해줘.", "error")
-            return redirect(url_for("memories"))
-        if len(data) > _MAX_PHOTO_BYTES:
-            flash("사진은 15MB 이하로 올려줘.", "error")
-            return redirect(url_for("memories"))
+        # A manually typed caption only makes sense for a single photo; when a
+        # batch is uploaded we ignore it and auto-caption each one instead.
+        manual_caption = (request.form.get("caption") or "").strip()[:1000] or None
+        if len(files) > 1:
+            manual_caption = None
 
-        try:
-            item_id, stored_name = onedrive.upload_photo(data, file.filename)
-        except onedrive.OneDriveError:
-            log.exception("OneDrive upload failed for couple %s", u.couple_id)
-            if onedrive.reconnect_needed():
-                flash("OneDrive 재연결이 필요해. 잠시 후 다시 시도해줘.", "error")
-            else:
-                flash("사진 업로드에 실패했어. 잠시 후 다시 시도해줘.", "error")
-            return redirect(url_for("memories"))
+        saved_ids = []          # rows that need background captioning
+        saved = 0
+        skipped = 0             # invalid / empty / too-big files
+        failed = 0              # OneDrive upload errors
+        for file in files:
+            # Validate it's an image by extension AND declared content-type.
+            ext = os.path.splitext(file.filename)[1].lower()
+            ctype = (file.mimetype or "").lower()
+            if ext not in _ALLOWED_IMAGE_EXTS and not ctype.startswith("image/"):
+                skipped += 1
+                continue
+            data = file.read()
+            if not data or len(data) > _MAX_PHOTO_BYTES:
+                skipped += 1
+                continue
+            try:
+                item_id, stored_name = onedrive.upload_photo(data, file.filename)
+            except onedrive.OneDriveError:
+                log.exception("OneDrive upload failed for couple %s", u.couple_id)
+                failed += 1
+                continue
 
-        # A manually typed caption wins and is treated as final ('ready', no
-        # auto-caption clobbering it). With no manual caption the row starts
-        # 'pending' and a background thread captions it via claude vision.
-        caption = (request.form.get("caption") or "").strip()[:1000] or None
-        photo = Photo(
-            couple_id=u.couple_id,
-            onedrive_item_id=item_id,
-            filename=stored_name[:255],           # the real name stored in OneDrive
-            original_name=file.filename[:255],    # the user's original filename
-            uploaded_by=u.id,
-            caption=caption,
-            caption_status="ready" if caption else "pending",
-        )
-        db.session.add(photo)
-        db.session.commit()
+            # A manual caption is treated as final ('ready'); otherwise the row
+            # starts 'pending' and a background thread captions it via claude.
+            caption = manual_caption
+            photo = Photo(
+                couple_id=u.couple_id,
+                onedrive_item_id=item_id,
+                filename=stored_name[:255],           # real name stored in OneDrive
+                original_name=file.filename[:255],    # the user's original filename
+                uploaded_by=u.id,
+                caption=caption,
+                caption_status="ready" if caption else "pending",
+            )
+            db.session.add(photo)
+            # Commit per photo so one later failure can't lose earlier successes.
+            db.session.commit()
+            saved += 1
+            if caption is None:
+                saved_ids.append(photo.id)
 
-        # Fire-and-forget auto-captioning. The HTTP response returns IMMEDIATELY
-        # after the OneDrive PUT + DB insert — it NEVER waits on the slow vision
-        # pass (CLAUDE.md: no synchronous AI on the request path).
-        if caption is None:
+        # Fire-and-forget auto-captioning for each new photo. The HTTP response
+        # returns after the OneDrive PUTs + DB inserts — it NEVER waits on the
+        # slow vision pass (CLAUDE.md: no synchronous AI on the request path).
+        for pid in saved_ids:
             try:
                 threading.Thread(
                     target=caption_photo,
-                    args=(current_app._get_current_object(), photo.id),
+                    args=(current_app._get_current_object(), pid),
                     daemon=True,
                 ).start()
             except Exception:  # noqa: BLE001 — captioning is best-effort
-                log.exception(
-                    "failed to spawn caption thread for photo %s", photo.id
-                )
+                log.exception("failed to spawn caption thread for photo %s", pid)
 
-        flash("추억을 저장했어! 💖", "ok")
+        # One honest flash summarizing the batch outcome.
+        if saved and not (skipped or failed):
+            flash(
+                f"추억 {saved}장을 저장했어! 💖" if saved > 1 else "추억을 저장했어! 💖",
+                "ok",
+            )
+        elif saved:
+            flash(f"{saved}장 저장했어. {skipped + failed}장은 올리지 못했어.", "ok")
+        elif failed and onedrive.reconnect_needed():
+            flash("OneDrive 재연결이 필요해. 잠시 후 다시 시도해줘.", "error")
+        elif failed:
+            flash("사진 업로드에 실패했어. 잠시 후 다시 시도해줘.", "error")
+        else:
+            flash("이미지 파일만 15MB 이하로 올릴 수 있어.", "error")
         return redirect(url_for("memories"))
 
     @app.route("/memories/<int:photo_id>/delete", methods=["POST"])

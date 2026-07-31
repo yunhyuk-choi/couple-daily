@@ -16,32 +16,25 @@
     <div class="flash flash-error">OneDrive 재연결이 필요해. 사진이 잠시 안 보일 수 있어.</div>
   {% endif %}
 
-  <div class="card">
-    <form class="stack memory-upload" method="post"
-          action="{{ url_for('memories_upload') }}" enctype="multipart/form-data">
-      <label>사진
-        <input type="file" name="photo" accept="image/*" required />
-      </label>
-      <label>한마디 <span class="muted small">(선택)</span>
-        <input type="text" name="caption" maxlength="1000"
-               placeholder="이 순간을 한 줄로 남겨봐" />
-      </label>
-      <button class="btn primary" type="submit">추억 올리기</button>
-      <p class="muted small">이미지 파일, 15MB 이하</p>
-    </form>
-  </div>
-
   {% if not photos %}
     <div class="card center-card">
       <img class="emoji hero" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
-      <p class="muted">아직 올린 사진이 없어. 첫 추억을 남겨보자!</p>
+      <p class="muted">아직 올린 사진이 없어.<br />오른쪽 아래 <strong>+</strong> 버튼으로 첫 추억을 남겨보자!</p>
     </div>
   {% else %}
     <div class="photo-grid">
       {% for p in photos %}
         <figure class="photo-card">
-          <img class="photo-img" src="{{ url_for('memory_image', photo_id=p.id) }}"
-               loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+          <button type="button" class="photo-open"
+                  data-id="{{ p.id }}"
+                  data-full="{{ url_for('memory_image', photo_id=p.id) }}"
+                  data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
+                  data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
+                  data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
+                  aria-label="사진 확대해서 보기">
+            <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
+                 loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+          </button>
           {% if p.caption_status == 'ready' and p.caption %}
             <figcaption class="photo-caption">
               {{ p.caption }}
@@ -62,17 +55,228 @@
         </figure>
       {% endfor %}
     </div>
+
+    {# Lightbox overlay — shows the ORIGINAL full-res image, caption + tags,
+       and a download(original) button. The full image is preloaded (see JS)
+       so tapping a thumbnail opens it instantly. #}
+    <div class="lightbox" id="lightbox" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="사진 확대 보기">
+      <button type="button" class="lb-close" id="lb-close" aria-label="닫기">×</button>
+      <div class="lb-stage">
+        <img class="lb-img" id="lb-img" alt="추억 사진" />
+      </div>
+      <div class="lb-meta">
+        <p class="lb-caption" id="lb-caption" hidden></p>
+        <div class="lb-tags themes" id="lb-tags" hidden></div>
+        <a class="btn primary lb-download" id="lb-download" href="#" download>다운로드</a>
+      </div>
+    </div>
   {% endif %}
+
+  {# Floating action button — the only entry point to adding photos. Opens the
+     upload modal so the page itself stays a clean grid. #}
+  <button type="button" class="fab glass" id="fab-upload"
+          aria-label="사진 추가" aria-haspopup="dialog">
+    <span class="fab-plus" aria-hidden="true">+</span>
+  </button>
+
+  {# Upload modal (frosted glass) — multi-file picker + preview strip + submit. #}
+  <div class="modal-overlay" id="upload-modal" hidden aria-hidden="true"
+       role="dialog" aria-modal="true" aria-label="추억 올리기">
+    <div class="modal-sheet glass">
+      <div class="modal-head">
+        <h2>추억 올리기</h2>
+        <button type="button" class="modal-close" id="upload-cancel" aria-label="닫기">×</button>
+      </div>
+      <form class="stack memory-upload" id="upload-form" method="post"
+            action="{{ url_for('memories_upload') }}" enctype="multipart/form-data">
+        <label class="upload-drop" for="photo-input">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+          <span class="upload-drop-title" id="upload-drop-title">사진 고르기</span>
+          <span class="muted small">여러 장 한 번에 · 이미지 15MB 이하</span>
+          <input id="photo-input" type="file" name="photos" accept="image/*" multiple hidden />
+        </label>
+        <div class="upload-preview" id="upload-preview" hidden></div>
+        <label class="caption-field" id="caption-field">한마디 <span class="muted small">(선택)</span>
+          <input type="text" name="caption" maxlength="1000"
+                 placeholder="이 순간을 한 줄로 남겨봐" />
+        </label>
+        <button class="btn primary" id="upload-submit" type="submit" disabled>업로드</button>
+      </form>
+    </div>
+  </div>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
-  {% if any_pending %}
-  {# At least one photo is still being captioned in the background — gently
-     auto-reload so its caption appears without a manual refresh. Same idea as
-     the insight page; only rendered while something is pending. #}
-  <script>
-    setTimeout(function () { window.location.reload(); }, 15000);
-  </script>
-  {% endif %}
+<script>
+(function () {
+  // ---- FAB opens the upload modal ----------------------------------------- #
+  var fab = document.getElementById("fab-upload");
+  var modal = document.getElementById("upload-modal");
+  if (fab && modal) {
+    var cancel = document.getElementById("upload-cancel");
+    function openModal() {
+      modal.hidden = false;
+      modal.setAttribute("aria-hidden", "false");
+      document.body.classList.add("modal-open");
+    }
+    function closeModal() {
+      modal.hidden = true;
+      modal.setAttribute("aria-hidden", "true");
+      document.body.classList.remove("modal-open");
+    }
+    fab.addEventListener("click", openModal);
+    cancel.addEventListener("click", closeModal);
+    modal.addEventListener("click", function (e) {
+      if (e.target === modal) closeModal();  // backdrop tap
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !modal.hidden) closeModal();
+    });
+  }
+
+  // ---- upload: multi-file preview + submit state -------------------------- #
+  var input = document.getElementById("photo-input");
+  if (input) {
+    var preview = document.getElementById("upload-preview");
+    var submit = document.getElementById("upload-submit");
+    var form = document.getElementById("upload-form");
+    var dropTitle = document.getElementById("upload-drop-title");
+    var captionField = document.getElementById("caption-field");
+
+    input.addEventListener("change", function () {
+      preview.innerHTML = "";
+      var files = Array.prototype.slice.call(input.files || []);
+      var imgs = files.filter(function (f) { return f.type.indexOf("image/") === 0; });
+      if (!imgs.length) {
+        preview.hidden = true;
+        submit.disabled = true;
+        submit.textContent = "업로드";
+        dropTitle.textContent = "사진 고르기";
+        if (captionField) captionField.hidden = false;
+        return;
+      }
+      imgs.forEach(function (f) {
+        var img = document.createElement("img");
+        img.className = "preview-thumb";
+        var url = URL.createObjectURL(f);
+        img.src = url;
+        img.onload = function () { URL.revokeObjectURL(url); };
+        preview.appendChild(img);
+      });
+      preview.hidden = false;
+      submit.disabled = false;
+      submit.textContent = imgs.length > 1 ? imgs.length + "장 업로드" : "업로드";
+      dropTitle.textContent = imgs.length + "장 선택됨 · 다시 고르기";
+      // A single manual caption only applies to a single photo.
+      if (captionField) captionField.hidden = imgs.length > 1;
+    });
+
+    form.addEventListener("submit", function () {
+      submit.disabled = true;
+      submit.textContent = "업로드 중…";
+    });
+  }
+
+  // ---- gallery: preload full-res + lightbox ------------------------------- #
+  var openers = Array.prototype.slice.call(document.querySelectorAll(".photo-open"));
+  var lb = document.getElementById("lightbox");
+  if (openers.length && lb) {
+    var lbImg = document.getElementById("lb-img");
+    var lbCap = document.getElementById("lb-caption");
+    var lbTags = document.getElementById("lb-tags");
+    var lbDownload = document.getElementById("lb-download");
+    var lbClose = document.getElementById("lb-close");
+    var preloaded = {}; // full url -> Image (keeps decoded bytes warm)
+
+    function preload(url) {
+      if (!url || preloaded[url]) return;
+      var im = new Image();
+      im.src = url;
+      preloaded[url] = im;
+    }
+
+    // Near-viewport prefetch of each ORIGINAL so tapping opens instantly, without
+    // eagerly loading every full image at once.
+    if ("IntersectionObserver" in window) {
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) {
+            preload(e.target.getAttribute("data-full"));
+            io.unobserve(e.target);
+          }
+        });
+      }, { rootMargin: "300px" });
+      openers.forEach(function (el) { io.observe(el); });
+    } else {
+      openers.forEach(function (el) { preload(el.getAttribute("data-full")); });
+    }
+    // Belt & suspenders: also prefetch on pointer-down (instant on tap).
+    openers.forEach(function (el) {
+      el.addEventListener("pointerdown", function () {
+        preload(el.getAttribute("data-full"));
+      });
+    });
+
+    function neighbors(idx) {
+      [idx - 1, idx + 1].forEach(function (j) {
+        if (j >= 0 && j < openers.length) preload(openers[j].getAttribute("data-full"));
+      });
+    }
+
+    function openAt(idx) {
+      var el = openers[idx];
+      lbImg.src = el.getAttribute("data-full");
+      var cap = el.getAttribute("data-caption") || "";
+      if (cap) { lbCap.textContent = cap; lbCap.hidden = false; }
+      else { lbCap.hidden = true; }
+      var tags = (el.getAttribute("data-tags") || "").split(",").filter(Boolean);
+      lbTags.innerHTML = "";
+      if (tags.length) {
+        tags.forEach(function (t) {
+          var s = document.createElement("span");
+          s.className = "chip small";
+          s.textContent = "#" + t;
+          lbTags.appendChild(s);
+        });
+        lbTags.hidden = false;
+      } else {
+        lbTags.hidden = true;
+      }
+      lbDownload.href = el.getAttribute("data-download");
+      lb.hidden = false;
+      lb.setAttribute("aria-hidden", "false");
+      document.body.classList.add("lb-open");
+      neighbors(idx);
+    }
+
+    function close() {
+      lb.hidden = true;
+      lb.setAttribute("aria-hidden", "true");
+      document.body.classList.remove("lb-open");
+      lbImg.removeAttribute("src");
+    }
+
+    openers.forEach(function (el, idx) {
+      el.addEventListener("click", function () { openAt(idx); });
+    });
+    lbClose.addEventListener("click", close);
+    lb.addEventListener("click", function (e) {
+      if (e.target === lb || e.target.classList.contains("lb-stage")) close();
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !lb.hidden) close();
+    });
+  }
+})();
+</script>
+
+{% if any_pending %}
+{# At least one photo is still being captioned in the background — gently
+   auto-reload so its caption appears without a manual refresh. Same idea as
+   the insight page; only rendered while something is pending. #}
+<script>
+  setTimeout(function () { window.location.reload(); }, 15000);
+</script>
+{% endif %}
 {% endblock %}

@@ -15,40 +15,14 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
-    <header class="topbar">
+    <header class="topbar slim">
       <a class="brand" href="{{ url_for('index') }}">
         <img class="emoji brand-emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
         <span>{{ app_name }}</span>
       </a>
-      {% if me and me.is_active_couple %}
-      <nav class="nav">
-        <a href="{{ url_for('index') }}" title="오늘의 질문">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="오늘" />
-        </a>
-        <a href="{{ url_for('history') }}" title="지난 질문">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="기록" />
-        </a>
-        <a href="{{ url_for('insight') }}" title="월간 인사이트">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="인사이트" />
-        </a>
-        {% if onedrive_enabled %}
-        <a href="{{ url_for('memories') }}" title="추억">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="추억" />
-        </a>
-        {% endif %}
-        <a href="{{ url_for('notifications') }}" title="알림"
-           class="bell-link{% if notif_unread %} has-unread{% endif %}">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/bell.svg') }}" alt="알림" />
-          {% if notif_unread %}<span class="bell-dot" aria-hidden="true"></span>{% endif %}
-        </a>
-        <a href="{{ url_for('settings') }}" title="설정">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="설정" />
-        </a>
-      </nav>
-      {% endif %}
     </header>
 
-    <main class="wrap">
+    <main class="wrap{% if me and me.is_active_couple %} has-tabbar{% endif %}">
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% for category, message in messages %}
           <div class="flash flash-{{ category }}">{{ message }}</div>
@@ -56,6 +30,35 @@
       {% endwith %}
       {% block content %}{% endblock %}
     </main>
+
+    {% if me and me.is_active_couple %}
+    {% set ep = request.endpoint %}
+    <nav class="tabbar" aria-label="주요 메뉴">
+      <a class="tab{% if ep == 'index' %} active{% endif %}" href="{{ url_for('index') }}">
+        <img class="tab-icon" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="" />
+        <span class="tab-label">홈</span>
+      </a>
+      <a class="tab{% if ep == 'memories' %} active{% endif %}" href="{{ url_for('memories') }}">
+        <img class="tab-icon" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+        <span class="tab-label">추억</span>
+      </a>
+      <a class="tab{% if ep == 'insight' %} active{% endif %}" href="{{ url_for('insight') }}">
+        <img class="tab-icon" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="" />
+        <span class="tab-label">인사이트</span>
+      </a>
+      <a class="tab{% if ep == 'notifications' %} active{% endif %}" href="{{ url_for('notifications') }}">
+        <span class="tab-icon-wrap">
+          <img class="tab-icon" src="{{ url_for('static', filename='emoji/bell.svg') }}" alt="" />
+          {% if notif_unread %}<span class="tab-dot" aria-hidden="true"></span>{% endif %}
+        </span>
+        <span class="tab-label">알림</span>
+      </a>
+      <a class="tab{% if ep == 'settings' %} active{% endif %}" href="{{ url_for('settings') }}">
+        <img class="tab-icon" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="" />
+        <span class="tab-label">설정</span>
+      </a>
+    </nav>
+    {% endif %}
 
     <script>
       // Register the service worker (offline shell + installability).
