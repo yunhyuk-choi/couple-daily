@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import string
+import tempfile
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -525,6 +526,124 @@ def _kick_monthly_report(couple_id, year, month):
         if not spawned:
             with _generating_lock:
                 _generating.discard(key)
+
+
+# --------------------------------------------------------------------------- #
+# Photo captioning (claude vision) — background, never on the request path
+# --------------------------------------------------------------------------- #
+# Same discipline as the monthly report: a slow `claude` subprocess (here a
+# vision pass) must run off the request thread with its own app context + fresh
+# DB session, catch everything, and never escape the thread. Captioning is
+# per-photo (each photo is unique), so a simple in-process guard set keyed by
+# photo_id is enough to stop a double-spawn for the same photo.
+_captioning_lock = threading.Lock()
+_captioning: set[int] = set()
+
+# Image extensions claude's Read tool recognizes; used to give the temp file the
+# right suffix so vision actually ingests it. Falls back to .jpg.
+_CAPTION_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+
+
+def _caption_tmp_dir():
+    """A scratch dir for vision temp images, INSIDE the process working dir.
+
+    Load-bearing: `claude` sandboxes its file reads to its working directory
+    (the subprocess cwd == the app's cwd). A temp image written to the SYSTEM
+    temp dir (%TEMP% / /tmp) is outside that sandbox and claude refuses to read
+    it — verified. Writing under cwd keeps the image inside the sandbox so vision
+    actually ingests it. The dir is git-ignored and files are deleted after use.
+    """
+    d = os.path.join(os.getcwd(), ".caption-tmp")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def caption_photo(app, photo_id):
+    """Background worker: caption ONE uploaded photo with `claude` vision.
+
+    Pushes a fresh app context (→ a new thread-local DB session), loads the
+    Photo, downloads its bytes from OneDrive to a temp file with the correct
+    extension, runs the slow vision pass, and stores the result:
+      * success → ``caption`` + ``tags`` (JSON) + ``caption_status='ready'``.
+      * failure/timeout/parse-error → ``caption_status='failed'`` (caption null).
+    ALWAYS deletes the temp file (finally) and ALWAYS frees the guard key. Never
+    raises out of the thread.
+    """
+    with _captioning_lock:
+        if photo_id in _captioning:
+            return  # already being captioned — don't pile on
+        _captioning.add(photo_id)
+
+    try:
+        with app.app_context():
+            tmp_path = None
+            try:
+                photo = db.session.get(Photo, photo_id)
+                if photo is None:
+                    return  # deleted before we got to it
+
+                item_id = photo.onedrive_item_id
+                name_for_ext = photo.filename or photo.original_name or ""
+
+                try:
+                    data, _ctype = onedrive.get_photo_content(item_id)
+                except onedrive.OneDriveError:
+                    log.exception(
+                        "caption_photo: OneDrive fetch failed (photo=%s)", photo_id
+                    )
+                    data = None
+
+                if not data:
+                    photo.caption_status = "failed"
+                    db.session.commit()
+                    return
+
+                ext = os.path.splitext(name_for_ext)[1].lower()
+                if ext not in _CAPTION_IMAGE_EXTS:
+                    ext = ".jpg"
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix="cd_caption_", suffix=ext, dir=_caption_tmp_dir()
+                )
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+
+                result = ai.caption_image(tmp_path)
+
+                # Re-load in case the row changed; commit the outcome.
+                photo = db.session.get(Photo, photo_id)
+                if photo is None:
+                    return
+                if result and result.get("caption"):
+                    photo.caption = (result["caption"] or "")[:1000]
+                    photo.tags = json.dumps(
+                        result.get("tags") or [], ensure_ascii=False
+                    )
+                    photo.caption_status = "ready"
+                else:
+                    photo.caption_status = "failed"
+                db.session.commit()
+            except Exception:  # noqa: BLE001 — never let the thread crash
+                db.session.rollback()
+                log.exception("caption_photo failed (photo=%s)", photo_id)
+                # Best-effort: don't leave the row stuck on 'pending' forever.
+                try:
+                    photo = db.session.get(Photo, photo_id)
+                    if photo is not None and photo.caption_status == "pending":
+                        photo.caption_status = "failed"
+                        db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        log.exception(
+                            "caption_photo: temp cleanup failed (%s)", tmp_path
+                        )
+    finally:
+        with _captioning_lock:
+            _captioning.discard(photo_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1135,17 +1254,23 @@ def _register_routes(app: Flask):
             {
                 "id": p.id,
                 "caption": p.caption,
+                "tags": p.tags_list,
+                "caption_status": p.caption_status,
                 "original_name": p.original_name,
                 "uploaded_by": p.uploaded_by,
                 "created_at": p.created_at,
             }
             for p in rows
         ]
+        # If anything is still being captioned, the template gently auto-reloads
+        # so finished captions appear without a manual refresh.
+        any_pending = any(p["caption_status"] == "pending" for p in photos)
         return render_template(
             "memories.html",
             enabled=True,
             reconnect=onedrive.reconnect_needed(),
             photos=photos,
+            any_pending=any_pending,
         )
 
     @app.route("/memories/<int:photo_id>/image")
@@ -1215,6 +1340,9 @@ def _register_routes(app: Flask):
                 flash("사진 업로드에 실패했어. 잠시 후 다시 시도해줘.", "error")
             return redirect(url_for("memories"))
 
+        # A manually typed caption wins and is treated as final ('ready', no
+        # auto-caption clobbering it). With no manual caption the row starts
+        # 'pending' and a background thread captions it via claude vision.
         caption = (request.form.get("caption") or "").strip()[:1000] or None
         photo = Photo(
             couple_id=u.couple_id,
@@ -1223,9 +1351,26 @@ def _register_routes(app: Flask):
             original_name=file.filename[:255],    # the user's original filename
             uploaded_by=u.id,
             caption=caption,
+            caption_status="ready" if caption else "pending",
         )
         db.session.add(photo)
         db.session.commit()
+
+        # Fire-and-forget auto-captioning. The HTTP response returns IMMEDIATELY
+        # after the OneDrive PUT + DB insert — it NEVER waits on the slow vision
+        # pass (CLAUDE.md: no synchronous AI on the request path).
+        if caption is None:
+            try:
+                threading.Thread(
+                    target=caption_photo,
+                    args=(current_app._get_current_object(), photo.id),
+                    daemon=True,
+                ).start()
+            except Exception:  # noqa: BLE001 — captioning is best-effort
+                log.exception(
+                    "failed to spawn caption thread for photo %s", photo.id
+                )
+
         flash("추억을 저장했어! 💖", "ok")
         return redirect(url_for("memories"))
 
