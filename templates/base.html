@@ -109,6 +109,21 @@
         });
       }
     </script>
+    <script>
+      // 하단 알약(.tabbar) 실제 높이를 재서 --tabbar-h로 발행 → 여백 동적 재산정
+      (function () {
+        var bar = document.querySelector('.tabbar');
+        if (!bar) return;
+        function setNavSpace() {
+          // 알약 실측 높이; 하단 갭 + safe-area는 CSS가 위에 더함
+          document.documentElement.style.setProperty('--tabbar-h', bar.offsetHeight + 'px');
+        }
+        setNavSpace();
+        window.addEventListener('resize', setNavSpace);
+        window.addEventListener('orientationchange', setNavSpace);
+        if (window.ResizeObserver) { new ResizeObserver(setNavSpace).observe(bar); }
+      })();
+    </script>
     {% block scripts %}{% endblock %}
   </body>
 </html>

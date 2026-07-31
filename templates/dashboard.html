@@ -61,15 +61,4 @@
   {{ render_thread(question.id, thread, comment_count, me) }}
 </div>
 {% endif %}
-
-<div class="quicklinks">
-  <a class="quicklink" href="{{ url_for('history') }}">
-    <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
-    <span>지난 질문 보기</span>
-  </a>
-  <a class="quicklink" href="{{ url_for('insight') }}">
-    <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="" />
-    <span>월간 인사이트</span>
-  </a>
-</div>
 {% endblock %}
