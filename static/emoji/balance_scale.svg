@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="100%" height="100%">
+  <defs>
+    <!-- 저울 그라데이션 -->
+    <linearGradient id="scaleGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FF7EB3" />
+      <stop offset="100%" stop-color="#FF758C" />
+    </linearGradient>
+
+    <!-- 부드러운 발광 효과 -->
+    <filter id="scaleGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#FF758C" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- 중심 기둥 -->
+  <rect x="57" y="30" width="6" height="62" rx="3" fill="url(#scaleGrad)" />
+
+  <!-- 상단 하트 장식 (저울추 대신 따뜻한 하트) -->
+  <path d="M 60 32
+           C 56.5 28.6, 52 25, 52 20.8
+           A 4 4 0 0 1 60 18.8
+           A 4 4 0 0 1 68 20.8
+           C 68 25, 63.5 28.6, 60 32 Z"
+        fill="#FF4D79" filter="url(#scaleGlow)" />
+
+  <!-- 저울대(가로 빔) -->
+  <rect x="20" y="35" width="80" height="6" rx="3" fill="url(#scaleGrad)" filter="url(#scaleGlow)" />
+
+  <!-- 빔 양 끝 고리 -->
+  <circle cx="30" cy="38" r="3.2" fill="#FF4D79" />
+  <circle cx="90" cy="38" r="3.2" fill="#FF4D79" />
+
+  <!-- 접시를 매단 줄 -->
+  <path d="M 30 40 L 19 61 M 30 40 L 41 61" stroke="#FF4D79" stroke-width="2"
+        fill="none" stroke-linecap="round" />
+  <path d="M 90 40 L 79 61 M 90 40 L 101 61" stroke="#FF4D79" stroke-width="2"
+        fill="none" stroke-linecap="round" />
+
+  <!-- 왼쪽 접시 -->
+  <path d="M 17 61 A 13 8 0 0 0 43 61 Z" fill="url(#scaleGrad)" filter="url(#scaleGlow)" />
+  <!-- 오른쪽 접시 -->
+  <path d="M 77 61 A 13 8 0 0 0 103 61 Z" fill="url(#scaleGrad)" filter="url(#scaleGlow)" />
+
+  <!-- 받침대 -->
+  <rect x="46" y="90" width="28" height="6" rx="3" fill="#FF4D79" />
+  <rect x="38" y="96" width="44" height="7" rx="3.5" fill="url(#scaleGrad)" />
+</svg>
