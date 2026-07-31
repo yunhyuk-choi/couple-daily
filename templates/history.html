@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% from "_comments.html" import render_thread %}
 {% block title %}지난 질문 · {{ app_name }}{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -13,30 +12,24 @@
     <a class="btn primary" href="{{ url_for('index') }}">오늘의 질문으로</a>
   </div>
 {% else %}
+  <div class="history-list">
   {% for item in items %}
-  <div class="card history-item">
-    <div class="date muted">{{ item.date.strftime('%Y.%m.%d') }}</div>
-    <h2 class="question-text small">{{ item.question }}</h2>
-    {% if item.revealed %}
-      <div class="answers">
-        <div class="answer-block mine">
-          <div class="who">{{ me.display_name }} (나)</div>
-          <p>{{ item.mine }}</p>
-        </div>
-        <div class="answer-block partner">
-          <div class="who">{{ partner.display_name }}</div>
-          <p>{{ item.partner }}</p>
-        </div>
+    <a class="card history-item" href="{{ url_for('question_detail', qid=item.id) }}">
+      <div class="date muted">{{ item.date.strftime('%Y.%m.%d') }}</div>
+      <h2 class="question-text small">{{ item.question }}</h2>
+      <div class="history-meta">
+        {% if item.revealed %}
+          <span class="meta-pill revealed">공개됨</span>
+          <span class="meta-pill">댓글 {{ item.comment_count }}</span>
+        {% elif item.answered_mine %}
+          <span class="meta-pill">내 답 완료 · 공개 대기</span>
+        {% else %}
+          <span class="meta-pill">답변 전</span>
+        {% endif %}
+        <span class="meta-arrow" aria-hidden="true">›</span>
       </div>
-      <div class="history-comments">
-        {{ render_thread(item.qid, item.thread, item.comment_count, me) }}
-      </div>
-    {% else %}
-      <p class="muted small">
-        {% if item.mine %}내 답은 남겼지만 아직 둘 다 답하지 않아 비공개야.{% else %}아직 답변이 없어.{% endif %}
-      </p>
-    {% endif %}
-  </div>
+    </a>
   {% endfor %}
+  </div>
 {% endif %}
 {% endblock %}

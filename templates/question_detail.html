@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_comments.html" import render_thread %}
+{% block title %}{{ question.q_date.strftime('%Y.%m.%d') }} 질문 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card question-card">
+  <div class="q-head">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
+    <span class="date">{{ question.q_date.strftime('%Y년 %m월 %d일') }}</span>
+  </div>
+  <h1 class="question-text">{{ question.text }}</h1>
+
+  {% if revealed %}
+    <div class="answers">
+      <div class="answer-block mine">
+        <div class="who"><img class="emoji sm" src="{{ url_for('static', filename='emoji/speech_balloon.svg') }}" alt="" /> {{ me.display_name }} (나)</div>
+        <p>{{ my_ans.text }}</p>
+      </div>
+      <div class="answer-block partner">
+        <div class="who"><img class="emoji sm" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" /> {{ partner.display_name }}</div>
+        <p>{{ partner_ans.text }}</p>
+      </div>
+    </div>
+  {% else %}
+    <div class="waiting">
+      <img class="emoji" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+      <p>
+        {% if my_ans %}내 답은 남겼지만 아직 둘 다 답하지 않아 비공개야.{% else %}아직 답변이 없어.{% endif %}
+      </p>
+    </div>
+  {% endif %}
+</div>
+
+{% if revealed %}
+<div class="card comments-card" id="comments">
+  {{ render_thread(question.id, thread, comment_count, me) }}
+</div>
+{% endif %}
+
+<div class="quicklinks">
+  <a class="quicklink" href="{{ url_for('history') }}">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
+    <span>지난 질문 목록</span>
+  </a>
+  <a class="quicklink" href="{{ url_for('index') }}">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="" />
+    <span>오늘의 질문</span>
+  </a>
+</div>
+{% endblock %}
