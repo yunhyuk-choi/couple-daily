@@ -92,8 +92,21 @@ h2.small, .question-text.small { font-size: 1.15rem; }
 /* forms */
 .stack { display: flex; flex-direction: column; gap: 12px; text-align: left; }
 label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; font-size: 0.92rem; }
-label.check-row { flex-direction: row; align-items: center; gap: 8px; }
-label.check-row input { width: auto; margin: 0; }
+label.check-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+label.check-row input {
+  width: auto;
+  margin: 0;
+  flex: none;
+  accent-color: var(--pink);
+}
 input, textarea {
   font: inherit;
   padding: 12px 14px;
