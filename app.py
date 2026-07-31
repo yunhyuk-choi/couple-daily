@@ -180,6 +180,10 @@ def create_app():
         # 실수) 요청은 여기서 막아 작은 Render 워커를 OOM/타임아웃에서 보호한다.
         # 업로드는 사진 단위로 쪼개 보내므로(memories.html) 이 상한이면 충분하다.
         MAX_CONTENT_LENGTH=55 * 1024 * 1024,  # 55 MB (사진 1장 + 멀티파트 여유)
+        SQLALCHEMY_ENGINE_OPTIONS={
+            "pool_pre_ping": True,   # 유휴 후 죽은 커넥션 자동 감지·재연결 (콜드스타트 500 원인 제거)
+            "pool_recycle": 280,     # Neon/프록시가 끊기 전에 선제 재활용 (초)
+        },
     )
 
     db.init_app(app)
@@ -656,16 +660,30 @@ def caption_photo(app, photo_id):
 def _register_routes(app: Flask):
     @app.context_processor
     def inject_globals():
-        me = current_user()
-        # Cheap unread COUNT for the topbar bell dot — only for a logged-in user
-        # who's in a couple (the only place the bell is shown).
+        # DB 장애 내성: 유휴 후 죽은 커넥션 등으로 DB가 잠깐 실패해도 여기서
+        # 터지면 *모든* 페이지(에러 페이지 포함)가 함께 무너진다. DB를 만지는
+        # 부분은 감싸서 실패 시 안전한 기본값으로 폴백한다(정상 경로는 그대로).
+        me = None
         notif_unread = 0
-        if me is not None and me.couple_id:
-            notif_unread = (
-                Notification.query.filter_by(user_id=me.id, is_read=False).count()
-            )
+        app_name = DEFAULT_APP_NAME
+        try:
+            me = current_user()
+            # Cheap unread COUNT for the topbar bell dot — only for a logged-in user
+            # who's in a couple (the only place the bell is shown).
+            if me is not None and me.couple_id:
+                notif_unread = (
+                    Notification.query.filter_by(user_id=me.id, is_read=False).count()
+                )
+            app_name = Setting.get("app_name", DEFAULT_APP_NAME)
+        except Exception:
+            # 오염된 트랜잭션을 비우고 안전한 기본값으로 계속 렌더한다.
+            db.session.rollback()
+            log.debug("inject_globals: DB 조회 실패 — 안전 기본값으로 폴백", exc_info=True)
+            me = None
+            notif_unread = 0
+            app_name = DEFAULT_APP_NAME
         return {
-            "app_name": Setting.get("app_name", DEFAULT_APP_NAME),
+            "app_name": app_name,
             "me": me,
             "kakao_enabled": kakao_enabled(),
             "push_enabled": push_enabled(),
@@ -1842,14 +1860,45 @@ def _register_routes(app: Flask):
             return e
         # Surface the real root cause in the logs (Render), never to the user.
         app.logger.exception("unhandled exception rendering %s", request.path)
-        return (
-            render_template(
-                "error.html",
-                heading="이런, 문제가 생겼어",
-                message="에러가 발생했습니다",
-            ),
-            500,
-        )
+        # 오염된 트랜잭션(죽은 커넥션 등)을 먼저 비워, 에러 페이지 렌더가
+        # 같은 죽은 커넥션에 다시 걸려 무너지지 않게 한다.
+        try:
+            db.session.rollback()
+        except Exception:
+            log.debug("error handler: rollback 실패", exc_info=True)
+        try:
+            # context_processor가 이제 DB 장애 내성이 있어 정상 렌더돼야 하지만,
+            # 그래도 실패하면 아래 인라인 폴백으로 넘어간다.
+            return (
+                render_template(
+                    "error.html",
+                    heading="이런, 문제가 생겼어",
+                    message="에러가 발생했습니다",
+                ),
+                500,
+            )
+        except Exception:
+            # 최후의 안전망: 템플릿·DB 없이도 테마 화면을 반드시 보여준다.
+            # (원시 흰색 Werkzeug 500 페이지는 절대 노출하지 않는다.)
+            log.exception("error handler: error.html 렌더 실패 — 인라인 폴백 사용")
+            html = (
+                "<!doctype html>"
+                "<html lang=\"ko\"><head><meta charset=\"UTF-8\"/>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"/>"
+                "<title>문제가 생겼어</title><style>"
+                "html,body{margin:0;height:100%}"
+                "body{background:#fff5f8;color:#5a4a52;"
+                "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                "display:flex;align-items:center;justify-content:center;text-align:center;padding:24px}"
+                ".box{max-width:22rem}"
+                "h1{font-size:1.4rem;margin:0 0 .6rem;color:#ff6b9d}"
+                "p{font-size:1rem;line-height:1.6;margin:0;color:#8a7a82}"
+                "</style></head><body><div class=\"box\">"
+                "<h1>이런, 문제가 생겼어</h1>"
+                "<p>잠시 후 다시 시도해줘</p>"
+                "</div></body></html>"
+            )
+            return html, 500, {"Content-Type": "text/html; charset=utf-8"}
 
 
 app = create_app()
