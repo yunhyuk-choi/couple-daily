@@ -30,6 +30,8 @@ ENV FLASK_ENV=production \
 
 EXPOSE 8080
 
-# gunicorn serves the app factory. 2 workers; long timeout because `claude -p`
-# is an agent and can take several seconds per request.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "180", "app:app"]
+# gunicorn serves the app factory. Bind to $PORT if the platform sets one
+# (Koyeb/Render/Fly all do), else 8080. 1 worker by default to stay within
+# small free-tier RAM (each `claude -p` spawns a ~265MB agent); override with
+# WEB_CONCURRENCY. Long timeout because `claude -p` is an agent (several sec).
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers ${WEB_CONCURRENCY:-1} --timeout 180 app:app"]
