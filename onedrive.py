@@ -60,6 +60,14 @@ _BYTES_CACHE_TTL = 60  # seconds
 _BYTES_CACHE_MAX = 24  # cap entries so memory can't grow unbounded
 _bytes_cache: dict[str, tuple[bytes, str, float]] = {}
 
+# per-(item,size) THUMBNAIL-BYTES cache for the gallery grid. Thumbnails are
+# tiny (a few KB), so we can cache more of them and for longer than full bytes.
+# Same rationale as _bytes_cache: cache the decoded bytes (the Graph thumbnail
+# `url` is a short-lived CDN link that would 401 if reused).
+_THUMB_CACHE_TTL = 600  # seconds
+_THUMB_CACHE_MAX = 64
+_thumb_cache: dict[tuple[str, str], tuple[bytes, str, float]] = {}
+
 
 class OneDriveError(RuntimeError):
     """Any OneDrive/Graph failure surfaced to the caller."""
@@ -220,8 +228,9 @@ def upload_photo(file_bytes: bytes, filename: str):
     Returns ``(item_id, stored_name)`` — the OneDrive drive-item id (the
     load-bearing handle for fetch/delete) and the sanitized unique name we
     actually stored it under (so the caller can record the true name, not a
-    re-derived guess). Simple PUT upload (fine for the ≤15 MB photos the route
-    caps at). Ensures the dedicated folder exists first. Raises OneDriveError on
+    re-derived guess). Simple PUT upload (fine for the ≤50 MB photos the route
+    caps at; Graph simple upload allows up to 250 MB). Ensures the dedicated
+    folder exists first. Raises OneDriveError on
     any failure.
     """
     try:
@@ -321,9 +330,64 @@ def get_photo_content_cached(item_id: str):
     return data, ctype
 
 
+def get_thumbnail(item_id: str, size: str = "medium"):
+    """Fetch a SMALL server-rendered thumbnail's bytes for a drive item.
+
+    Graph exposes ``GET /me/drive/items/<id>/thumbnails/0/<size>`` (size is one
+    of ``small`` / ``medium`` / ``large``) which returns a thumbnail resource
+    whose ``url`` is a short-lived, pre-authenticated CDN link. We fetch THAT
+    small image server-side so the gallery grid never proxies the full-res
+    original. Returns ``(bytes, content_type)``, or ``(None, None)`` when the
+    item has no thumbnail yet / is gone — the route then falls back to the full
+    image. A brief in-process bytes cache absorbs refetch storms (we cache the
+    decoded bytes, never the expiring URL).
+    """
+    now = time.time()
+    key = (item_id, size)
+    hit = _thumb_cache.get(key)
+    if hit and now < hit[2]:
+        return hit[0], hit[1]
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/thumbnails/0/{size}",
+            headers=_auth_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        # 404 == item gone OR no thumbnail available for it yet.
+        if r.status_code == 404:
+            return None, None
+        if r.status_code != 200:
+            raise OneDriveError(f"thumbnail meta fetch failed (status={r.status_code})")
+        url = r.json().get("url")
+        if not url:
+            return None, None
+        # The thumbnail url is already pre-authenticated — fetch WITHOUT the
+        # Bearer header (sending it to the CDN host would be wrong).
+        ir = requests.get(url, timeout=HTTP_TIMEOUT)
+        if ir.status_code != 200:
+            raise OneDriveError(f"thumbnail fetch failed (status={ir.status_code})")
+        data = ir.content
+        ctype = ir.headers.get("Content-Type") or "image/jpeg"
+    except requests.RequestException as e:
+        raise OneDriveError(f"thumbnail request failed: {e}") from e
+
+    if data:
+        # Evict expired / oldest before inserting to bound memory.
+        if len(_thumb_cache) >= _THUMB_CACHE_MAX:
+            for k in [k for k, v in _thumb_cache.items() if v[2] <= now]:
+                _thumb_cache.pop(k, None)
+            if len(_thumb_cache) >= _THUMB_CACHE_MAX:
+                oldest = min(_thumb_cache, key=lambda k: _thumb_cache[k][2])
+                _thumb_cache.pop(oldest, None)
+        _thumb_cache[key] = (data, ctype, now + _THUMB_CACHE_TTL)
+    return data, ctype
+
+
 def delete_photo(item_id: str):
     """Delete an item from OneDrive. A 404 (already gone) counts as success."""
     _bytes_cache.pop(item_id, None)
+    for k in [k for k in _thumb_cache if k[0] == item_id]:
+        _thumb_cache.pop(k, None)
     try:
         r = requests.delete(
             f"{GRAPH_BASE}/me/drive/items/{item_id}",

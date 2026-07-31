@@ -15,40 +15,66 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
-    <header class="topbar">
+    {#
+      Two-level navigation, data-driven so a new PARENT (e.g. a future 데이트
+      assistant) is a one-line addition to `nav`, and a new CHILD (e.g. 추억 →
+      검색) is a one-line addition to that parent's `children`.
+        * Bottom floating pill = parents only.
+        * Sub-tab bar under the header = the ACTIVE parent's children, but only
+          rendered when the parent has MORE THAN ONE child.
+        * 알림 / 설정 live in the header (top-right), outside this structure.
+    #}
+    {% set nav = [
+      {'label': '질문', 'icon': 'speech_balloon.svg', 'default': 'index',
+       'children': [
+         {'label': '오늘',    'endpoint': 'index'},
+         {'label': '지난',    'endpoint': 'history'},
+         {'label': '인사이트', 'endpoint': 'insight'},
+       ]},
+      {'label': '추억', 'icon': 'sparkling_heart.svg', 'default': 'memories',
+       'children': [
+         {'label': '앨범', 'endpoint': 'memories'},
+       ]},
+    ] %}
+    {% set ep = request.endpoint %}
+    {% set ns = namespace(active_parent=none) %}
+    {% for parent in nav %}
+      {% if ep in (parent.children | map(attribute='endpoint') | list) %}
+        {% set ns.active_parent = parent %}
+      {% endif %}
+    {% endfor %}
+    {% set show_subtabs = ns.active_parent is not none and ns.active_parent.children | length > 1 %}
+
+    <header class="topbar slim">
       <a class="brand" href="{{ url_for('index') }}">
         <img class="emoji brand-emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
         <span>{{ app_name }}</span>
       </a>
       {% if me and me.is_active_couple %}
-      <nav class="nav">
-        <a href="{{ url_for('index') }}" title="오늘의 질문">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="오늘" />
+      <div class="header-actions">
+        <a class="header-btn{% if notif_unread %} has-unread{% endif %}"
+           href="{{ url_for('notifications') }}" aria-label="알림"
+           title="알림">
+          <img class="header-icon" src="{{ url_for('static', filename='emoji/bell.svg') }}" alt="" />
+          {% if notif_unread %}<span class="header-dot" aria-hidden="true"></span>{% endif %}
         </a>
-        <a href="{{ url_for('history') }}" title="지난 질문">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="기록" />
+        <a class="header-btn" href="{{ url_for('settings') }}" aria-label="설정" title="설정">
+          <img class="header-icon" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="" />
         </a>
-        <a href="{{ url_for('insight') }}" title="월간 인사이트">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="인사이트" />
-        </a>
-        {% if onedrive_enabled %}
-        <a href="{{ url_for('memories') }}" title="추억">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="추억" />
-        </a>
-        {% endif %}
-        <a href="{{ url_for('notifications') }}" title="알림"
-           class="bell-link{% if notif_unread %} has-unread{% endif %}">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/bell.svg') }}" alt="알림" />
-          {% if notif_unread %}<span class="bell-dot" aria-hidden="true"></span>{% endif %}
-        </a>
-        <a href="{{ url_for('settings') }}" title="설정">
-          <img class="emoji" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="설정" />
-        </a>
-      </nav>
+      </div>
       {% endif %}
     </header>
 
-    <main class="wrap">
+    <main class="wrap{% if me and me.is_active_couple %} has-tabbar{% endif %}">
+      {% if show_subtabs %}
+      <nav class="subtabs" aria-label="{{ ns.active_parent.label }} 하위 메뉴">
+        {% for c in ns.active_parent.children %}
+        <a class="subtab{% if c.endpoint == ep %} active{% endif %}"
+           href="{{ url_for(c.endpoint) }}">{{ c.label }}</a>
+        {% endfor %}
+      </nav>
+      {% endif %}
+
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% for category, message in messages %}
           <div class="flash flash-{{ category }}">{{ message }}</div>
@@ -56,6 +82,18 @@
       {% endwith %}
       {% block content %}{% endblock %}
     </main>
+
+    {% if me and me.is_active_couple %}
+    <nav class="tabbar" aria-label="주요 메뉴">
+      {% for parent in nav %}
+      <a class="tab{% if parent == ns.active_parent %} active{% endif %}"
+         href="{{ url_for(parent.default) }}">
+        <img class="tab-icon" src="{{ url_for('static', filename='emoji/' + parent.icon) }}" alt="" />
+        <span class="tab-label">{{ parent.label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+    {% endif %}
 
     <script>
       // Register the service worker (offline shell + installability).
