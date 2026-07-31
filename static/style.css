@@ -711,3 +711,42 @@ body.lb-open { overflow: hidden; }
   .quicklinks { flex-direction: column; }
   .comment.reply { margin-left: 20px; }
 }
+
+/* ---- 판사 (AI judge): 사건 목록 배지 + 진술 + 판결 ---- */
+.meta-pill.fault { background: var(--pink-soft); color: var(--pink); border-color: transparent; }
+.meta-pill.judging { background: var(--cream); color: var(--pink); border-color: var(--pink-soft); }
+
+/* 각자 진술: 댓글과 같은 아바타+말풍선 조합 */
+.statements { display: flex; flex-direction: column; gap: 10px; }
+.statement-row { display: flex; gap: 10px; align-items: flex-start; }
+
+/* 판결 카드 */
+.verdict-card { border-color: var(--pink-soft); }
+.verdict-judging .emoji.hero { animation: verdict-pulse 1.4s ease-in-out infinite; }
+@keyframes verdict-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+.verdict-summary {
+  font-size: 1.05rem; font-weight: 800; line-height: 1.5;
+  margin: 0 0 14px; color: var(--ink);
+}
+.verdict-section { margin-top: 14px; }
+.verdict-section h3 {
+  font-size: 0.82rem; font-weight: 700; color: var(--muted);
+  margin: 0 0 4px;
+}
+.verdict-section p { margin: 0; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.verdict-note { margin: 14px 0 0; }
+
+/* 잘못 비율 막대 (핑크 테마) */
+.fault-bars { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 4px; }
+.fault-item { display: flex; flex-direction: column; gap: 4px; }
+.fault-label { display: flex; justify-content: space-between; font-size: 0.9rem; font-weight: 700; }
+.fault-label strong { color: var(--pink); }
+.fault-track {
+  height: 12px; border-radius: 999px;
+  background: var(--pink-soft); overflow: hidden;
+}
+.fault-fill {
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, #ff8fb1, var(--pink));
+  min-width: 2px;
+}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}새 사건 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
+  <h1>새 사건 열기</h1>
+</div>
+
+<div class="card">
+  <p class="muted small" style="margin-top:0">
+    무슨 일이 있었는지 상황을 적고, 원하면 내 진술도 함께 남겨줘.
+    상대의 진술은 나중에 각자 추가할 수 있고, 진술이 하나만 있어도 판결을 맡길 수 있어.
+  </p>
+  <form class="stack" method="post" action="{{ url_for('case_new') }}">
+    <label for="case-title">사건 제목 <span class="muted small">(선택)</span>
+      <input id="case-title" type="text" name="title" maxlength="120"
+             placeholder="예: 데이트 약속 시간 다툼" />
+    </label>
+    <label for="case-situation">상황 설명 <span class="muted small">(필수)</span>
+      <textarea id="case-situation" name="situation" rows="5" required
+                placeholder="어떤 일로 다퉜는지 상황을 알려줘."></textarea>
+    </label>
+    <label for="case-statement">내 진술 <span class="muted small">(선택)</span>
+      <textarea id="case-statement" name="statement" rows="4"
+                placeholder="내 입장에서 하고 싶은 말을 적어줘. 지금 비워둬도 나중에 추가할 수 있어."></textarea>
+    </label>
+    <button class="btn primary" type="submit">사건 열기</button>
+    <a class="btn ghost" href="{{ url_for('cases') }}">취소</a>
+  </form>
+</div>
+{% endblock %}
