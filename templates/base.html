@@ -31,6 +31,16 @@
         <a href="{{ url_for('insight') }}" title="월간 인사이트">
           <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="인사이트" />
         </a>
+        <a href="{{ url_for('notifications') }}" title="알림"
+           class="bell-link{% if notif_unread %} has-unread{% endif %}">
+          <svg class="bell-icon" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-label="알림">
+            <path d="M12 3a5 5 0 0 0-5 5c0 4-1.4 5.6-2 6.3-.4.5 0 1.2.6 1.2h12.8c.6 0 1-.7.6-1.2-.6-.7-2-2.3-2-6.3a5 5 0 0 0-5-5z" />
+            <path d="M10 19.5a2 2 0 0 0 4 0" />
+          </svg>
+          {% if notif_unread %}<span class="bell-dot" aria-hidden="true"></span>{% endif %}
+        </a>
         <a href="{{ url_for('settings') }}" title="설정">
           <img class="emoji" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="설정" />
         </a>

@@ -217,6 +217,44 @@ class Comment(db.Model):
     )
 
 
+class Notification(db.Model):
+    """An in-app notification for a single recipient.
+
+    Created by the event hooks in app.py (partner answered / commented / couple
+    approved). Designed so a future web-push branch can reuse the same hooks:
+    push would simply fan out from the same ``notify()`` call site. ``is_read``
+    powers the topbar bell dot; viewing ``/notifications`` clears it.
+    """
+    __tablename__ = "notifications"
+
+    id = db.Column(db.Integer, primary_key=True)
+    # The RECIPIENT (never the actor who triggered the event).
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # 'answer' | 'comment' | 'approval'
+    type = db.Column(db.String(16), nullable=False)
+    message = db.Column(db.String(255), nullable=False)
+    # Relative URL to navigate to when the row is tapped.
+    link = db.Column(db.String(255), nullable=False)
+    is_read = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+def notify(user, type, message, link):
+    """Create + add a Notification for ``user`` (the recipient).
+
+    Returns the Notification (added to the session, not yet committed) or None
+    when there is no recipient. The caller commits — keeping the commit at the
+    call site lets the hook isolate a notification failure from the main action.
+    """
+    if user is None:
+        return None
+    n = Notification(user_id=user.id, type=type, message=message, link=link)
+    db.session.add(n)
+    return n
+
+
 class Setting(db.Model):
     """Global key/value settings (e.g. the configurable app name)."""
     __tablename__ = "settings"
