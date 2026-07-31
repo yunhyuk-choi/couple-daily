@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}추억 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+  <h1>우리의 추억</h1>
+</div>
+
+{% if not enabled %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+    <p class="muted">아직 OneDrive 연결이 필요해.<br />연결되면 여기에 둘만의 사진을 모을 수 있어.</p>
+  </div>
+{% else %}
+  {% if reconnect %}
+    <div class="flash flash-error">OneDrive 재연결이 필요해. 사진이 잠시 안 보일 수 있어.</div>
+  {% endif %}
+
+  <div class="card">
+    <form class="stack memory-upload" method="post"
+          action="{{ url_for('memories_upload') }}" enctype="multipart/form-data">
+      <label>사진
+        <input type="file" name="photo" accept="image/*" required />
+      </label>
+      <label>한마디 <span class="muted small">(선택)</span>
+        <input type="text" name="caption" maxlength="1000"
+               placeholder="이 순간을 한 줄로 남겨봐" />
+      </label>
+      <button class="btn primary" type="submit">추억 올리기</button>
+      <p class="muted small">이미지 파일, 15MB 이하</p>
+    </form>
+  </div>
+
+  {% if not photos %}
+    <div class="card center-card">
+      <img class="emoji hero" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+      <p class="muted">아직 올린 사진이 없어. 첫 추억을 남겨보자!</p>
+    </div>
+  {% else %}
+    <div class="photo-grid">
+      {% for p in photos %}
+        <figure class="photo-card">
+          <img class="photo-img" src="{{ url_for('memory_image', photo_id=p.id) }}"
+               loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+          {% if p.caption %}
+            <figcaption class="photo-caption">{{ p.caption }}</figcaption>
+          {% endif %}
+          <form method="post" action="{{ url_for('memories_delete', photo_id=p.id) }}"
+                class="photo-delete"
+                onsubmit="return confirm('이 사진을 삭제할까?');">
+            <button class="photo-del-btn" type="submit" title="삭제" aria-label="삭제">×</button>
+          </form>
+        </figure>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}

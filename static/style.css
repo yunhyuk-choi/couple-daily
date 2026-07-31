@@ -350,6 +350,58 @@ code { background: var(--pink-soft); padding: 2px 6px; border-radius: 6px; font-
 .notif-empty { text-align: center; color: var(--muted); padding: 40px 0; }
 .notif-empty .emoji { width: 48px; height: 48px; display: block; margin: 0 auto 12px; }
 
+/* memories (추억) gallery */
+.memory-upload input[type="file"] {
+  padding: 10px 12px;
+  font-size: 0.9rem;
+}
+.photo-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.photo-card {
+  position: relative;
+  margin: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.photo-img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: var(--pink-soft);
+}
+.photo-caption {
+  padding: 10px 12px;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.photo-delete { position: absolute; top: 8px; right: 8px; margin: 0; }
+.photo-del-btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(61, 43, 52, 0.55);
+  color: #fff;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.photo-del-btn:hover { background: var(--pink); }
+
 @media (max-width: 420px) {
   .stat-grid { grid-template-columns: 1fr; }
   .quicklinks { flex-direction: column; }
