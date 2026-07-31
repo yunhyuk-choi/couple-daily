@@ -45,6 +45,19 @@ def run_startup_migrations():
             except Exception:  # noqa: BLE001
                 log.exception("startup migration: failed adding users.kakao_id")
 
+        # 1b) add profile_image_url (Kakao profile photo) if it's missing
+        if "profile_image_url" not in cols:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("ALTER TABLE users ADD COLUMN profile_image_url VARCHAR")
+                    )
+                log.info("startup migration: added users.profile_image_url")
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup migration: failed adding users.profile_image_url"
+                )
+
         # 2) drop NOT NULL on email / password_hash so Kakao users can exist.
         #    SQLite cannot ALTER a column's nullability in place; older SQLite
         #    DBs keep NOT NULL, but Kakao rows simply never touch those columns
@@ -98,6 +111,8 @@ class User(db.Model):
     # Kakao user id (a number, stored as string). Unique when present, null for
     # email/password users.
     kakao_id = db.Column(db.String(64), unique=True, nullable=True, index=True)
+    # Kakao profile photo URL, if the user granted it. Optional for everyone.
+    profile_image_url = db.Column(db.String(512), nullable=True)
     display_name = db.Column(db.String(60), nullable=False)
     couple_id = db.Column(db.Integer, db.ForeignKey("couples.id"), nullable=True)
     is_admin = db.Column(db.Boolean, default=False, nullable=False)
@@ -137,6 +152,13 @@ class DailyQuestion(db.Model):
     answers = db.relationship(
         "Answer", backref="question", lazy="dynamic", cascade="all, delete-orphan"
     )
+    comments = db.relationship(
+        "Comment",
+        backref="question",
+        lazy="dynamic",
+        cascade="all, delete-orphan",
+        order_by="Comment.created_at",
+    )
 
     def answer_by(self, user_id):
         return self.answers.filter_by(user_id=user_id).first()
@@ -144,6 +166,10 @@ class DailyQuestion(db.Model):
     @property
     def both_answered(self):
         return self.answers.count() >= 2
+
+    def ordered_comments(self):
+        """All of this question's comments, oldest first (any nesting depth)."""
+        return self.comments.order_by(Comment.created_at.asc()).all()
 
 
 class Answer(db.Model):
@@ -159,6 +185,36 @@ class Answer(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
     text = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Comment(db.Model):
+    """A comment on a day's revealed answers. Supports threaded replies via
+    a nullable self-referential ``parent_id``."""
+    __tablename__ = "comments"
+
+    id = db.Column(db.Integer, primary_key=True)
+    question_id = db.Column(
+        db.Integer, db.ForeignKey("daily_questions.id"), nullable=False, index=True
+    )
+    author_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # Null for a top-level comment; points at another comment for a reply.
+    parent_id = db.Column(
+        db.Integer, db.ForeignKey("comments.id"), nullable=True, index=True
+    )
+    text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    author = db.relationship("User")
+    # Direct replies. Deleting a comment deletes its replies (tidy).
+    replies = db.relationship(
+        "Comment",
+        backref=db.backref("parent", remote_side=[id]),
+        lazy="dynamic",
+        cascade="all, delete-orphan",
+        order_by="Comment.created_at",
+    )
 
 
 class Setting(db.Model):

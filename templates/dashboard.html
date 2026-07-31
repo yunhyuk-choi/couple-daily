@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_comments.html" import render_thread %}
 {% block title %}오늘의 질문 · {{ app_name }}{% endblock %}
 {% block content %}
 <div class="card question-card">
@@ -54,6 +55,12 @@
     </form>
   {% endif %}
 </div>
+
+{% if revealed %}
+<div class="card comments-card">
+  {{ render_thread(question.id, thread, comment_count, me) }}
+</div>
+{% endif %}
 
 <div class="quicklinks">
   <a class="quicklink" href="{{ url_for('history') }}">
