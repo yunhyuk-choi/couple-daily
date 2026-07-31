@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}오프라인 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+  <h1>오프라인이야</h1>
+  <p class="muted">지금은 네트워크에 연결되어 있지 않아. 연결되면 다시 열어줘.</p>
+</div>
+{% endblock %}

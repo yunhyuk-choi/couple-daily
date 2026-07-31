@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}회원가입 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+  <h1>우리 둘만의 공간 시작하기</h1>
+  <p class="muted">
+    처음이라면 초대 코드는 비워둬 — 네가 커플 공간을 만들고 초대 코드를 받게 돼.<br />
+    파트너가 이미 만들었다면 받은 초대 코드를 입력해줘.
+  </p>
+  <form method="post" class="stack">
+    <label>이름 (상대가 볼 이름)
+      <input type="text" name="display_name" required maxlength="60" />
+    </label>
+    <label>이메일
+      <input type="email" name="email" required autocomplete="email" />
+    </label>
+    <label>비밀번호 (8자 이상)
+      <input type="password" name="password" required minlength="8" autocomplete="new-password" />
+    </label>
+    <label>초대 코드 <span class="muted">(선택)</span>
+      <input type="text" name="invite_code" maxlength="8" placeholder="파트너에게 받은 코드" style="text-transform: uppercase" />
+    </label>
+    <button type="submit" class="btn primary">시작하기</button>
+  </form>
+  <p class="muted center">
+    이미 계정이 있어? <a href="{{ url_for('login') }}">로그인</a>
+  </p>
+</div>
+{% endblock %}

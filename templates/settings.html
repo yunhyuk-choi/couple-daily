@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}설정 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="" />
+  <h1>설정</h1>
+</div>
+
+<div class="card">
+  <form method="post" class="stack">
+    <label>앱 이름 (제목·헤더·홈 화면 아이콘 이름에 쓰여)
+      <input type="text" name="app_name" value="{{ current_app_name }}" maxlength="60" />
+    </label>
+    <label>내 이름 (상대가 보는 이름)
+      <input type="text" name="display_name" value="{{ me.display_name }}" maxlength="60" />
+    </label>
+    <button class="btn primary" type="submit">저장</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2 class="small">계정</h2>
+  <p class="muted">{{ me.email }}{% if me.is_admin %} · 공간 관리자{% endif %}</p>
+  {% if me.couple %}
+  <p class="muted small">초대 코드: <code>{{ me.couple.invite_code }}</code></p>
+  {% endif %}
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="btn ghost" type="submit">로그아웃</button>
+  </form>
+</div>
+
+<div class="card install-hint">
+  <div class="q-head">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+    <span>홈 화면에 추가</span>
+  </div>
+  <p class="muted small">
+    이 앱은 PWA라서 홈 화면에 설치할 수 있어.<br />
+    · Android/Chrome: 주소창 메뉴 → "앱 설치" 또는 "홈 화면에 추가"<br />
+    · iOS/Safari: 공유 버튼 → "홈 화면에 추가"
+  </p>
+</div>
+{% endblock %}
