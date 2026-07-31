@@ -75,33 +75,63 @@ body {
   color: var(--pink);
   text-decoration: none;
 }
-.nav { display: flex; gap: 6px; }
-.nav a {
-  padding: 6px 8px;
-  border-radius: 12px;
-  line-height: 1;
+/* header actions (top-right): 알림 + 설정 icon buttons */
+.header-actions { display: flex; align-items: center; gap: 2px; }
+.header-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: var(--pink);
+  text-decoration: none;
   transition: background 0.15s;
 }
-.nav a:hover { background: var(--pink-soft); }
-
-/* topbar notification bell */
-.bell-link { position: relative; display: inline-flex; color: var(--pink); }
-.bell-icon {
-  width: 1.5em;
-  height: 1.5em;
-  vertical-align: -0.35em;
-  display: inline-block;
-}
-.bell-dot {
+.header-btn:hover { background: var(--pink-soft); }
+.header-icon { width: 24px; height: 24px; display: block; }
+.header-dot {
   position: absolute;
-  top: 3px;
-  right: 4px;
+  top: 6px;
+  right: 7px;
   width: 9px;
   height: 9px;
   border-radius: 50%;
   background: var(--pink);
   border: 2px solid var(--card);
   box-shadow: 0 0 0 1px rgba(255, 107, 157, 0.35);
+}
+
+/* secondary sub-tab bar (segmented control) — the active parent's children.
+   Sits at the top of the content, scrolls away with it, pink-theme pill. */
+.subtabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 18px;
+  padding: 4px;
+  background: rgba(255, 214, 229, 0.4);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.subtab {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  padding: 8px 6px;
+  border-radius: 999px;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.subtab:hover { color: var(--pink); }
+.subtab.active {
+  background: var(--pink);
+  color: #fff;
+  box-shadow: 0 3px 10px rgba(255, 107, 157, 0.35);
 }
 
 /* <main> fills the space left by the natural-height header, so short pages
