@@ -571,6 +571,20 @@ def _register_routes(app: Flask):
         except (TypeError, ValueError):
             year, month = today.year, today.month
 
+        # Solo space: the couple has only one approved member (partner hasn't
+        # joined/been approved yet). Never call the stats/qualitative functions
+        # with a None partner — show a gentle empty state instead.
+        if partner is None:
+            return render_template(
+                "insight.html",
+                no_partner=True,
+                stats=None,
+                qualitative=None,
+                has_data=False,
+                year=year,
+                month=month,
+            )
+
         stats = insights.compute_monthly_stats(u.couple_id, year, month, u, partner)
         qa_items = insights.collect_month_qa(u.couple_id, year, month, u, partner)
         qualitative = ai.generate_monthly_qualitative(
@@ -654,6 +668,39 @@ def _register_routes(app: Flask):
     @app.route("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    # ---- themed error handlers ----
+    @app.errorhandler(404)
+    @app.errorhandler(405)
+    def _not_found(e):
+        # Missing page or wrong method → same gentle "not ready yet" state.
+        return (
+            render_template(
+                "error.html",
+                heading="여기엔 아무것도 없어",
+                message="아직 준비되지 않은 기능이에요",
+            ),
+            404,
+        )
+
+    @app.errorhandler(500)
+    @app.errorhandler(Exception)
+    def _server_error(e):
+        # Let HTTP errors (404/405/etc.) keep their own handling/status.
+        from werkzeug.exceptions import HTTPException
+
+        if isinstance(e, HTTPException):
+            return e
+        # Surface the real root cause in the logs (Render), never to the user.
+        app.logger.exception("unhandled exception rendering %s", request.path)
+        return (
+            render_template(
+                "error.html",
+                heading="이런, 문제가 생겼어",
+                message="에러가 발생했습니다",
+            ),
+            500,
+        )
 
 
 app = create_app()

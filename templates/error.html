@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}문제가 생겼어 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+  <h1>{{ heading or "이런…" }}</h1>
+  <p class="muted">{{ message or "에러가 발생했습니다" }}</p>
+  <a class="btn primary" href="{{ url_for('index') }}">홈으로 돌아가기</a>
+</div>
+{% endblock %}
