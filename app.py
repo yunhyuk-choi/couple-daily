@@ -1097,11 +1097,20 @@ def _register_routes(app: Flask):
 
         # Qualitative comes ONLY from the cached MonthlyReport — the slow
         # `claude -p` call never runs on this request path.
+        #
+        # TRUE stale-while-revalidate for the DISPLAY: whether we show content
+        # depends on whether the row HAS content (generated_at set), NOT on the
+        # status. So while a background refresh runs (status=='generating') the
+        # PREVIOUS cached content keeps showing — we never drop a populated
+        # report back to the placeholder. The regen path only swaps the content
+        # once the new report is ready (it never clears content when it marks
+        # the row 'generating').
         report = MonthlyReport.query.filter_by(
             couple_id=u.couple_id, year=year, month=month
         ).first()
+        has_content = report is not None and report.generated_at is not None
         qualitative = None
-        if report is not None and report.status == "ready":
+        if has_content:
             qualitative = {
                 "summary": report.summary or "",
                 "themes": report.themes_list,
@@ -1110,13 +1119,24 @@ def _register_routes(app: Flask):
                 "fun": report.fun or "",
             }
 
-        # No fresh cached report but there IS data to summarize → trigger a
-        # background build (guarded against duplicates) and show a placeholder.
-        pending = False
-        if has_data and qualitative is None:
-            pending = True
+        # A background refresh is in flight for this month.
+        refreshing = report is not None and report.status == "generating"
+        # Placeholder ONLY when there's data but no content has ever been built
+        # for this month (first-ever generation). If content exists, we show it.
+        pending = has_data and not has_content
+
+        # Trigger a background build when there's data but no cached content yet
+        # (missing / failed-with-no-content). When content already exists we do
+        # NOT kick from here — answer events keep it fresh — and the in-flight
+        # guard in _kick_monthly_report would no-op anyway.
+        if has_data and not has_content:
             if report is None or report.status in ("generating", "failed"):
                 _kick_monthly_report(u.couple_id, year, month)
+
+        # Auto-reload while anything is being (re)built so the display swaps to
+        # the fresh content when the background thread finishes: either building
+        # the first report (pending) or refreshing existing content (refreshing).
+        auto_refresh = pending or (has_content and refreshing)
 
         # previous / next month links
         prev_m = (month - 1) or 12
@@ -1129,6 +1149,8 @@ def _register_routes(app: Flask):
             qualitative=qualitative,
             has_data=has_data,
             pending=pending,
+            refreshing=refreshing,
+            auto_refresh=auto_refresh,
             year=year,
             month=month,
             prev=(prev_y, prev_m),
