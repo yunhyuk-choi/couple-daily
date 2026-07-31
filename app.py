@@ -9,12 +9,15 @@ Run locally:   python app.py            (SQLite fallback, debug reloader)
 Run in prod:   gunicorn 'app:create_app()'   (Postgres via DATABASE_URL)
 """
 import functools
+import logging
 import os
 import secrets
 import string
 import time
 from datetime import date, datetime, timedelta
+from urllib.parse import urlencode
 
+import requests
 from flask import (
     Flask,
     abort,
@@ -32,9 +35,23 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
 import insights
-from models import Answer, Couple, DailyQuestion, Setting, User, db
+from models import Answer, Couple, DailyQuestion, Setting, User, db, run_startup_migrations
+
+log = logging.getLogger(__name__)
 
 DEFAULT_APP_NAME = os.environ.get("APP_NAME", "우리의 하루")
+
+# ---- Kakao OAuth 2.0 config (read from env; never hardcode secrets) ----
+KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY")
+KAKAO_CLIENT_SECRET = os.environ.get("KAKAO_CLIENT_SECRET")  # optional
+KAKAO_AUTHORIZE_URL = "https://kauth.kakao.com/oauth/authorize"
+KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
+KAKAO_USERINFO_URL = "https://kapi.kakao.com/v2/user/me"
+
+
+def kakao_enabled() -> bool:
+    """Kakao login is only offered when a REST API key is configured."""
+    return bool(KAKAO_REST_API_KEY)
 _INVITE_ALPHABET = string.ascii_uppercase + string.digits  # unambiguous enough
 
 # ---- minimal in-memory login rate limiting (per IP) ----
@@ -76,6 +93,8 @@ def create_app():
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        # Bring pre-existing tables (live Postgres) up to date for Kakao login.
+        run_startup_migrations()
         # Seed the configurable app name once.
         if Setting.get("app_name") is None:
             Setting.set("app_name", DEFAULT_APP_NAME)
@@ -101,6 +120,31 @@ def _gen_invite_code():
         if not Couple.query.filter_by(invite_code=code).first():
             return code
     raise RuntimeError("could not generate a unique invite code")
+
+
+def _resolve_couple_for_join(invite_code: str):
+    """Shared couple-attach logic for both email signup and Kakao connect.
+
+    ``invite_code`` must already be normalized (stripped/upper-cased); "" means
+    "create a new space". Returns ``(couple, is_admin, status, error)`` — on any
+    validation failure ``couple`` is None and ``error`` is a Korean message.
+
+    Mirrors the original signup rules exactly so both paths stay in sync:
+      * no code  → create a new Couple, become admin, status 'approved'
+      * has code → join an existing (non-full) Couple, status 'pending'
+    """
+    if invite_code:
+        couple = Couple.query.filter_by(invite_code=invite_code).first()
+        if not couple:
+            return None, None, None, "초대 코드가 올바르지 않아."
+        if couple.is_full:
+            return None, None, None, "이 커플 공간은 이미 두 명이 꽉 찼어."
+        return couple, False, "pending", None
+    # First user → creates the couple space, becomes admin.
+    couple = Couple(invite_code=_gen_invite_code())
+    db.session.add(couple)
+    db.session.flush()  # get couple.id
+    return couple, True, "approved", None
 
 
 def login_required(view):
@@ -179,6 +223,7 @@ def _register_routes(app: Flask):
         return {
             "app_name": Setting.get("app_name", DEFAULT_APP_NAME),
             "me": current_user(),
+            "kakao_enabled": kakao_enabled(),
         }
 
     # ---- landing / dashboard ----
@@ -241,35 +286,18 @@ def _register_routes(app: Flask):
                 flash("이미 가입된 이메일이야.", "error")
                 return render_template("signup.html")
 
-            if invite_code:
-                couple = Couple.query.filter_by(invite_code=invite_code).first()
-                if not couple:
-                    flash("초대 코드가 올바르지 않아.", "error")
-                    return render_template("signup.html")
-                if couple.is_full:
-                    flash("이 커플 공간은 이미 두 명이 꽉 찼어.", "error")
-                    return render_template("signup.html")
-                user = User(
-                    email=email,
-                    password_hash=generate_password_hash(password),
-                    display_name=display_name,
-                    couple_id=couple.id,
-                    is_admin=False,
-                    status="pending",  # awaits admin approval
-                )
-            else:
-                # First user → creates the couple space, becomes admin.
-                couple = Couple(invite_code=_gen_invite_code())
-                db.session.add(couple)
-                db.session.flush()  # get couple.id
-                user = User(
-                    email=email,
-                    password_hash=generate_password_hash(password),
-                    display_name=display_name,
-                    couple_id=couple.id,
-                    is_admin=True,
-                    status="approved",
-                )
+            couple, is_admin, status, err = _resolve_couple_for_join(invite_code)
+            if err:
+                flash(err, "error")
+                return render_template("signup.html")
+            user = User(
+                email=email,
+                password_hash=generate_password_hash(password),
+                display_name=display_name,
+                couple_id=couple.id,
+                is_admin=is_admin,
+                status=status,
+            )
             db.session.add(user)
             db.session.commit()
             session.clear()
@@ -306,6 +334,165 @@ def _register_routes(app: Flask):
     def logout():
         session.clear()
         return redirect(url_for("login"))
+
+    # ---- Kakao social login ----
+    def _kakao_redirect_uri() -> str:
+        # Must exactly match the redirect URI registered in the Kakao console.
+        # Force https: on Render we sit behind a TLS proxy, so _external alone
+        # can yield http.
+        return url_for("kakao_callback", _external=True, _scheme="https")
+
+    @app.route("/auth/kakao/login")
+    def kakao_login():
+        if current_user():
+            return redirect(url_for("index"))
+        if not kakao_enabled():
+            flash("카카오 로그인이 설정되지 않았어.", "error")
+            return redirect(url_for("login"))
+        # CSRF: random state stored in session, verified on callback.
+        state = secrets.token_urlsafe(24)
+        session["kakao_oauth_state"] = state
+        params = {
+            "client_id": KAKAO_REST_API_KEY,
+            "redirect_uri": _kakao_redirect_uri(),
+            "response_type": "code",
+            "state": state,
+        }
+        return redirect(KAKAO_AUTHORIZE_URL + "?" + urlencode(params))
+
+    @app.route("/auth/kakao/callback")
+    def kakao_callback():
+        if not kakao_enabled():
+            abort(404)
+        # Verify state (CSRF protection). Pop so it can't be replayed.
+        expected = session.pop("kakao_oauth_state", None)
+        got = request.args.get("state")
+        if not expected or not got or not secrets.compare_digest(expected, got):
+            flash("카카오 로그인 검증에 실패했어. 다시 시도해줘.", "error")
+            return redirect(url_for("login"))
+        if request.args.get("error"):
+            flash("카카오 로그인이 취소됐어.", "error")
+            return redirect(url_for("login"))
+        code = request.args.get("code")
+        if not code:
+            flash("카카오 인증 코드를 받지 못했어.", "error")
+            return redirect(url_for("login"))
+
+        # Exchange authorization code for an access token.
+        token_data = {
+            "grant_type": "authorization_code",
+            "client_id": KAKAO_REST_API_KEY,
+            "redirect_uri": _kakao_redirect_uri(),
+            "code": code,
+        }
+        if KAKAO_CLIENT_SECRET:
+            token_data["client_secret"] = KAKAO_CLIENT_SECRET
+        try:
+            tr = requests.post(KAKAO_TOKEN_URL, data=token_data, timeout=10)
+            tr.raise_for_status()
+            access_token = tr.json().get("access_token")
+        except requests.RequestException:
+            log.exception("kakao token exchange failed")  # never log token body
+            access_token = None
+        if not access_token:
+            flash("카카오 인증에 실패했어. 다시 시도해줘.", "error")
+            return redirect(url_for("login"))
+
+        # Fetch the Kakao profile.
+        try:
+            ur = requests.get(
+                KAKAO_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10,
+            )
+            ur.raise_for_status()
+            profile = ur.json()
+        except requests.RequestException:
+            log.exception("kakao userinfo fetch failed")
+            flash("카카오 프로필을 가져오지 못했어. 다시 시도해줘.", "error")
+            return redirect(url_for("login"))
+
+        kakao_id = profile.get("id")
+        if kakao_id is None:
+            flash("카카오 사용자 정보를 확인하지 못했어.", "error")
+            return redirect(url_for("login"))
+        kakao_id = str(kakao_id)  # stable identity
+        account = profile.get("kakao_account") or {}
+        kprofile = account.get("profile") or {}
+        props = profile.get("properties") or {}
+        nickname = (
+            kprofile.get("nickname") or props.get("nickname") or "카카오 사용자"
+        )[:60]
+
+        # Existing Kakao user → just log in.
+        user = User.query.filter_by(kakao_id=kakao_id).first()
+        if user:
+            session.clear()
+            session["user_id"] = user.id
+            session.permanent = True
+            return redirect(url_for("index"))
+
+        # New Kakao user → needs to choose/join a couple space next.
+        session["pending_kakao_id"] = kakao_id
+        session["pending_kakao_nickname"] = nickname
+        return redirect(url_for("kakao_connect"))
+
+    @app.route("/auth/kakao/connect", methods=["GET", "POST"])
+    def kakao_connect():
+        if current_user():
+            return redirect(url_for("index"))
+        kakao_id = session.get("pending_kakao_id")
+        nickname = session.get("pending_kakao_nickname")
+        if not kakao_id:
+            # No pending Kakao identity — start over.
+            return redirect(url_for("login"))
+
+        if request.method == "POST":
+            # Guard against a duplicate that appeared between callback and submit.
+            if User.query.filter_by(kakao_id=kakao_id).first():
+                session.pop("pending_kakao_id", None)
+                session.pop("pending_kakao_nickname", None)
+                flash("이미 연결된 카카오 계정이야. 다시 로그인해줘.", "error")
+                return redirect(url_for("login"))
+
+            display_name = (request.form.get("display_name") or nickname or "").strip()
+            display_name = display_name[:60]
+            invite_code = (request.form.get("invite_code") or "").strip().upper()
+            if not display_name:
+                flash("이름을 입력해줘.", "error")
+                return render_template(
+                    "kakao_connect.html", nickname=nickname, invite_code=invite_code
+                )
+
+            couple, is_admin, status, err = _resolve_couple_for_join(invite_code)
+            if err:
+                flash(err, "error")
+                return render_template(
+                    "kakao_connect.html", nickname=nickname, invite_code=invite_code
+                )
+            user = User(
+                kakao_id=kakao_id,
+                display_name=display_name,
+                couple_id=couple.id,
+                is_admin=is_admin,
+                status=status,
+            )
+            db.session.add(user)
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                flash("연결 중 문제가 생겼어. 다시 시도해줘.", "error")
+                return redirect(url_for("login"))
+
+            session.clear()
+            session["user_id"] = user.id
+            session.permanent = True  # 새 커플은 로그인 상태 유지
+            return redirect(url_for("index"))
+
+        return render_template(
+            "kakao_connect.html", nickname=nickname, invite_code=""
+        )
 
     # ---- couple approval ----
     @app.route("/approve/<int:user_id>", methods=["POST"])
