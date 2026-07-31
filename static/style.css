@@ -139,6 +139,8 @@ textarea { resize: vertical; }
 /* Kakao brand button (official yellow #FEE500 / dark label #191600) */
 .btn.kakao { background: #FEE500; color: #191600; width: 100%; }
 .btn.kakao:hover { filter: brightness(0.97); }
+/* vertical spacing between stacked account actions (link / unlink / logout) */
+.stack-sm { margin-top: 12px; }
 
 /* "또는" divider between email form and social login */
 .or-divider {
