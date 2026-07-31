@@ -228,8 +228,9 @@ def upload_photo(file_bytes: bytes, filename: str):
     Returns ``(item_id, stored_name)`` — the OneDrive drive-item id (the
     load-bearing handle for fetch/delete) and the sanitized unique name we
     actually stored it under (so the caller can record the true name, not a
-    re-derived guess). Simple PUT upload (fine for the ≤15 MB photos the route
-    caps at). Ensures the dedicated folder exists first. Raises OneDriveError on
+    re-derived guess). Simple PUT upload (fine for the ≤50 MB photos the route
+    caps at; Graph simple upload allows up to 250 MB). Ensures the dedicated
+    folder exists first. Raises OneDriveError on
     any failure.
     """
     try:

@@ -86,7 +86,7 @@
         <label class="upload-drop" for="photo-input">
           <img class="emoji" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
           <span class="upload-drop-title" id="upload-drop-title">사진 고르기</span>
-          <span class="muted small">여러 장 한 번에 · 이미지 15MB 이하</span>
+          <span class="muted small">여러 장 한 번에 · 이미지 50MB 이하</span>
           <input id="photo-input" type="file" name="photos" accept="image/*" multiple hidden />
         </label>
         <div class="upload-preview" id="upload-preview" hidden></div>
@@ -95,6 +95,9 @@
                  placeholder="이 순간을 한 줄로 남겨봐" />
         </label>
         <button class="btn primary" id="upload-submit" type="submit" disabled>업로드</button>
+        {# JS 업로더 진행/결과 표시. JS가 꺼져 있으면 폼이 그대로 전송된다(폴백). #}
+        <p class="upload-status muted small" id="upload-status" role="status"
+           aria-live="polite" hidden></p>
       </form>
     </div>
   </div>
@@ -137,11 +140,27 @@
     var form = document.getElementById("upload-form");
     var dropTitle = document.getElementById("upload-drop-title");
     var captionField = document.getElementById("caption-field");
+    var status = document.getElementById("upload-status");
+    var captionInput = form.querySelector('input[name="caption"]');
+    var MAX_SELECT = 100;   // 한 번에 고를 수 있는 사진 수(과다 선택 방지)
+    var uploading = false;
+
+    function setStatus(msg) {
+      if (!status) return;
+      if (msg) { status.textContent = msg; status.hidden = false; }
+      else { status.textContent = ""; status.hidden = true; }
+    }
 
     input.addEventListener("change", function () {
       preview.innerHTML = "";
+      setStatus("");
       var files = Array.prototype.slice.call(input.files || []);
       var imgs = files.filter(function (f) { return f.type.indexOf("image/") === 0; });
+      if (imgs.length > MAX_SELECT) {
+        setStatus("한 번에 최대 " + MAX_SELECT + "장까지 올릴 수 있어. 처음 "
+                  + MAX_SELECT + "장만 올릴게.");
+        imgs = imgs.slice(0, MAX_SELECT);
+      }
       if (!imgs.length) {
         preview.hidden = true;
         submit.disabled = true;
@@ -166,9 +185,79 @@
       if (captionField) captionField.hidden = imgs.length > 1;
     });
 
-    form.addEventListener("submit", function () {
+    // ---- sequential per-photo upload (하나씩 순차 전송) --------------------- #
+    // 선택한 사진을 한 요청에 몰아 보내지 않고 1장씩 fetch로 순차 전송한다. 작은
+    // Render 워커/ OneDrive가 300MB 멀티파트 하나에 OOM/타임아웃 나던 걸 막는다.
+    // JS가 없으면 이 핸들러가 안 붙고 폼이 그대로 전송된다(서버가 다중 파일 처리).
+    function uploadOne(file, withCaption) {
+      var fd = new FormData();
+      fd.append("photos", file, file.name);
+      // 한마디(캡션)는 딱 1장일 때만 의미 있다.
+      if (withCaption && captionInput && captionInput.value.trim()) {
+        fd.append("caption", captionInput.value.trim());
+      }
+      // ajax 신호: 쿼리 플래그 + 헤더 둘 다 줘서 프록시가 하나를 지워도 안전하게.
+      var url = form.action + (form.action.indexOf("?") >= 0 ? "&" : "?") + "ajax=1";
+      return fetch(url, {
+        method: "POST",
+        headers: { "X-Requested-With": "fetch", "Accept": "application/json" },
+        body: fd,
+        credentials: "same-origin",
+      }).then(function (resp) {
+        return resp.json().catch(function () { return { ok: false }; });
+      }).then(function (data) {
+        return !!(data && data.ok && data.saved);
+      }).catch(function () {
+        return false;  // 네트워크 오류 → 실패로 집계
+      });
+    }
+
+    form.addEventListener("submit", function (e) {
+      var files = Array.prototype.slice.call(input.files || []);
+      var imgs = files.filter(function (f) { return f.type.indexOf("image/") === 0; });
+      if (imgs.length > MAX_SELECT) imgs = imgs.slice(0, MAX_SELECT);
+      if (!imgs.length || uploading) return;  // 없으면/진행중이면 폼 기본동작 막지 않음
+
+      // 여기서부터 JS가 인계 — 기본 전송을 막고 1장씩 보낸다.
+      e.preventDefault();
+      uploading = true;
       submit.disabled = true;
-      submit.textContent = "업로드 중…";
+
+      var total = imgs.length;
+      var withCaption = total === 1;
+      var done = 0;
+      var failedNames = [];
+
+      function step(i) {
+        if (i >= total) return finish();
+        submit.textContent = "업로드 중…";
+        setStatus((i + 1) + "/" + total + " 업로드 중…");
+        uploadOne(imgs[i], withCaption).then(function (ok) {
+          done += 1;
+          if (!ok) failedNames.push(imgs[i].name);
+          step(i + 1);  // 반드시 이전 요청이 끝난 뒤 다음 장 전송
+        });
+      }
+
+      function finish() {
+        if (failedNames.length) {
+          var okCount = total - failedNames.length;
+          setStatus(okCount + "/" + total + " 저장됨 · 실패: "
+                    + failedNames.join(", ") + " — 잠시 후 새로고침할게.");
+          // 버튼을 새로고침 전용으로 바꾼다(폼 재전송 방지: type=button).
+          submit.textContent = "새로고침";
+          submit.type = "button";
+          submit.disabled = false;
+          submit.onclick = function () { window.location.href = "/memories"; };
+          // 실패 목록을 잠깐 읽을 시간을 준 뒤 새 그리드로 새로고침.
+          setTimeout(function () { window.location.href = "/memories"; }, 4000);
+        } else {
+          setStatus(total + "장 저장 완료! 새로고침 중…");
+          window.location.href = "/memories";
+        }
+      }
+
+      step(0);
     });
   }
 
