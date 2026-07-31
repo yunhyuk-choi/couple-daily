@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}월간 인사이트 · {{ app_name }}{% endblock %}
+{% macro trend_label(t) -%}
+  {%- if t == 'up' -%}점점 길어지는 중{%- elif t == 'down' -%}조금 짧아지는 중{%- elif t == 'flat' -%}꾸준한 편{%- else -%}데이터 부족{%- endif -%}
+{%- endmacro %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="" />
+  <h1>월간 관계 인사이트</h1>
+</div>
+
+<div class="month-nav">
+  <a class="btn ghost sm" href="{{ url_for('insight', year=prev[0], month=prev[1]) }}">← 이전 달</a>
+  <span class="month-label">{{ stats.month_label }}</span>
+  <a class="btn ghost sm" href="{{ url_for('insight', year=next[0], month=next[1]) }}">다음 달 →</a>
+</div>
+
+{% if not has_data %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
+    <p class="muted">이 달엔 아직 답변 기록이 없어. 오늘의 질문에 답을 쌓아가 보자!</p>
+  </div>
+{% else %}
+  <!-- Quantitative: computed from the DB, honest counts only -->
+  <div class="stat-grid">
+    <div class="card stat">
+      <div class="stat-num">{{ stats.both_answered_days }}/{{ stats.total_days }}</div>
+      <div class="stat-label">둘 다 답한 날 / 질문이 있던 날</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-num">{{ stats.best_streak }}일</div>
+      <div class="stat-label">최고 연속 기록 (둘 다 답한 날)</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-num">{{ stats.participation_a.days }} · {{ stats.participation_b.days }}</div>
+      <div class="stat-label">답변한 날 ({{ stats.participation_a.name }} · {{ stats.participation_b.name }})</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-num">
+        {% if stats.first_answerer == 'tie' %}비슷비슷{% else %}{{ stats.first_answerer }}{% endif %}
+      </div>
+      <div class="stat-label">먼저 답하는 편</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-num">{{ stats.avg_len_a.avg }}자</div>
+      <div class="stat-label">{{ stats.avg_len_a.name }} 평균 답 길이 · {{ trend_label(stats.avg_len_a.trend) }}</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-num">{{ stats.avg_len_b.avg }}자</div>
+      <div class="stat-label">{{ stats.avg_len_b.name }} 평균 답 길이 · {{ trend_label(stats.avg_len_b.trend) }}</div>
+    </div>
+  </div>
+
+  <!-- Qualitative: grounded in real answers via claude -p -->
+  <div class="card insight-card">
+    <div class="q-head">
+      <img class="emoji" src="{{ url_for('static', filename='emoji/sparkles.svg') }}" alt="" />
+      <span>이번 달, 두 사람의 이야기</span>
+    </div>
+    {% if qualitative %}
+      {% if qualitative.summary %}<p class="insight-summary">{{ qualitative.summary }}</p>{% endif %}
+      {% if qualitative.themes %}
+        <div class="themes">
+          {% for t in qualitative.themes %}<span class="chip">{{ t }}</span>{% endfor %}
+        </div>
+      {% endif %}
+      {% if qualitative.tone %}
+      <div class="insight-row"><strong>분위기</strong><span>{{ qualitative.tone }}</span></div>
+      {% endif %}
+      {% if qualitative.divergent_question %}
+      <div class="insight-row"><strong>가장 달랐던 질문</strong><span>{{ qualitative.divergent_question }}</span></div>
+      {% endif %}
+      {% if qualitative.fun %}
+      <div class="insight-row fun"><strong>재미용</strong><span>{{ qualitative.fun }}</span></div>
+      {% endif %}
+      <p class="muted small">이 관찰은 두 사람이 실제로 남긴 답변만을 근거로 claude가 정리했어. 점수가 아니라 부드러운 관찰이야.</p>
+    {% else %}
+      <p class="muted">이번 달 이야기를 정리하지 못했어 (AI 생성 일시 실패). 잠시 후 다시 열어봐.</p>
+    {% endif %}
+  </div>
+{% endif %}
+{% endblock %}

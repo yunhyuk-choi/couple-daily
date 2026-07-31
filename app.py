@@ -1,126 +1,472 @@
-from flask import Flask, render_template, request, Response, jsonify
-import subprocess
-import re
+"""couple-daily — a tiny daily-question app for exactly two people.
 
-app = Flask(__name__)
+Identity constraint (do not violate): the AI mechanism is the `claude` CLI run
+as a backend subprocess (see ai.py), NOT the Anthropic API/SDK. This file wires
+Flask + SQLAlchemy, auth, couple linking, the daily question, monthly insight,
+settings and PWA plumbing on top of that.
 
-# ANSI 색상 코드(터미널 특수문자) 제거용 정규식
-ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+Run locally:   python app.py            (SQLite fallback, debug reloader)
+Run in prod:   gunicorn 'app:create_app()'   (Postgres via DATABASE_URL)
+"""
+import functools
+import os
+import secrets
+import string
+import time
+from datetime import date, datetime
 
-# 글로벌 변수로 로그인 프로세스 상태 보관
-login_process = None 
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    send_from_directory,
+    url_for,
+)
+from sqlalchemy.exc import IntegrityError
+from werkzeug.security import check_password_hash, generate_password_hash
 
-@app.route('/')
-def index():
-    """메인 화면 렌더링"""
-    return render_template('intex.html')
+import ai
+import insights
+from models import Answer, Couple, DailyQuestion, Setting, User, db
 
-@app.route('/start-login', methods=['POST'])
-def start_login():
-    """클로드 로그인 프로세스 시작 및 URL 추출"""
-    global login_process
-    
-    # 기존 로그인 프로세스가 있으면 강제 종료
-    if login_process:
-        login_process.kill()
-        
-    try:
-        # 백그라운드에서 로그인 명령어 실행
-        login_process = subprocess.Popen(
-            ['claude', 'auth', 'login'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1
+DEFAULT_APP_NAME = os.environ.get("APP_NAME", "우리의 하루")
+_INVITE_ALPHABET = string.ascii_uppercase + string.digits  # unambiguous enough
+
+# ---- minimal in-memory login rate limiting (per IP) ----
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_RL_WINDOW = 300  # seconds
+_RL_MAX = 8       # attempts per window
+
+
+def _normalize_db_url(url: str) -> str:
+    # Heroku/Fly sometimes hand out postgres://; SQLAlchemy 2.x wants postgresql://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+def create_app():
+    app = Flask(__name__)
+
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        db_url = _normalize_db_url(db_url)
+    else:
+        # Local dev fallback: SQLite file in instance/ so it runs without Postgres.
+        os.makedirs(app.instance_path, exist_ok=True)
+        db_url = "sqlite:///" + os.path.join(app.instance_path, "couple_daily.db")
+
+    is_prod = os.environ.get("FLASK_ENV") == "production" or bool(os.environ.get("DATABASE_URL"))
+
+    app.config.update(
+        SECRET_KEY=os.environ.get("SECRET_KEY", "dev-insecure-change-me"),
+        SQLALCHEMY_DATABASE_URI=db_url,
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=is_prod,  # HTTPS-only cookies in prod
+    )
+
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
+        # Seed the configurable app name once.
+        if Setting.get("app_name") is None:
+            Setting.set("app_name", DEFAULT_APP_NAME)
+            db.session.commit()
+
+    _register_routes(app)
+    return app
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def current_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    return db.session.get(User, uid)
+
+
+def _gen_invite_code():
+    for _ in range(20):
+        code = "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(8))
+        if not Couple.query.filter_by(invite_code=code).first():
+            return code
+    raise RuntimeError("could not generate a unique invite code")
+
+
+def login_required(view):
+    @functools.wraps(view)
+    def wrapped(*a, **kw):
+        if not current_user():
+            return redirect(url_for("login", next=request.path))
+        return view(*a, **kw)
+
+    return wrapped
+
+
+def active_couple_required(view):
+    """Only approved + linked users may use the core features."""
+    @functools.wraps(view)
+    def wrapped(*a, **kw):
+        u = current_user()
+        if not u:
+            return redirect(url_for("login"))
+        if not u.is_active_couple:
+            return redirect(url_for("index"))
+        return view(*a, **kw)
+
+    return wrapped
+
+
+def _rate_limited(ip: str) -> bool:
+    now = time.time()
+    hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _RL_WINDOW]
+    _LOGIN_ATTEMPTS[ip] = hits
+    return len(hits) >= _RL_MAX
+
+
+def _record_attempt(ip: str):
+    _LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+def get_or_create_today_question(couple: Couple) -> DailyQuestion:
+    today = date.today()
+    q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
+    if q:
+        return q
+
+    # Personalize from recent history (most recent first, excluding today).
+    recent = (
+        DailyQuestion.query.filter(
+            DailyQuestion.couple_id == couple.id, DailyQuestion.q_date < today
         )
-        
-        auth_url = None
-        
-        # 출력 스트림에서 https:// 로 시작하는 인증 링크 찾기
-        for line in iter(login_process.stdout.readline, ''):
-            url_match = re.search(r'(https://[^\s]+)', line)
-            if url_match:
-                auth_url = url_match.group(1)
-                break # URL을 찾았으므로 읽기 중단 (프로세스는 로컬호스트 콜백 대기 상태로 유지됨)
+        .order_by(DailyQuestion.q_date.desc())
+        .limit(8)
+        .all()
+    )
+    recent_pairs = [
+        {"question": r.text, "answers": [a.text for a in r.answers.all()]}
+        for r in recent
+    ]
+    text, source = ai.generate_daily_question(recent_pairs)
 
-        if auth_url:
-            return jsonify({"status": "success", "url": auth_url})
+    q = DailyQuestion(couple_id=couple.id, q_date=today, text=text, source=source)
+    db.session.add(q)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # Partner generated it concurrently — take theirs.
+        db.session.rollback()
+        q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
+    return q
+
+
+# --------------------------------------------------------------------------- #
+# Routes
+# --------------------------------------------------------------------------- #
+def _register_routes(app: Flask):
+    @app.context_processor
+    def inject_globals():
+        return {
+            "app_name": Setting.get("app_name", DEFAULT_APP_NAME),
+            "me": current_user(),
+        }
+
+    # ---- landing / dashboard ----
+    @app.route("/")
+    def index():
+        u = current_user()
+        if not u:
+            return redirect(url_for("login"))
+        if not u.couple_id:
+            # Shouldn't normally happen (signup always attaches a couple), but guard.
+            return render_template("no_couple.html")
+        if u.status == "pending":
+            return render_template("pending.html")
+
+        couple = u.couple
+        # Admin waiting for a partner to accept.
+        pending_partner = couple.members.filter_by(status="pending").first()
+        if u.is_admin and pending_partner:
+            return render_template(
+                "approve.html", pending=pending_partner, invite_code=couple.invite_code
+            )
+        # Approved but partner hasn't joined yet.
+        if len(couple.approved_members) < 2:
+            return render_template("waiting_partner.html", invite_code=couple.invite_code)
+
+        # Full, active couple → today's question.
+        q = get_or_create_today_question(couple)
+        partner = u.partner
+        my_ans = q.answer_by(u.id)
+        partner_ans = q.answer_by(partner.id) if partner else None
+        revealed = q.both_answered
+        return render_template(
+            "dashboard.html",
+            question=q,
+            my_ans=my_ans,
+            partner_ans=partner_ans,
+            partner=partner,
+            revealed=revealed,
+            today=q.q_date,
+        )
+
+    # ---- auth ----
+    @app.route("/signup", methods=["GET", "POST"])
+    def signup():
+        if current_user():
+            return redirect(url_for("index"))
+        if request.method == "POST":
+            email = (request.form.get("email") or "").strip().lower()
+            password = request.form.get("password") or ""
+            display_name = (request.form.get("display_name") or "").strip()
+            invite_code = (request.form.get("invite_code") or "").strip().upper()
+
+            if not email or not password or not display_name:
+                flash("이메일, 비밀번호, 이름을 모두 입력해줘.", "error")
+                return render_template("signup.html")
+            if len(password) < 8:
+                flash("비밀번호는 8자 이상으로 해줘.", "error")
+                return render_template("signup.html")
+            if User.query.filter_by(email=email).first():
+                flash("이미 가입된 이메일이야.", "error")
+                return render_template("signup.html")
+
+            if invite_code:
+                couple = Couple.query.filter_by(invite_code=invite_code).first()
+                if not couple:
+                    flash("초대 코드가 올바르지 않아.", "error")
+                    return render_template("signup.html")
+                if couple.is_full:
+                    flash("이 커플 공간은 이미 두 명이 꽉 찼어.", "error")
+                    return render_template("signup.html")
+                user = User(
+                    email=email,
+                    password_hash=generate_password_hash(password),
+                    display_name=display_name,
+                    couple_id=couple.id,
+                    is_admin=False,
+                    status="pending",  # awaits admin approval
+                )
+            else:
+                # First user → creates the couple space, becomes admin.
+                couple = Couple(invite_code=_gen_invite_code())
+                db.session.add(couple)
+                db.session.flush()  # get couple.id
+                user = User(
+                    email=email,
+                    password_hash=generate_password_hash(password),
+                    display_name=display_name,
+                    couple_id=couple.id,
+                    is_admin=True,
+                    status="approved",
+                )
+            db.session.add(user)
+            db.session.commit()
+            session.clear()
+            session["user_id"] = user.id
+            return redirect(url_for("index"))
+        return render_template("signup.html")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if current_user():
+            return redirect(url_for("index"))
+        if request.method == "POST":
+            ip = request.remote_addr or "unknown"
+            if _rate_limited(ip):
+                flash("로그인 시도가 너무 많아. 잠시 후 다시 시도해줘.", "error")
+                return render_template("login.html"), 429
+            email = (request.form.get("email") or "").strip().lower()
+            password = request.form.get("password") or ""
+            user = User.query.filter_by(email=email).first()
+            if not user or not check_password_hash(user.password_hash, password):
+                _record_attempt(ip)
+                flash("이메일 또는 비밀번호가 맞지 않아.", "error")
+                return render_template("login.html")
+            session.clear()
+            session["user_id"] = user.id
+            nxt = request.args.get("next")
+            return redirect(nxt or url_for("index"))
+        return render_template("login.html")
+
+    @app.route("/logout", methods=["POST"])
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
+    # ---- couple approval ----
+    @app.route("/approve/<int:user_id>", methods=["POST"])
+    @login_required
+    def approve(user_id):
+        u = current_user()
+        if not u.is_admin:
+            abort(403)
+        partner = User.query.get_or_404(user_id)
+        if partner.couple_id != u.couple_id or partner.status != "pending":
+            abort(400)
+        partner.status = "approved"
+        db.session.commit()
+        flash(f"{partner.display_name}님과 연결됐어! 이제 함께 시작해봐.", "ok")
+        return redirect(url_for("index"))
+
+    # ---- daily answer ----
+    @app.route("/answer", methods=["POST"])
+    @active_couple_required
+    def answer():
+        u = current_user()
+        text = (request.form.get("answer") or "").strip()
+        if not text:
+            flash("답변을 입력해줘.", "error")
+            return redirect(url_for("index"))
+        q = get_or_create_today_question(u.couple)
+        existing = q.answer_by(u.id)
+        if existing:
+            existing.text = text  # allow editing until reveal is fine; keep simple
         else:
-            return jsonify({"status": "error", "message": "로그인 URL을 찾을 수 없습니다."})
-            
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+            db.session.add(Answer(question_id=q.id, user_id=u.id, text=text))
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+        return redirect(url_for("index"))
 
-@app.route('/complete-login', methods=['POST'])
-def complete_login():
-    """프론트에서 받은 인증 코드(code#state)를 로그인 프로세스 stdin에 써서 완료"""
-    global login_process
-    data = request.json
-    code = (data.get('code') or '').strip()
-
-    if not code:
-        return jsonify({"status": "error", "message": "인증 코드가 비어 있습니다."})
-
-    if not login_process or login_process.poll() is not None:
-        return jsonify({"status": "error", "message": "대기 중인 로그인 프로세스가 없습니다. 1단계부터 다시 시작하세요."})
-
-    try:
-        # 코드 붙여넣기를 기다리는 CLI의 stdin에 코드를 써줌
-        login_process.stdin.write(code + "\n")
-        login_process.stdin.flush()
-
-        # 코드 교환이 끝나면 CLI가 남은 출력을 뱉고 종료 → EOF까지 읽어 성공/실패 판정
-        output_lines = []
-        for line in iter(login_process.stdout.readline, ''):
-            clean_line = ansi_escape.sub('', line).strip()
-            if clean_line:
-                output_lines.append(clean_line)
-
-        login_process.wait(timeout=15)
-        rc = login_process.returncode
-        result_text = "\n".join(output_lines)
-        login_process = None
-
-        if rc == 0:
-            return jsonify({"status": "success", "message": "로그인 완료!", "detail": result_text[-500:]})
-        return jsonify({"status": "error", "message": f"로그인 실패 (exit {rc}): {result_text[-300:]}"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-@app.route('/ask', methods=['POST'])
-def ask():
-    """클로드 코드 CLI 호출 및 스트리밍 응답 (채팅)"""
-    user_input = request.form.get('prompt')
-    
-    if not user_input:
-        return "입력값이 없습니다.", 400
-
-    def generate_output():
-        # 클로드 코드 실행 (사용자 입력을 인자로 전달)
-        process = subprocess.Popen(
-            ['claude', '-p', user_input],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1
+    # ---- history ----
+    @app.route("/history")
+    @active_couple_required
+    def history():
+        u = current_user()
+        partner = u.partner
+        qs = (
+            DailyQuestion.query.filter_by(couple_id=u.couple_id)
+            .order_by(DailyQuestion.q_date.desc())
+            .all()
         )
-        
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                # 터미널 색상 찌꺼기 제거 후 줄바꿈 태그로 변환
-                clean_line = ansi_escape.sub('', line).strip()
-                if clean_line:
-                    yield f"{clean_line}<br>\n"
-                    
-        process.stdout.close()
-        process.wait()
+        items = []
+        for q in qs:
+            my = q.answer_by(u.id)
+            pa = q.answer_by(partner.id) if partner else None
+            items.append(
+                {
+                    "date": q.q_date,
+                    "question": q.text,
+                    "revealed": q.both_answered,
+                    "mine": my.text if my else None,
+                    "partner": pa.text if (pa and q.both_answered) else None,
+                }
+            )
+        return render_template("history.html", items=items, partner=partner)
 
-    return Response(generate_output(), mimetype='text/html')
+    # ---- monthly insight ----
+    @app.route("/insight")
+    @active_couple_required
+    def insight():
+        u = current_user()
+        partner = u.partner
+        today = date.today()
+        try:
+            year = int(request.args.get("year", today.year))
+            month = int(request.args.get("month", today.month))
+            if not (1 <= month <= 12):
+                raise ValueError
+        except (TypeError, ValueError):
+            year, month = today.year, today.month
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+        stats = insights.compute_monthly_stats(u.couple_id, year, month, u, partner)
+        qa_items = insights.collect_month_qa(u.couple_id, year, month, u, partner)
+        qualitative = ai.generate_monthly_qualitative(
+            stats["month_label"], u.display_name, partner.display_name, qa_items
+        )
+        # previous / next month links
+        prev_m = (month - 1) or 12
+        prev_y = year - 1 if month == 1 else year
+        next_m = 1 if month == 12 else month + 1
+        next_y = year + 1 if month == 12 else year
+        return render_template(
+            "insight.html",
+            stats=stats,
+            qualitative=qualitative,
+            has_data=bool(qa_items),
+            year=year,
+            month=month,
+            prev=(prev_y, prev_m),
+            next=(next_y, next_m),
+        )
+
+    # ---- settings ----
+    @app.route("/settings", methods=["GET", "POST"])
+    @login_required
+    def settings():
+        u = current_user()
+        if request.method == "POST":
+            new_name = (request.form.get("app_name") or "").strip()
+            new_display = (request.form.get("display_name") or "").strip()
+            if new_name:
+                Setting.set("app_name", new_name[:60])
+            if new_display:
+                u.display_name = new_display[:60]
+            db.session.commit()
+            flash("설정을 저장했어.", "ok")
+            return redirect(url_for("settings"))
+        return render_template(
+            "settings.html", current_app_name=Setting.get("app_name", DEFAULT_APP_NAME)
+        )
+
+    # ---- PWA plumbing ----
+    @app.route("/manifest.json")
+    def manifest():
+        name = Setting.get("app_name", DEFAULT_APP_NAME)
+        return jsonify(
+            {
+                "name": name,
+                "short_name": name,
+                "start_url": "/",
+                "scope": "/",
+                "display": "standalone",
+                "background_color": "#fff1f6",
+                "theme_color": "#ff6b9d",
+                "lang": "ko",
+                "icons": [
+                    {"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                    {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                    {
+                        "src": "/static/icons/maskable-512.png",
+                        "sizes": "512x512",
+                        "type": "image/png",
+                        "purpose": "maskable",
+                    },
+                ],
+            }
+        )
+
+    @app.route("/sw.js")
+    def service_worker():
+        # Served from root so the SW scope covers the whole app.
+        resp = send_from_directory(app.static_folder, "sw.js")
+        resp.headers["Content-Type"] = "application/javascript"
+        resp.headers["Service-Worker-Allowed"] = "/"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    @app.route("/offline")
+    def offline():
+        return render_template("offline.html")
+
+    @app.route("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    # Local dev only. Production uses gunicorn (see Dockerfile / fly.toml).
+    app.run(host="127.0.0.1", port=5000, debug=True)
