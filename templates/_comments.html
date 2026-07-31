@@ -1,0 +1,59 @@
+{# Reusable comment thread. `thread` is [(top_comment, [replies…]), …] from
+   build_comment_thread(); `qid` is the DailyQuestion id; `me` is current user. #}
+
+{% macro _avatar(user) %}
+  {% if user.profile_image_url %}
+    <img class="c-avatar" src="{{ user.profile_image_url }}" alt=""
+         referrerpolicy="no-referrer" loading="lazy" />
+  {% else %}
+    {% set palette = ['#ff8fb1', '#ffb37a', '#8fd6b4', '#8fb6ff', '#c79bff', '#ff9e9e'] %}
+    <span class="c-avatar c-avatar-fallback"
+          style="background: {{ palette[user.id % palette|length] }}">{{ (user.display_name or '?')[:1] }}</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro _comment(c, qid, me, is_reply) %}
+  <div class="comment{% if is_reply %} reply{% endif %}" id="c-{{ c.id }}">
+    {{ _avatar(c.author) }}
+    <div class="c-main">
+      <div class="c-head">
+        <span class="c-author">{{ c.author.display_name }}{% if me and c.author_id == me.id %} · 나{% endif %}</span>
+        <span class="c-time">{{ c.created_at | timeago }}</span>
+      </div>
+      <div class="c-text">{{ c.text }}</div>
+      <details class="c-reply">
+        <summary>답글</summary>
+        <form method="post" action="{{ url_for('add_comment', qid=qid) }}" class="c-form reply">
+          <input type="hidden" name="parent_id" value="{{ c.id }}" />
+          <input type="text" name="text" maxlength="1000" placeholder="답글 달기..." required />
+          <button class="btn primary sm" type="submit">등록</button>
+        </form>
+      </details>
+    </div>
+  </div>
+{% endmacro %}
+
+{% macro render_thread(qid, thread, count, me) %}
+  <div class="comments" id="c-q{{ qid }}">
+    <div class="c-title">
+      <img class="emoji sm" src="{{ url_for('static', filename='emoji/speech_balloon.svg') }}" alt="" />
+      댓글{% if count %} {{ count }}{% endif %}
+    </div>
+    {% if thread %}
+      <div class="c-list">
+        {% for top, replies in thread %}
+          {{ _comment(top, qid, me, false) }}
+          {% for r in replies %}
+            {{ _comment(r, qid, me, true) }}
+          {% endfor %}
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="muted small c-empty">아직 댓글이 없어. 첫 댓글을 남겨봐!</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('add_comment', qid=qid) }}" class="c-form top">
+      <input type="text" name="text" maxlength="1000" placeholder="댓글 달기..." required />
+      <button class="btn primary sm" type="submit">등록</button>
+    </form>
+  </div>
+{% endmacro %}
