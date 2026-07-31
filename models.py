@@ -436,3 +436,81 @@ class MonthlyReport(db.Model):
             return v if isinstance(v, list) else []
         except (ValueError, TypeError):
             return []
+
+
+class Case(db.Model):
+    """A '사건' — one couple's fight brought before the AI judge.
+
+    One partner opens a case with a 상황 설명; each partner can add their own
+    진술(``CaseStatement``). A background thread then runs the slow ``claude -p``
+    judge pass (never on the request path) and stores the parsed verdict here.
+    Scoped to ``couple_id`` so a couple only ever sees their own cases. Created
+    by ``db.create_all()`` — a brand-new table needs no ALTER migration.
+
+    ``status`` lifecycle:
+      * 'open'    — created; awaiting judgment (allows judging once ≥1 진술).
+      * 'judging' — a background thread is running the AI judge.
+      * 'decided' — a verdict is ready (``verdict_json`` populated).
+      * 'failed'  — the AI failed AND there is no prior good verdict to keep.
+    """
+    __tablename__ = "cases"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    # A short label for the list; if empty, the list shows a situation snippet.
+    title = db.Column(db.String(120), nullable=True)
+    situation = db.Column(db.Text, nullable=False)  # 상황 설명
+    status = db.Column(db.String(16), default="open", nullable=False)
+    # The parsed AI verdict as JSON (stored via json.dumps(..., ensure_ascii=False)).
+    verdict_json = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+    decided_at = db.Column(db.DateTime, nullable=True)  # last successful verdict
+
+    creator = db.relationship("User")
+    statements = db.relationship(
+        "CaseStatement", backref="case", cascade="all, delete-orphan"
+    )
+
+    @property
+    def verdict(self):
+        """Decode the stored verdict JSON back to a dict (defensive)."""
+        if not self.verdict_json:
+            return None
+        try:
+            v = json.loads(self.verdict_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+
+class CaseStatement(db.Model):
+    """One partner's 진술 for a case. Each partner has at most one (upsert)."""
+    __tablename__ = "case_statements"
+    __table_args__ = (
+        db.UniqueConstraint("case_id", "user_id", name="uq_case_user"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    case_id = db.Column(
+        db.Integer, db.ForeignKey("cases.id"), nullable=False, index=True
+    )
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    author = db.relationship("User")

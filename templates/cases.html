@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}우리의 재판소 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
+  <h1>우리의 재판소</h1>
+</div>
+
+{% if not items %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
+    <p class="muted">아직 맡긴 사건이 없어.<br />다툰 일이 있으면 오른쪽 아래
+      <strong>+</strong> 버튼으로 사건을 열고 AI 판사에게 판결을 맡겨봐.</p>
+  </div>
+{% else %}
+  <div class="history-list">
+  {% for item in items %}
+    <a class="card history-item" href="{{ url_for('case_detail', case_id=item.id) }}">
+      <div class="date muted">{{ item.created_at.strftime('%Y.%m.%d') }}</div>
+      <h2 class="question-text small">
+        {{ item.title if item.title else (item.situation[:40] ~ ('…' if item.situation|length > 40 else '')) }}
+      </h2>
+      <div class="history-meta">
+        {% if item.status == 'decided' %}
+          <span class="meta-pill revealed">판결 완료</span>
+          {% if item.fault %}
+            <span class="meta-pill fault">
+              {%- for f in item.fault -%}
+                {{ (' · ' if not loop.first else '') }}{{ '나' if me and f.name == me.display_name else f.name }} {{ f.percent }}%
+              {%- endfor -%}
+            </span>
+          {% elif item.summary %}
+            <span class="meta-pill">{{ item.summary[:24] }}{{ '…' if item.summary|length > 24 else '' }}</span>
+          {% endif %}
+        {% elif item.status == 'judging' %}
+          <span class="meta-pill judging">판결 중…</span>
+        {% elif item.status == 'failed' %}
+          <span class="meta-pill">판결 실패</span>
+        {% else %}
+          <span class="meta-pill">판결 전</span>
+        {% endif %}
+        <span class="meta-arrow" aria-hidden="true">›</span>
+      </div>
+    </a>
+  {% endfor %}
+  </div>
+{% endif %}
+
+{# Floating action button — the entry point to opening a new 사건. #}
+<a class="fab glass" id="fab-new-case" href="{{ url_for('case_new') }}"
+   aria-label="새 사건">
+  <span class="fab-plus" aria-hidden="true">+</span>
+</a>
+{% endblock %}
