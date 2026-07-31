@@ -229,7 +229,57 @@ a { color: var(--pink); }
 
 code { background: var(--pink-soft); padding: 2px 6px; border-radius: 6px; font-size: 0.9em; }
 
+/* comments */
+.comments-card { padding: 18px 20px; }
+.comments .c-title {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 800; font-size: 0.95rem; color: var(--ink); margin-bottom: 12px;
+}
+.c-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
+.c-empty { margin: 4px 0 14px; }
+.comment { display: flex; gap: 10px; align-items: flex-start; }
+.comment.reply { margin-left: 34px; }
+.comment.reply .c-main { background: #fff7fa; }
+
+.c-avatar {
+  width: 30px; height: 30px; border-radius: 50%;
+  flex: none; object-fit: cover; border: 1px solid var(--line);
+}
+.c-avatar-fallback {
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: 800; font-size: 0.85rem; line-height: 1;
+  text-transform: uppercase; border: none;
+}
+.c-main {
+  flex: 1; min-width: 0;
+  background: var(--cream);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 8px 12px;
+}
+.c-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.c-author { font-weight: 700; font-size: 0.88rem; }
+.c-time { color: var(--muted); font-size: 0.75rem; }
+.c-text { margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+
+.c-reply { margin-top: 6px; }
+.c-reply summary {
+  cursor: pointer; color: var(--muted); font-size: 0.78rem;
+  font-weight: 600; list-style: none; width: fit-content;
+}
+.c-reply summary::-webkit-details-marker { display: none; }
+.c-reply[open] summary { color: var(--pink); }
+
+.c-form { display: flex; gap: 8px; margin-top: 8px; }
+.c-form input[type="text"] { flex: 1; padding: 9px 12px; }
+.c-form.reply { margin-top: 8px; }
+.c-form.top { margin-top: 4px; }
+.c-form .btn.sm { flex: none; white-space: nowrap; }
+
+.history-comments { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+
 @media (max-width: 420px) {
   .stat-grid { grid-template-columns: 1fr; }
   .quicklinks { flex-direction: column; }
+  .comment.reply { margin-left: 20px; }
 }
