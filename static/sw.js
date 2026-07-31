@@ -4,7 +4,7 @@
  * network-first for pages with an offline fallback. Bump CACHE_VERSION to
  * invalidate old caches on deploy.
  */
-const CACHE_VERSION = "couple-daily-v3";
+const CACHE_VERSION = "couple-daily-v4";
 const APP_SHELL = [
   "/offline",
   "/static/style.css",
@@ -42,11 +42,12 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
 
   if (url.pathname.startsWith("/static/")) {
-    // CSS/JS: stale-while-revalidate — serve cache instantly if present, but
-    // ALWAYS refetch in the background and update the cache, so edits reach
-    // clients on the next load without bumping CACHE_VERSION. If not cached,
-    // go to network then cache.
-    if (/\.(css|js)$/.test(url.pathname)) {
+    // All static assets — CSS/JS AND emoji/icon images (.svg/.png) — use
+    // stale-while-revalidate: serve cache instantly if present, but ALWAYS
+    // refetch in the background and update the cache, so edits (e.g. changed
+    // nav icons) reach clients on the next load without bumping CACHE_VERSION.
+    // If not cached, go to network then cache.
+    if (/\.(css|js|svg|png)$/.test(url.pathname)) {
       event.respondWith(
         caches.open(CACHE_VERSION).then((cache) =>
           cache.match(req).then((hit) => {
@@ -61,7 +62,7 @@ self.addEventListener("fetch", (event) => {
       return;
     }
 
-    // Images/other static assets are immutable: cache-first.
+    // Any other static asset type: cache-first.
     event.respondWith(
       caches.match(req).then((hit) => hit || fetch(req).then((res) => {
         const copy = res.clone();
