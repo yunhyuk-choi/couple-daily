@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import string
+import threading
 import time
 from datetime import date, datetime, timedelta
 from urllib.parse import urlencode
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover
 from flask import (
     Flask,
     abort,
+    current_app,
     flash,
     jsonify,
     redirect,
@@ -47,6 +49,7 @@ from models import (
     Comment,
     Couple,
     DailyQuestion,
+    MonthlyReport,
     Notification,
     PushSubscription,
     Setting,
@@ -344,6 +347,182 @@ def build_comment_thread(q: DailyQuestion):
             replies_of.setdefault(root.id, []).append(c)
     thread = [(t, replies_of.get(t.id, [])) for t in tops]
     return thread, len(comments)
+
+
+# --------------------------------------------------------------------------- #
+# Monthly report — cached AI qualitative insight, (re)built in the background
+# --------------------------------------------------------------------------- #
+# The /insight page must render instantly from the cached MonthlyReport row and
+# NEVER run the slow `claude -p` subprocess on the request path. Generation is
+# offloaded to a daemon thread that owns its own app context + DB session.
+#
+# Concurrency guards (two layers):
+#   * DB-level: the report row's status='generating' + updated_at. A fresh
+#     'generating' means a build is in flight; a 'generating' older than
+#     _STUCK_GENERATING is treated as stale (a crashed/killed thread) and is
+#     retryable so a month can never get stuck showing the placeholder forever.
+#   * In-process: a set of (couple_id, year, month) keys currently generating,
+#     protected by a lock. This is the fast, exact guard for the single-worker
+#     Render free tier (one gunicorn worker) so rapid events don't double-spawn.
+_generating_lock = threading.Lock()
+_generating: set[tuple[int, int, int]] = set()
+_STUCK_GENERATING = timedelta(minutes=5)
+
+
+def regenerate_monthly_report(app, couple_id, year, month):
+    """Background worker: (re)build the cached qualitative report for a month.
+
+    Runs in a daemon thread. Pushes a fresh app context (which yields a NEW
+    thread-local scoped DB session — request sessions are never shared across
+    threads) and calls the slow `claude -p` pass, then upserts the row:
+      * success  → content fields + status='ready' + generated_at.
+      * failure/None → status='failed', UNLESS the row already had a good
+        report (generated_at set), in which case the prior 'ready' content is
+        kept so the user still sees the last good insight.
+    Never raises out of the thread; always frees the in-process guard key.
+    """
+    key = (couple_id, year, month)
+    try:
+        with app.app_context():
+            try:
+                couple = db.session.get(Couple, couple_id)
+                members = couple.approved_members if couple else []
+                if len(members) < 2:
+                    return  # solo space — nothing two-person to summarize
+                user_a, user_b = members[0], members[1]
+
+                qa_items = insights.collect_month_qa(
+                    couple_id, year, month, user_a, user_b
+                )
+                month_label = f"{year}년 {month}월"
+                try:
+                    qualitative = ai.generate_monthly_qualitative(
+                        month_label, user_a.display_name, user_b.display_name, qa_items
+                    )
+                except Exception:  # noqa: BLE001 — claude must never crash the thread
+                    log.exception(
+                        "claude monthly insight raised (couple=%s %s-%s)",
+                        couple_id, year, month,
+                    )
+                    qualitative = None
+
+                report = MonthlyReport.query.filter_by(
+                    couple_id=couple_id, year=year, month=month
+                ).first()
+                if report is None:
+                    report = MonthlyReport(
+                        couple_id=couple_id, year=year, month=month
+                    )
+                    db.session.add(report)
+
+                now = datetime.utcnow()
+                if qualitative:
+                    report.summary = qualitative.get("summary") or ""
+                    report.themes = json.dumps(
+                        qualitative.get("themes") or [], ensure_ascii=False
+                    )
+                    report.tone = qualitative.get("tone") or ""
+                    report.divergent_question = qualitative.get("divergent_question") or ""
+                    report.fun = qualitative.get("fun") or ""
+                    report.status = "ready"
+                    report.generated_at = now
+                elif report.generated_at is not None:
+                    # Generation failed but we have prior good content — keep it
+                    # visible rather than degrading to a placeholder.
+                    report.status = "ready"
+                else:
+                    report.status = "failed"
+                report.updated_at = now
+
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception(
+                        "commit failed for monthly report (couple=%s %s-%s)",
+                        couple_id, year, month,
+                    )
+            except Exception:  # noqa: BLE001 — belt & suspenders; never escape
+                db.session.rollback()
+                log.exception(
+                    "regenerate_monthly_report failed (couple=%s %s-%s)",
+                    couple_id, year, month,
+                )
+    finally:
+        with _generating_lock:
+            _generating.discard(key)
+
+
+def _kick_monthly_report(couple_id, year, month):
+    """Atomically claim a month for generation and spawn the background thread.
+
+    Must be called inside an app/request context. No-ops (does NOT spawn) when a
+    build is already in flight (in-process key held, or a fresh DB 'generating').
+    Marks the row status='generating' (creating it if missing) and commits BEFORE
+    spawning, so a concurrent request sees the claim. Content columns are left
+    untouched so a prior good report survives the regen window.
+    """
+    key = (couple_id, year, month)
+    now = datetime.utcnow()
+
+    report = MonthlyReport.query.filter_by(
+        couple_id=couple_id, year=year, month=month
+    ).first()
+    # A fresh in-flight DB claim → don't pile on. A stale one (crashed thread) is
+    # retryable so the month can't be wedged in 'generating' forever.
+    if (
+        report is not None
+        and report.status == "generating"
+        and report.updated_at
+        and (now - report.updated_at) < _STUCK_GENERATING
+    ):
+        return
+
+    with _generating_lock:
+        if key in _generating:
+            return
+        _generating.add(key)
+
+    spawned = False
+    try:
+        if report is None:
+            report = MonthlyReport(
+                couple_id=couple_id, year=year, month=month, status="generating"
+            )
+            db.session.add(report)
+        else:
+            report.status = "generating"
+        report.updated_at = now
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # A concurrent request created the row first — take theirs.
+            db.session.rollback()
+            report = MonthlyReport.query.filter_by(
+                couple_id=couple_id, year=year, month=month
+            ).first()
+            if report is None:
+                raise
+            report.status = "generating"
+            report.updated_at = now
+            db.session.commit()
+
+        threading.Thread(
+            target=regenerate_monthly_report,
+            args=(current_app._get_current_object(), couple_id, year, month),
+            daemon=True,
+        ).start()
+        spawned = True
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception(
+            "failed to kick monthly report (couple=%s %s-%s)",
+            couple_id, year, month,
+        )
+    finally:
+        if not spawned:
+            with _generating_lock:
+                _generating.discard(key)
 
 
 # --------------------------------------------------------------------------- #
@@ -786,6 +965,12 @@ def _register_routes(app: Flask):
                 f"{u.display_name}님이 오늘 답을 남겼어 💌",
                 url_for("index"),
             )
+        # Freshen this month's cached insight in the BACKGROUND (never blocks the
+        # response, never runs claude here). Only meaningful once there's a
+        # partner to have a two-person conversation. Guarded against duplicates.
+        if u.partner is not None:
+            today = date.today()
+            _kick_monthly_report(u.couple_id, today.year, today.month)
         return redirect(url_for("index"))
 
     # ---- comments on a day's revealed answers ----
@@ -902,11 +1087,37 @@ def _register_routes(app: Flask):
                 month=month,
             )
 
+        # Quantitative stats stay LIVE — a cheap DB query, never cached.
         stats = insights.compute_monthly_stats(u.couple_id, year, month, u, partner)
-        qa_items = insights.collect_month_qa(u.couple_id, year, month, u, partner)
-        qualitative = ai.generate_monthly_qualitative(
-            stats["month_label"], u.display_name, partner.display_name, qa_items
+        # "has data" == at least one answer exists this month (derived from the
+        # stats we already computed, so we avoid a second DB pass on the request).
+        has_data = bool(
+            stats["participation_a"]["days"] or stats["participation_b"]["days"]
         )
+
+        # Qualitative comes ONLY from the cached MonthlyReport — the slow
+        # `claude -p` call never runs on this request path.
+        report = MonthlyReport.query.filter_by(
+            couple_id=u.couple_id, year=year, month=month
+        ).first()
+        qualitative = None
+        if report is not None and report.status == "ready":
+            qualitative = {
+                "summary": report.summary or "",
+                "themes": report.themes_list,
+                "tone": report.tone or "",
+                "divergent_question": report.divergent_question or "",
+                "fun": report.fun or "",
+            }
+
+        # No fresh cached report but there IS data to summarize → trigger a
+        # background build (guarded against duplicates) and show a placeholder.
+        pending = False
+        if has_data and qualitative is None:
+            pending = True
+            if report is None or report.status in ("generating", "failed"):
+                _kick_monthly_report(u.couple_id, year, month)
+
         # previous / next month links
         prev_m = (month - 1) or 12
         prev_y = year - 1 if month == 1 else year
@@ -916,7 +1127,8 @@ def _register_routes(app: Flask):
             "insight.html",
             stats=stats,
             qualitative=qualitative,
-            has_data=bool(qa_items),
+            has_data=has_data,
+            pending=pending,
             year=year,
             month=month,
             prev=(prev_y, prev_m),

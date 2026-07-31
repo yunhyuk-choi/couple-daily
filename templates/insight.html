@@ -83,9 +83,23 @@
       {% endif %}
       <p class="muted small">이 관찰은 두 사람이 실제로 남긴 답변만을 근거로 claude가 정리했어. 점수가 아니라 부드러운 관찰이야.</p>
     {% else %}
-      <p class="muted">이번 달 이야기를 정리하지 못했어 (AI 생성 일시 실패). 잠시 후 다시 열어봐.</p>
+      <p class="insight-pending muted">
+        <span class="pending-dots" aria-hidden="true">•••</span>
+        이번 달 이야기를 정리하고 있어… 잠시 후 다시 볼래?
+      </p>
     {% endif %}
   </div>
 {% endif %}
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {% if pending %}
+  {# While a report is being generated in the background, gently auto-reload so
+     the finished insight appears without the user manually refreshing. Only
+     rendered in the generating state. #}
+  <script>
+    setTimeout(function () { window.location.reload(); }, 12000);
+  </script>
+  {% endif %}
 {% endblock %}
