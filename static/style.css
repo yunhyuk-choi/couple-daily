@@ -240,6 +240,8 @@ a { color: var(--pink); }
 .stat { text-align: center; padding: 18px 12px; margin: 0; }
 .stat-num { font-size: 1.6rem; font-weight: 900; color: var(--pink); }
 .stat-label { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+.insight-card .q-head { display: flex; align-items: center; gap: 8px; }
+.refresh-badge { margin-left: auto; background: var(--pink-soft); color: var(--pink); padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; white-space: nowrap; opacity: 0.9; }
 .insight-summary { font-size: 1.15rem; font-weight: 700; line-height: 1.5; }
 .themes { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .chip { background: var(--pink-soft); color: var(--pink); padding: 5px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 700; }

@@ -4,6 +4,7 @@ Data model is intentionally small — the app serves exactly one couple (two
 people) per couple-space, though the schema does not forbid several couples
 existing in one database.
 """
+import json
 import logging
 from datetime import datetime, date
 
@@ -297,3 +298,61 @@ class Setting(db.Model):
             row.value = value
         else:
             db.session.add(Setting(key=key, value=value))
+
+
+class MonthlyReport(db.Model):
+    """Cached AI qualitative monthly insight for one couple + month.
+
+    The ``/insight`` page must render INSTANTLY from the DB and never block on
+    the slow ``claude -p`` subprocess. This row caches the qualitative content
+    produced by ``ai.generate_monthly_qualitative``; it is (re)generated in a
+    background thread on answer events, never on the request path. The cheap
+    quantitative stats (counts/streaks) are NOT cached — they stay live.
+
+    ``status`` lifecycle:
+      * 'generating' — a background thread is (re)building this report.
+      * 'ready'      — cached qualitative content is current and renderable.
+      * 'failed'     — the last generation failed with no prior good content.
+
+    Unique on (couple_id, year, month) so there is exactly one report per month.
+    Created by ``db.create_all()`` — a brand-new table needs no ALTER migration.
+    """
+    __tablename__ = "monthly_reports"
+    __table_args__ = (
+        db.UniqueConstraint("couple_id", "year", "month", name="uq_report_couple_month"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    year = db.Column(db.Integer, nullable=False)
+    month = db.Column(db.Integer, nullable=False)
+
+    # ---- qualitative content (mirrors generate_monthly_qualitative's dict) ----
+    summary = db.Column(db.Text, nullable=True)
+    themes = db.Column(db.Text, nullable=True)  # JSON-encoded list[str]
+    tone = db.Column(db.Text, nullable=True)
+    divergent_question = db.Column(db.Text, nullable=True)
+    fun = db.Column(db.Text, nullable=True)
+
+    # ---- lifecycle ----
+    status = db.Column(db.String(16), default="generating", nullable=False)
+    generated_at = db.Column(db.DateTime, nullable=True)  # last successful build
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    @property
+    def themes_list(self):
+        """Decode the JSON-stored themes back to a list (defensive)."""
+        if not self.themes:
+            return []
+        try:
+            v = json.loads(self.themes)
+            return v if isinstance(v, list) else []
+        except (ValueError, TypeError):
+            return []
