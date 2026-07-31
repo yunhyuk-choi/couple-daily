@@ -106,26 +106,32 @@ body {
   margin: 0 auto;
   padding: 20px 16px 60px;
 }
-/* leave room for the fixed bottom tab bar (+ iOS home-indicator safe area) so
-   content isn't hidden behind it and there's no accidental extra scroll */
-.wrap.has-tabbar { padding-bottom: calc(78px + env(safe-area-inset-bottom)); }
+/* leave room for the FLOATING bottom nav island (its height + bottom offset +
+   home-indicator inset) so content isn't hidden behind it and short pages
+   don't get a phantom scroll */
+.wrap.has-tabbar { padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
 
-/* fixed bottom tab bar (primary mobile nav) — pink-tinted frosted glass */
+/* floating rounded glassy pink nav ISLAND — not a full-width edge bar.
+   Side margins + a gap from the bottom edge + a soft shadow so it reads as
+   hovering above the content. */
 .tabbar {
   position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  left: 16px;
+  right: 16px;
+  bottom: calc(env(safe-area-inset-bottom) + 12px);
   z-index: 30;
   display: flex;
+  max-width: 460px;
+  margin: 0 auto;
   /* translucent soft-pink surface (NOT neutral gray) so it reads as part of
      the pink app; blur frosts whatever scrolls beneath it */
   background: rgba(255, 240, 246, 0.72);
-  backdrop-filter: blur(18px) saturate(1.35);
-  -webkit-backdrop-filter: blur(18px) saturate(1.35);
-  border-top: 1px solid rgba(255, 107, 157, 0.16);
-  box-shadow: 0 -6px 22px rgba(255, 107, 157, 0.12);
-  padding-bottom: env(safe-area-inset-bottom);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  border: 1px solid rgba(255, 107, 157, 0.18);
+  border-radius: 28px;
+  box-shadow: 0 12px 30px rgba(255, 107, 157, 0.24);
+  overflow: hidden;
 }
 .tab {
   position: relative;
@@ -134,22 +140,22 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 3px;
-  padding: 8px 4px 7px;
+  padding: 9px 4px 8px;
   text-decoration: none;
   color: var(--muted);
   font-weight: 700;
   min-width: 0;
 }
-/* clear pink accent bar over the active tab */
-.tab.active::before {
+/* keep icon + label above the active highlight chip */
+.tab > * { position: relative; z-index: 1; }
+/* soft pink rounded highlight behind the active tab (suits the pill shape) */
+.tab.active::after {
   content: "";
   position: absolute;
-  top: 0;
-  left: 22%;
-  right: 22%;
-  height: 3px;
-  border-radius: 0 0 3px 3px;
-  background: var(--pink);
+  z-index: 0;
+  inset: 5px 6px;
+  border-radius: 16px;
+  background: rgba(255, 107, 157, 0.14);
 }
 .tab-icon {
   width: 26px;
@@ -172,20 +178,6 @@ body {
   border-radius: 50%;
   background: var(--pink);
   border: 2px solid #fff;
-}
-/* keep the bar phone-width and centered on wide desktop screens */
-@media (min-width: 560px) {
-  .tabbar {
-    left: 50%;
-    right: auto;
-    transform: translateX(-50%);
-    width: 520px;
-    max-width: calc(100% - 24px);
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    bottom: 16px;
-    box-shadow: 0 8px 28px rgba(255, 107, 157, 0.18);
-  }
 }
 
 /* cards */
@@ -480,8 +472,9 @@ code { background: var(--pink-soft); padding: 2px 6px; border-radius: 6px; font-
 .fab {
   position: fixed;
   right: 16px;
-  /* sit clear ABOVE the fixed bottom tab bar (+ iOS home-indicator) */
-  bottom: calc(80px + env(safe-area-inset-bottom));
+  /* float clear ABOVE the floating nav island (island: 12px offset + ~62px
+     tall) + home-indicator inset */
+  bottom: calc(90px + env(safe-area-inset-bottom));
   z-index: 40;
   width: 58px;
   height: 58px;
@@ -550,11 +543,10 @@ body.modal-open { overflow: hidden; }
   cursor: pointer;
 }
 .modal-close:hover { background: rgba(61, 43, 52, 0.14); }
-/* on wider screens the sheet becomes a centered dialog + FAB clears the pill nav */
+/* on wider screens the upload sheet becomes a centered dialog */
 @media (min-width: 560px) {
   .modal-overlay { align-items: center; }
   .modal-sheet { border-radius: 22px; max-width: 480px; }
-  .fab { bottom: calc(94px + env(safe-area-inset-bottom)); }
 }
 
 /* lightbox (확대 보기) */
