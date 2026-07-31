@@ -20,7 +20,24 @@ def compute_monthly_stats(couple_id, year, month, user_a, user_b):
 
     user_a is treated as "me" for the who-answers-first framing; both names are
     included so the caller can render neutrally.
+
+    Defensive: if ``user_b`` is None (partner hasn't joined yet), return a safe,
+    neutral stats dict rather than raising — no caller can crash on a missing
+    partner.
     """
+    if user_b is None:
+        return {
+            "month_label": f"{year}년 {month}월",
+            "total_days": 0,
+            "both_answered_days": 0,
+            "participation_a": {"name": user_a.display_name, "days": 0},
+            "participation_b": {"name": "파트너", "days": 0},
+            "best_streak": 0,
+            "first_counts": {user_a.display_name: 0, "파트너": 0},
+            "first_answerer": "tie",
+            "avg_len_a": {"name": user_a.display_name, "avg": 0, "trend": "n/a"},
+            "avg_len_b": {"name": "파트너", "avg": 0, "trend": "n/a"},
+        }
     start, end = _month_bounds(year, month)
     questions = (
         DailyQuestion.query.filter(
@@ -135,7 +152,13 @@ def _length_trend(questions, user_id):
 
 
 def collect_month_qa(couple_id, year, month, user_a, user_b):
-    """Collect the month's Q&A (both answered OR partial) for the qualitative pass."""
+    """Collect the month's Q&A (both answered OR partial) for the qualitative pass.
+
+    Defensive: if ``user_b`` is None (no partner yet), return an empty list —
+    there is no couple conversation to summarize.
+    """
+    if user_b is None:
+        return []
     start, end = _month_bounds(year, month)
     questions = (
         DailyQuestion.query.filter(
