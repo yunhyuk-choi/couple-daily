@@ -1,0 +1,96 @@
+<script>
+// 공용 라이트박스 — 썸네일 탭 시 원본 프리로드 + 확대(캡션·태그). 앨범·검색 공유.
+(function () {
+  var openers = Array.prototype.slice.call(document.querySelectorAll(".photo-open"));
+  var lb = document.getElementById("lightbox");
+  if (!openers.length || !lb) return;
+
+  var lbImg = document.getElementById("lb-img");
+  var lbCap = document.getElementById("lb-caption");
+  var lbTags = document.getElementById("lb-tags");
+  var lbDownload = document.getElementById("lb-download");
+  var lbDeleteForm = document.getElementById("lb-delete-form");
+  var lbClose = document.getElementById("lb-close");
+  var preloaded = {}; // full url -> Image (keeps decoded bytes warm)
+
+  function preload(url) {
+    if (!url || preloaded[url]) return;
+    var im = new Image();
+    im.src = url;
+    preloaded[url] = im;
+  }
+
+  // Near-viewport prefetch of each ORIGINAL so tapping opens instantly, without
+  // eagerly loading every full image at once.
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          preload(e.target.getAttribute("data-full"));
+          io.unobserve(e.target);
+        }
+      });
+    }, { rootMargin: "300px" });
+    openers.forEach(function (el) { io.observe(el); });
+  } else {
+    openers.forEach(function (el) { preload(el.getAttribute("data-full")); });
+  }
+  // Belt & suspenders: also prefetch on pointer-down (instant on tap).
+  openers.forEach(function (el) {
+    el.addEventListener("pointerdown", function () {
+      preload(el.getAttribute("data-full"));
+    });
+  });
+
+  function neighbors(idx) {
+    [idx - 1, idx + 1].forEach(function (j) {
+      if (j >= 0 && j < openers.length) preload(openers[j].getAttribute("data-full"));
+    });
+  }
+
+  function openAt(idx) {
+    var el = openers[idx];
+    lbImg.src = el.getAttribute("data-full");
+    var cap = el.getAttribute("data-caption") || "";
+    if (cap) { lbCap.textContent = cap; lbCap.hidden = false; }
+    else { lbCap.hidden = true; }
+    var tags = (el.getAttribute("data-tags") || "").split(",").filter(Boolean);
+    lbTags.innerHTML = "";
+    if (tags.length) {
+      tags.forEach(function (t) {
+        var s = document.createElement("span");
+        s.className = "chip small";
+        s.textContent = "#" + t;
+        lbTags.appendChild(s);
+      });
+      lbTags.hidden = false;
+    } else {
+      lbTags.hidden = true;
+    }
+    lbDownload.href = el.getAttribute("data-download");
+    if (lbDeleteForm) lbDeleteForm.action = el.getAttribute("data-delete");
+    lb.hidden = false;
+    lb.setAttribute("aria-hidden", "false");
+    document.body.classList.add("lb-open");
+    neighbors(idx);
+  }
+
+  function close() {
+    lb.hidden = true;
+    lb.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("lb-open");
+    lbImg.removeAttribute("src");
+  }
+
+  openers.forEach(function (el, idx) {
+    el.addEventListener("click", function () { openAt(idx); });
+  });
+  lbClose.addEventListener("click", close);
+  lb.addEventListener("click", function (e) {
+    if (e.target === lb || e.target.classList.contains("lb-stage")) close();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && !lb.hidden) close();
+  });
+})();
+</script>

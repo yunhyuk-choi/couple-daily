@@ -1311,6 +1311,68 @@ def _register_routes(app: Flask):
             any_pending=any_pending,
         )
 
+    @app.route("/memories/search")
+    @active_couple_required
+    def memories_search():
+        """자연어 추억 검색 — 캡션·태그·원본파일명에 대한 즉시 키워드 매칭.
+
+        캡션/태그는 이미 배경 캡셔너가 만든 자연어 AI 설명이라, 그 위를 검색하면
+        요청 경로에서 claude를 호출하지 않고도(앱 절대 제약: 동기 AI 금지) 자연어
+        검색 경험을 준다 — 순수 DB 읽기다. 커플 범위 밖 사진은 절대 조회하지 않는다.
+
+        매칭: 질의를 공백 토큰화(소문자)하고, 각 토큰이 caption·tags·original_name
+        중 하나의 부분문자열이면 해당 토큰이 매칭된 것으로 본다. 결과는 (1) 서로 다른
+        매칭 토큰 수 내림차순, (2) 동률이면 created_at 내림차순으로 정렬한다.
+        """
+        u = current_user()
+        q = (request.args.get("q") or "").strip()
+        if not onedrive.onedrive_enabled():
+            return render_template(
+                "memories_search.html", enabled=False, q=q, photos=[]
+            )
+
+        tokens = [t for t in q.lower().split() if t]
+        photos = []
+        if tokens:
+            rows = (
+                Photo.query.filter_by(couple_id=u.couple_id)
+                .order_by(Photo.created_at.desc(), Photo.id.desc())
+                .all()
+            )
+            scored = []
+            for p in rows:
+                # 검색 대상 텍스트를 소문자로 모아 토큰별 부분문자열 매칭.
+                hay = [(p.caption or "").lower(), (p.original_name or "").lower()]
+                hay.extend(t.lower() for t in p.tags_list)
+                matched = 0
+                for tok in tokens:
+                    if any(tok in h for h in hay):
+                        matched += 1
+                if matched:
+                    scored.append((matched, p))
+            # 매칭 토큰 수 내림차순, 동률은 created_at 내림차순(rows가 이미 최신순이라
+            # 안정 정렬로 recency 타이브레이크가 유지된다).
+            scored.sort(key=lambda sp: sp[0], reverse=True)
+            photos = [
+                {
+                    "id": p.id,
+                    "caption": p.caption,
+                    "tags": p.tags_list,
+                    "caption_status": p.caption_status,
+                    "original_name": p.original_name,
+                    "uploaded_by": p.uploaded_by,
+                    "created_at": p.created_at,
+                }
+                for _, p in scored
+            ]
+        return render_template(
+            "memories_search.html",
+            enabled=True,
+            reconnect=onedrive.reconnect_needed(),
+            q=q,
+            photos=photos,
+        )
+
     @app.route("/memories/<int:photo_id>/image")
     @active_couple_required
     def memory_image(photo_id):

@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}추억 검색 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+  <h1>추억 검색</h1>
+</div>
+
+{% if not enabled %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+    <p class="muted">아직 OneDrive 연결이 필요해.<br />연결되면 캡션·태그로 추억을 검색할 수 있어.</p>
+  </div>
+{% else %}
+  {% if reconnect %}
+    <div class="flash flash-error">OneDrive 재연결이 필요해. 사진이 잠시 안 보일 수 있어.</div>
+  {% endif %}
+
+  {# 검색 폼 — GET로 memories_search에 q를 보낸다. 캡션·태그·파일명 즉시 매칭(비 AI). #}
+  <form class="c-form top" method="get" action="{{ url_for('memories_search') }}" role="search">
+    <label class="sr-only" for="q">추억 검색어</label>
+    <input id="q" type="text" name="q" value="{{ q }}"
+           placeholder="바다, 우리 강아지, 생일…"
+           autocomplete="off" enterkeyhint="search"{% if not q %} autofocus{% endif %} />
+    <button class="btn primary sm" type="submit" aria-label="검색">🔍</button>
+  </form>
+
+  {% if q %}
+    {% if photos %}
+      <p class="muted small search-count">{{ photos | length }}개의 추억</p>
+      {% include "_photo_grid.html" %}
+    {% else %}
+      <div class="card center-card">
+        <img class="emoji hero" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+        <p class="muted">‘{{ q }}’ 와(과) 맞는 추억이 없어.<br />다른 말로 찾아볼까?</p>
+      </div>
+    {% endif %}
+  {% else %}
+    {# q가 비어있을 때의 부드러운 안내. 입력창은 위에서 autofocus 된다. #}
+    <div class="card center-card">
+      <img class="emoji hero" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+      <p class="muted">캡션이나 태그로 둘만의 추억을 찾아봐.<br />예: 바다, 우리 강아지, 생일</p>
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if enabled and q and photos %}
+{% include "_lightbox_js.html" %}
+{% endif %}
+{% endblock %}
