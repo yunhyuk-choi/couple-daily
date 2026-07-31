@@ -596,7 +596,12 @@ body.lb-open { overflow: hidden; }
 }
 .lb-caption { margin: 0 0 10px; font-size: 1.02rem; font-weight: 600; line-height: 1.5; }
 .lb-tags { justify-content: center; margin-bottom: 12px; }
+.lb-actions { display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; }
+.lb-delete-form { margin: 0; }
 .lb-download { display: inline-block; }
+/* delete lives in the lightbox now (grid stays clean); tinted for the dark overlay */
+.lb-delete { background: rgba(255, 255, 255, 0.14); color: #fff; }
+.lb-delete:hover { filter: none; background: rgba(255, 255, 255, 0.26); }
 .lb-close {
   position: absolute;
   top: calc(10px + env(safe-area-inset-top));
@@ -613,67 +618,57 @@ body.lb-open { overflow: hidden; }
 }
 .lb-close:hover { background: rgba(255, 255, 255, 0.3); }
 
-.photo-open {
-  display: block;
-  width: 100%;
-  padding: 0;
-  border: none;
-  background: none;
-  cursor: pointer;
-}
 .memory-upload input[type="file"] {
   padding: 10px 12px;
   font-size: 0.9rem;
 }
+/* compact, UNIFORM square-thumbnail grid — caption/tags/delete live in the
+   lightbox, so every cell is exactly the same height (no tall uneven cards) */
 .photo-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 12px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
 }
-.photo-card {
+.photo-open {
   position: relative;
-  margin: 0;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
+  aspect-ratio: 1 / 1;   /* every cell identical height */
+  padding: 0;
+  border: none;
+  border-radius: 14px;
   overflow: hidden;
+  background: var(--pink-soft);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  transition: transform 0.08s, filter 0.15s;
 }
+.photo-open:hover { filter: brightness(1.03); }
+.photo-open:active { transform: scale(0.98); }
 .photo-img {
   display: block;
   width: 100%;
-  aspect-ratio: 1 / 1;
+  height: 100%;
   object-fit: cover;
-  background: var(--pink-soft);
 }
-.photo-caption {
-  padding: 10px 12px;
-  font-size: 0.88rem;
-  line-height: 1.45;
-  color: var(--ink);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.photo-analyzing { color: var(--muted); font-style: italic; }
-.photo-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.chip.small { padding: 3px 9px; font-size: 0.72rem; }
-.photo-delete { position: absolute; top: 8px; right: 8px; margin: 0; }
-.photo-del-btn {
-  width: 30px;
-  height: 30px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(61, 43, 52, 0.55);
-  color: #fff;
-  font-size: 1.15rem;
+/* tiny "still analyzing" badge — absolutely positioned so it never changes the
+   cell height */
+.thumb-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  font-size: 0.8rem;
   line-height: 1;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s;
+  padding: 3px 5px;
+  border-radius: 8px;
+  background: rgba(40, 22, 31, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
-.photo-del-btn:hover { background: var(--pink); }
+.chip.small { padding: 3px 9px; font-size: 0.72rem; }
+
+/* a bit larger cells / more columns on wider screens */
+@media (min-width: 560px) {
+  .photo-grid { grid-template-columns: repeat(4, 1fr); }
+}
 
 @media (max-width: 420px) {
   .stat-grid { grid-template-columns: 1fr; }

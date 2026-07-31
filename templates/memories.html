@@ -22,44 +22,32 @@
       <p class="muted">아직 올린 사진이 없어.<br />오른쪽 아래 <strong>+</strong> 버튼으로 첫 추억을 남겨보자!</p>
     </div>
   {% else %}
+    {# Compact, uniform square thumbnails only. Caption / tags / delete live in
+       the lightbox (tap a thumbnail) so the grid stays tidy and short — equal
+       cell heights, no inline white caption area. #}
     <div class="photo-grid">
       {% for p in photos %}
-        <figure class="photo-card">
-          <button type="button" class="photo-open"
-                  data-id="{{ p.id }}"
-                  data-full="{{ url_for('memory_image', photo_id=p.id) }}"
-                  data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
-                  data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
-                  data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
-                  aria-label="사진 확대해서 보기">
-            <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
-                 loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
-          </button>
-          {% if p.caption_status == 'ready' and p.caption %}
-            <figcaption class="photo-caption">
-              {{ p.caption }}
-              {% if p.tags %}
-                <span class="photo-tags">
-                  {% for t in p.tags %}<span class="chip small">#{{ t }}</span>{% endfor %}
-                </span>
-              {% endif %}
-            </figcaption>
-          {% elif p.caption_status == 'pending' %}
-            <figcaption class="photo-caption photo-analyzing muted small">📝 분석 중…</figcaption>
+        <button type="button" class="photo-open"
+                data-id="{{ p.id }}"
+                data-full="{{ url_for('memory_image', photo_id=p.id) }}"
+                data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
+                data-delete="{{ url_for('memories_delete', photo_id=p.id) }}"
+                data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
+                data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
+                aria-label="{{ p.caption or p.original_name or '추억 사진' }} 크게 보기">
+          <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
+               loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+          {% if p.caption_status == 'pending' %}
+            <span class="thumb-badge" title="분석 중" aria-hidden="true">📝</span>
           {% endif %}
-          <form method="post" action="{{ url_for('memories_delete', photo_id=p.id) }}"
-                class="photo-delete"
-                onsubmit="return confirm('이 사진을 삭제할까?');">
-            <button class="photo-del-btn" type="submit" title="삭제" aria-label="삭제">×</button>
-          </form>
-        </figure>
+        </button>
       {% endfor %}
     </div>
 
-    {# Lightbox overlay — shows the ORIGINAL full-res image, caption + tags,
-       and a download(original) button. The full image is preloaded (see JS)
-       so tapping a thumbnail opens it instantly. #}
-    <div class="lightbox" id="lightbox" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="사진 확대 보기">
+    {# Lightbox overlay — enlarged ORIGINAL full-res image + caption + tags +
+       download(original) + delete. The full image is preloaded (see JS) so
+       tapping a thumbnail opens it instantly. #}
+    <div class="lightbox" id="lightbox" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="사진 크게 보기">
       <button type="button" class="lb-close" id="lb-close" aria-label="닫기">×</button>
       <div class="lb-stage">
         <img class="lb-img" id="lb-img" alt="추억 사진" />
@@ -67,7 +55,13 @@
       <div class="lb-meta">
         <p class="lb-caption" id="lb-caption" hidden></p>
         <div class="lb-tags themes" id="lb-tags" hidden></div>
-        <a class="btn primary lb-download" id="lb-download" href="#" download>다운로드</a>
+        <div class="lb-actions">
+          <a class="btn primary lb-download" id="lb-download" href="#" download>다운로드</a>
+          <form method="post" id="lb-delete-form" class="lb-delete-form"
+                onsubmit="return confirm('이 사진을 삭제할까?');">
+            <button class="btn ghost lb-delete" type="submit">🗑 삭제</button>
+          </form>
+        </div>
       </div>
     </div>
   {% endif %}
@@ -186,6 +180,7 @@
     var lbCap = document.getElementById("lb-caption");
     var lbTags = document.getElementById("lb-tags");
     var lbDownload = document.getElementById("lb-download");
+    var lbDeleteForm = document.getElementById("lb-delete-form");
     var lbClose = document.getElementById("lb-close");
     var preloaded = {}; // full url -> Image (keeps decoded bytes warm)
 
@@ -244,6 +239,7 @@
         lbTags.hidden = true;
       }
       lbDownload.href = el.getAttribute("data-download");
+      if (lbDeleteForm) lbDeleteForm.action = el.getAttribute("data-delete");
       lb.hidden = false;
       lb.setAttribute("aria-hidden", "false");
       document.body.classList.add("lb-open");
