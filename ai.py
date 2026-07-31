@@ -224,3 +224,142 @@ def caption_image(image_path):
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] image captioning failed: {e}", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------------------
+# 커플 싸움 AI 판사 (judge a couple's fight from their statements)
+# ---------------------------------------------------------------------------
+def _normalize_fault(raw_fault, name_a, name_b):
+    """Coerce claude's ``fault`` list into a clean two-entry split summing to 100.
+
+    Pure/offline (no claude) so it can be unit-tested directly. Rules:
+      * keep the two names EXACTLY as passed in (name_a, name_b), matched by
+        name against ``raw_fault`` where possible (else positionally);
+      * coerce each percent to int, clamp to 0..100;
+      * if the two don't sum to 100, rebalance proportionally (or fall back to
+        50/50 when both are 0);
+      * return ``None`` when there is no usable fault data at all.
+    """
+    if not isinstance(raw_fault, list) or not raw_fault:
+        return None
+
+    # Map name -> percent from whatever claude returned (defensive on shapes).
+    by_name = {}
+    ordered = []
+    for entry in raw_fault:
+        if not isinstance(entry, dict):
+            continue
+        nm = entry.get("name")
+        pct = entry.get("percent")
+        try:
+            pct = int(round(float(pct)))
+        except (TypeError, ValueError):
+            pct = None
+        ordered.append((nm, pct))
+        if isinstance(nm, str):
+            by_name[nm.strip()] = pct
+
+    def _pick(target, fallback_idx):
+        # Prefer an exact name match; otherwise fall back to position.
+        if target in by_name and by_name[target] is not None:
+            return by_name[target]
+        if fallback_idx < len(ordered):
+            return ordered[fallback_idx][1]
+        return None
+
+    pa = _pick(name_a, 0)
+    pb = _pick(name_b, 1)
+    if pa is None and pb is None:
+        return None  # nothing usable
+
+    pa = 0 if pa is None else max(0, min(100, pa))
+    pb = 0 if pb is None else max(0, min(100, pb))
+
+    total = pa + pb
+    if total == 100:
+        pass
+    elif total <= 0:
+        pa, pb = 50, 50  # no signal — split evenly
+    else:
+        # Rebalance proportionally so the two always sum to exactly 100.
+        pa = int(round(pa * 100 / total))
+        pb = 100 - pa
+    return [
+        {"name": name_a, "percent": pa},
+        {"name": name_b, "percent": pb},
+    ]
+
+
+def judge_fight(name_a, name_b, situation, statements):
+    """Judge a couple's fight with `claude`, returning a normalized verdict dict.
+
+    ``statements`` is a list of ``{"name": <display_name>, "text": <진술>}`` with
+    1 or 2 entries (a partner who left no statement is simply absent). Builds a
+    warm-but-fair Korean prompt, runs `claude -p`, parses strict JSON, and returns
+    a normalized dict — or ``None`` on ANY failure (never raises), exactly like
+    ``generate_monthly_qualitative``. Because it runs the slow agent subprocess,
+    the caller MUST invoke it from a background thread, never on the request path.
+
+    Returns on success::
+
+        {"fault": [{"name": name_a, "percent": int}, {"name": name_b, "percent": int}],
+         "summary": str, "reason": str, "resolution": str, "note": str}
+    """
+    if not name_a or not name_b or not (situation or "").strip():
+        return None
+    if not statements:
+        return None
+
+    stmt_lines = []
+    for s in statements:
+        nm = (s.get("name") or "").strip() or "익명"
+        txt = (s.get("text") or "").strip() or "(진술 없음)"
+        stmt_lines.append(f"- {nm}의 진술: {txt}")
+    stmt_block = "\n".join(stmt_lines)
+    only_one = len(statements) < 2
+
+    prompt = (
+        f"너는 연인 두 사람({name_a}, {name_b})의 다툼을 판결하는, 다정하지만 공정한 "
+        "'AI 판사'야. 재미있고 따뜻하게, 그러나 어느 한쪽으로 치우치지 않고 균형 있고 "
+        "솔직하게 판결해.\n\n"
+        "아래의 상황 설명과, 있는 만큼의 각자 진술만을 근거로 판단해. 지어내지 마.\n\n"
+        f"[상황 설명]\n{(situation or '').strip()}\n\n"
+        f"[각자 진술]\n{stmt_block}\n\n"
+        "판결 규칙:\n"
+        f"- 잘못 비율(fault)은 {name_a}와 {name_b} 두 사람 것을 합쳐 정확히 100이 되게, "
+        "근거 있게 배분해.\n"
+        + (
+            "- 지금은 한 사람의 진술만 있어. 그 한계를 감안해서 신중하게 판단하고, "
+            "note에 '한쪽 진술만 있어 판단에 한계가 있다'는 취지를 부드럽게 한 문장으로 "
+            "적어줘.\n"
+            if only_one
+            else "- 두 사람의 진술을 모두 고려해서 공평하게 판단해.\n"
+        )
+        + "- 금지: 모욕, 인신공격, 한쪽 편만 들도록 부추기는 말, 과격하거나 비난하는 말투.\n"
+        "- 목표는 관계 회복이야. 구체적이고 실천 가능한 화해 방법을 제시해.\n\n"
+        "출력은 반드시 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+        "{\n"
+        f'  "fault": [{{"name": "{name_a}", "percent": <정수>}}, '
+        f'{{"name": "{name_b}", "percent": <정수>}}],\n'
+        '  "summary": "<한 줄 판결 요지>",\n'
+        '  "reason": "<양측을 고려한 판결 이유, 2~4문장>",\n'
+        '  "resolution": "<두 사람을 위한 구체적 화해/해결 제안, 2~3문장>",\n'
+        '  "note": "<한쪽만 진술 등 한계가 있으면 한 문장, 없으면 빈 문자열>"\n'
+        "}"
+    )
+    try:
+        raw = _run_claude(prompt)
+        data = _extract_json(raw)
+        fault = _normalize_fault(data.get("fault"), name_a, name_b)
+        if not fault:
+            raise ValueError("no usable fault data")
+        return {
+            "fault": fault,
+            "summary": (data.get("summary") or "").strip(),
+            "reason": (data.get("reason") or "").strip(),
+            "resolution": (data.get("resolution") or "").strip(),
+            "note": (data.get("note") or "").strip(),
+        }
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] fight judgment failed: {e}", file=sys.stderr)
+        return None

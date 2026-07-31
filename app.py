@@ -48,6 +48,8 @@ import insights
 import onedrive
 from models import (
     Answer,
+    Case,
+    CaseStatement,
     Comment,
     Couple,
     DailyQuestion,
@@ -652,6 +654,90 @@ def caption_photo(app, photo_id):
     finally:
         with _captioning_lock:
             _captioning.discard(photo_id)
+
+
+# --------------------------------------------------------------------------- #
+# 커플 싸움 AI 판사 — background verdict, never on the request path
+# --------------------------------------------------------------------------- #
+# Same discipline as the monthly report / photo captioner: the slow `claude -p`
+# judge pass runs off the request thread with its own app context + fresh DB
+# session, catches everything, and never escapes the thread. Per-case in-process
+# guard set keyed by case_id stops a double-spawn for the same case.
+_judging_lock = threading.Lock()
+_judging: set[int] = set()
+
+
+def judge_case(app, case_id):
+    """Background worker: run the AI judge for ONE case, mirroring
+    ``regenerate_monthly_report``.
+
+    Pushes a fresh app context (→ a NEW thread-local DB session — request
+    sessions are never shared across threads), loads the Case + its statements +
+    the two partners' display names, runs the slow judge pass, and upserts the
+    outcome:
+      * success  → ``verdict_json`` + status='decided' + decided_at.
+      * failure/None → status='failed', UNLESS the case already had a good
+        verdict (decided_at set), in which case the prior verdict is kept
+        ('decided') so the couple still sees the last good judgment.
+    Never raises out of the thread; always frees the in-process guard key.
+    """
+    try:
+        with app.app_context():
+            try:
+                case = db.session.get(Case, case_id)
+                if case is None:
+                    return  # deleted before we got to it
+
+                couple = db.session.get(Couple, case.couple_id)
+                members = couple.approved_members if couple else []
+                # Two people (any order) — used only for display names in the
+                # prompt. A statement author who left may not be a current member,
+                # so resolve names per-statement below, falling back to members.
+                name_a = members[0].display_name if len(members) >= 1 else "한 사람"
+                name_b = members[1].display_name if len(members) >= 2 else "상대"
+
+                statements = []
+                for st in case.statements:
+                    author = db.session.get(User, st.user_id)
+                    nm = author.display_name if author else "익명"
+                    statements.append({"name": nm, "text": st.text})
+
+                try:
+                    result = ai.judge_fight(
+                        name_a, name_b, case.situation, statements
+                    )
+                except Exception:  # noqa: BLE001 — claude must never crash the thread
+                    log.exception("claude fight judgment raised (case=%s)", case_id)
+                    result = None
+
+                # Re-load in case the row changed while claude ran.
+                case = db.session.get(Case, case_id)
+                if case is None:
+                    return
+                now = datetime.utcnow()
+                if result:
+                    case.verdict_json = json.dumps(result, ensure_ascii=False)
+                    case.status = "decided"
+                    case.decided_at = now
+                elif case.decided_at is not None:
+                    # Judgment failed but we have a prior good verdict — keep it
+                    # visible rather than degrading to a failed state.
+                    case.status = "decided"
+                else:
+                    case.status = "failed"
+                case.updated_at = now
+
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception("commit failed for case verdict (case=%s)", case_id)
+            except Exception:  # noqa: BLE001 — belt & suspenders; never escape
+                db.session.rollback()
+                log.exception("judge_case failed (case=%s)", case_id)
+    finally:
+        with _judging_lock:
+            _judging.discard(case_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1596,6 +1682,188 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("사진을 삭제했어.", "ok")
         return redirect(url_for("memories"))
+
+    # ---- 판사 (AI judge for couple fights): 사건 + 진술 + 백그라운드 판결 ----
+    def _get_case_or_404(u, case_id):
+        """Load a case, 404 unless it belongs to the requester's couple, so a
+        case can never be read/acted on across couples."""
+        case = db.session.get(Case, case_id)
+        if case is None or case.couple_id != u.couple_id:
+            abort(404)
+        return case
+
+    @app.route("/cases")
+    @active_couple_required
+    def cases():
+        """List the couple's 사건 (newest first). Pure DB read — never claude."""
+        u = current_user()
+        rows = (
+            Case.query.filter_by(couple_id=u.couple_id)
+            .order_by(Case.created_at.desc(), Case.id.desc())
+            .all()
+        )
+        items = []
+        for c in rows:
+            v = c.verdict
+            items.append(
+                {
+                    "id": c.id,
+                    "title": c.title,
+                    "situation": c.situation,
+                    "status": c.status,
+                    "created_at": c.created_at,
+                    "summary": (v.get("summary") if v else "") or "",
+                    "fault": (v.get("fault") if v else None),
+                }
+            )
+        return render_template("cases.html", items=items)
+
+    @app.route("/cases/new", methods=["GET", "POST"])
+    @active_couple_required
+    def case_new():
+        u = current_user()
+        if request.method == "POST":
+            situation = (request.form.get("situation") or "").strip()
+            title = (request.form.get("title") or "").strip()[:120] or None
+            statement = (request.form.get("statement") or "").strip()
+            if not situation:
+                flash("무슨 일이 있었는지 상황을 먼저 적어줘.", "error")
+                return render_template("case_new.html")
+            case = Case(
+                couple_id=u.couple_id,
+                created_by=u.id,
+                title=title,
+                situation=situation,
+                status="open",
+            )
+            db.session.add(case)
+            db.session.flush()  # get case.id for the optional statement
+            if statement:
+                db.session.add(
+                    CaseStatement(case_id=case.id, user_id=u.id, text=statement)
+                )
+            db.session.commit()
+            return redirect(url_for("case_detail", case_id=case.id))
+        return render_template("case_new.html")
+
+    @app.route("/cases/<int:case_id>")
+    @active_couple_required
+    def case_detail(case_id):
+        """A single 사건: situation + both partners' statements + the verdict.
+
+        Pure DB read — the slow claude judge NEVER runs here; it runs only in the
+        background ``judge_case`` worker. 404 for a missing case or one that isn't
+        this couple's, so a case can't be read across couples."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        partner = u.partner
+        my_st = CaseStatement.query.filter_by(
+            case_id=case.id, user_id=u.id
+        ).first()
+        partner_st = (
+            CaseStatement.query.filter_by(case_id=case.id, user_id=partner.id).first()
+            if partner is not None
+            else None
+        )
+        # Render exactly the two couple members' sides (me first). A missing side
+        # shows a gentle "아직 진술을 남기지 않았어" placeholder in the template.
+        sides = [{"user": u, "statement": my_st, "is_me": True}]
+        if partner is not None:
+            sides.append({"user": partner, "statement": partner_st, "is_me": False})
+        return render_template(
+            "case_detail.html",
+            case=case,
+            verdict=case.verdict,
+            sides=sides,
+            my_statement=my_st,
+            has_statement=len(case.statements) >= 1,
+        )
+
+    @app.route("/cases/<int:case_id>/statement", methods=["POST"])
+    @active_couple_required
+    def case_statement(case_id):
+        """Upsert MY 진술 for this case (each partner has at most one).
+
+        If a verdict already exists we do NOT auto-clear it — the user re-judges
+        manually with the '다시 판결 맡기기' button."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        text = (request.form.get("text") or "").strip()
+        if not text:
+            flash("진술 내용을 입력해줘.", "error")
+            return redirect(url_for("case_detail", case_id=case.id))
+        st = CaseStatement.query.filter_by(case_id=case.id, user_id=u.id).first()
+        if st:
+            st.text = text
+            st.updated_at = datetime.utcnow()
+        else:
+            db.session.add(
+                CaseStatement(case_id=case.id, user_id=u.id, text=text)
+            )
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # A concurrent submit created my statement first — take theirs, update.
+            db.session.rollback()
+            st = CaseStatement.query.filter_by(
+                case_id=case.id, user_id=u.id
+            ).first()
+            if st:
+                st.text = text
+                st.updated_at = datetime.utcnow()
+                db.session.commit()
+        return redirect(url_for("case_detail", case_id=case.id))
+
+    @app.route("/cases/<int:case_id>/judge", methods=["POST"])
+    @active_couple_required
+    def case_judge(case_id):
+        """Kick off the BACKGROUND AI judgment for this case.
+
+        Requires ≥1 statement. Marks the case 'judging', commits so the detail
+        page shows the '판결 중' state (+ auto-refresh), then spawns the daemon
+        thread. The slow claude pass runs ONLY in ``judge_case`` — never here."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        if len(case.statements) < 1:
+            flash("먼저 진술을 남겨줘.", "error")
+            return redirect(url_for("case_detail", case_id=case.id))
+
+        case.status = "judging"
+        case.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        # In-process guard so a rapid double-tap can't spawn two judge threads
+        # for the same case (single-worker Render free tier). The thread frees
+        # the key in its finally.
+        spawn = False
+        with _judging_lock:
+            if case.id not in _judging:
+                _judging.add(case.id)
+                spawn = True
+        if spawn:
+            try:
+                threading.Thread(
+                    target=judge_case,
+                    args=(current_app._get_current_object(), case.id),
+                    daemon=True,
+                ).start()
+            except Exception:  # noqa: BLE001 — never break the redirect
+                log.exception("failed to spawn judge thread for case %s", case.id)
+                with _judging_lock:
+                    _judging.discard(case.id)
+        return redirect(url_for("case_detail", case_id=case.id))
+
+    @app.route("/cases/<int:case_id>/delete", methods=["POST"])
+    @active_couple_required
+    def case_delete(case_id):
+        """Delete a case (cascade removes its statements). Any couple member may
+        delete their couple's case."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        db.session.delete(case)
+        db.session.commit()
+        flash("사건을 삭제했어.", "ok")
+        return redirect(url_for("cases"))
 
     # ---- monthly insight ----
     @app.route("/insight")
