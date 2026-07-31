@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}파트너 수락 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
+  <h1>연결 요청이 왔어</h1>
+  <p><strong>{{ pending.display_name }}</strong> ({{ pending.email }})님이 초대 코드로 가입했어.</p>
+  <p class="muted">수락하면 두 사람이 커플로 연결되고 바로 시작할 수 있어.</p>
+  <form method="post" action="{{ url_for('approve', user_id=pending.id) }}">
+    <button class="btn primary" type="submit">수락하기</button>
+  </form>
+  <p class="muted small">초대 코드: <code>{{ invite_code }}</code></p>
+</div>
+{% endblock %}

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}지난 질문 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
+  <h1>지난 질문들</h1>
+</div>
+
+{% if not items %}
+  <div class="card center-card">
+    <p class="muted">아직 기록이 없어. 오늘의 질문에 답해보자!</p>
+    <a class="btn primary" href="{{ url_for('index') }}">오늘의 질문으로</a>
+  </div>
+{% else %}
+  {% for item in items %}
+  <div class="card history-item">
+    <div class="date muted">{{ item.date.strftime('%Y.%m.%d') }}</div>
+    <h2 class="question-text small">{{ item.question }}</h2>
+    {% if item.revealed %}
+      <div class="answers">
+        <div class="answer-block mine">
+          <div class="who">{{ me.display_name }} (나)</div>
+          <p>{{ item.mine }}</p>
+        </div>
+        <div class="answer-block partner">
+          <div class="who">{{ partner.display_name }}</div>
+          <p>{{ item.partner }}</p>
+        </div>
+      </div>
+    {% else %}
+      <p class="muted small">
+        {% if item.mine %}내 답은 남겼지만 아직 둘 다 답하지 않아 비공개야.{% else %}아직 답변이 없어.{% endif %}
+      </p>
+    {% endif %}
+  </div>
+  {% endfor %}
+{% endif %}
+{% endblock %}

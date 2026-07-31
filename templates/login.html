@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}로그인 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/locked.svg') }}" alt="" />
+  <h1>다시 만나서 반가워</h1>
+  <p class="muted">{{ app_name }}에 로그인해줘.</p>
+  <form method="post" class="stack">
+    <label>이메일
+      <input type="email" name="email" required autocomplete="email" />
+    </label>
+    <label>비밀번호
+      <input type="password" name="password" required autocomplete="current-password" />
+    </label>
+    <button type="submit" class="btn primary">로그인</button>
+  </form>
+  <p class="muted center">
+    아직 계정이 없어? <a href="{{ url_for('signup') }}">회원가입</a>
+  </p>
+</div>
+{% endblock %}

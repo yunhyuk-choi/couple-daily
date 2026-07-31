@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>{% block title %}{{ app_name }}{% endblock %}</title>
+    <meta name="theme-color" content="#ff6b9d" />
+    <meta name="description" content="둘만의 오늘의 질문 — {{ app_name }}" />
+    <!-- PWA: manifest is dynamic so the installed name follows APP_NAME -->
+    <link rel="manifest" href="{{ url_for('manifest') }}" />
+    <link rel="icon" href="{{ url_for('static', filename='emoji/two_hearts.svg') }}" />
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="{{ app_name }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="{{ url_for('index') }}">
+        <img class="emoji brand-emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+        <span>{{ app_name }}</span>
+      </a>
+      {% if me and me.is_active_couple %}
+      <nav class="nav">
+        <a href="{{ url_for('index') }}" title="오늘의 질문">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="오늘" />
+        </a>
+        <a href="{{ url_for('history') }}" title="지난 질문">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="기록" />
+        </a>
+        <a href="{{ url_for('insight') }}" title="월간 인사이트">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="인사이트" />
+        </a>
+        <a href="{{ url_for('settings') }}" title="설정">
+          <img class="emoji" src="{{ url_for('static', filename='emoji/gear.svg') }}" alt="설정" />
+        </a>
+      </nav>
+      {% endif %}
+    </header>
+
+    <main class="wrap">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+
+    <script>
+      // Register the service worker (offline shell + installability).
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+        });
+      }
+    </script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>
