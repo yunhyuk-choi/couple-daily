@@ -77,6 +77,36 @@ def run_startup_migrations():
                         log.exception(
                             "startup migration: failed dropping NOT NULL on users.%s", col
                         )
+
+        # 3) photos: Phase-2 vision captioning columns (tags + caption_status).
+        #    The `photos` table pre-exists from Phase 1; add the two new columns
+        #    if missing. caption_status is added with a server DEFAULT 'ready' so
+        #    EXISTING Phase-1 rows backfill to 'ready' (they are never auto-
+        #    captioned and must not get stuck showing "분석 중"); NEW rows get
+        #    'pending' from the model-level Python default at insert time.
+        if "photos" in insp.get_table_names():
+            pcols = {c["name"]: c for c in insp.get_columns("photos")}
+            if "tags" not in pcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE photos ADD COLUMN tags TEXT"))
+                    log.info("startup migration: added photos.tags")
+                except Exception:  # noqa: BLE001
+                    log.exception("startup migration: failed adding photos.tags")
+            if "caption_status" not in pcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "ALTER TABLE photos ADD COLUMN caption_status "
+                                "VARCHAR DEFAULT 'ready'"
+                            )
+                        )
+                    log.info("startup migration: added photos.caption_status")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "startup migration: failed adding photos.caption_status"
+                    )
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -302,11 +332,31 @@ class Photo(db.Model):
     uploaded_by = db.Column(
         db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
     )
-    # Optional caption. Null in Phase 1; Phase 2 (Vision) will populate it.
+    # Optional caption. Null in Phase 1; Phase 2 (Vision) populates it with a
+    # one-sentence Korean description produced by `claude` vision.
     caption = db.Column(db.Text, nullable=True)
+    # JSON-encoded list[str] of Korean keyword tags reflecting the photo content
+    # (Phase 2, filled alongside ``caption`` by the background captioner). Null
+    # until captioning succeeds.
+    tags = db.Column(db.Text, nullable=True)
+    # Captioning lifecycle: 'pending' (queued/in-flight), 'ready' (caption+tags
+    # populated, or a manual caption was given), 'failed' (vision errored/timed
+    # out — caption stays null). New auto-captioned uploads start 'pending'.
+    caption_status = db.Column(db.String(16), default="pending", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     uploader = db.relationship("User")
+
+    @property
+    def tags_list(self):
+        """Decode the JSON-stored tags back to a list (defensive)."""
+        if not self.tags:
+            return []
+        try:
+            v = json.loads(self.tags)
+            return v if isinstance(v, list) else []
+        except (ValueError, TypeError):
+            return []
 
 
 class Setting(db.Model):
