@@ -147,7 +147,10 @@ body {
 /* leave room for the FLOATING bottom nav island (its height + bottom offset +
    home-indicator inset) so content isn't hidden behind it and short pages
    don't get a phantom scroll */
-.wrap.has-tabbar { padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
+.wrap.has-tabbar {
+  /* 알약 높이(런타임 실측) + 하단 갭(12px) + safe-area + 약간의 여유 */
+  padding-bottom: calc(var(--tabbar-h, 60px) + 12px + env(safe-area-inset-bottom) + 10px);
+}
 
 /* floating rounded glassy pink nav ISLAND — not a full-width edge bar.
    Side margins + a gap from the bottom edge + a soft shadow so it reads as
