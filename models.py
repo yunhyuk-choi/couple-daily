@@ -279,6 +279,36 @@ class PushSubscription(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
+class Photo(db.Model):
+    """A photo the couple uploaded, stored in OneDrive (``couple-daily`` folder).
+
+    OneDrive holds the bytes; this row keeps only the item id + light metadata.
+    ``caption`` is nullable now — Phase 2 will fill it with a Vision-generated
+    description. Scoped to ``couple_id`` so a couple only ever sees their own
+    photos. Created by ``db.create_all()`` (brand-new table, no ALTER migration).
+    """
+    __tablename__ = "photos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    # The OneDrive drive-item id (opaque). What we delete / fetch a URL by.
+    onedrive_item_id = db.Column(db.String(255), nullable=False)
+    # The sanitized/unique name we stored it under in OneDrive.
+    filename = db.Column(db.String(255), nullable=False)
+    # The user's original upload filename (display only; may be absent).
+    original_name = db.Column(db.String(255), nullable=True)
+    uploaded_by = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # Optional caption. Null in Phase 1; Phase 2 (Vision) will populate it.
+    caption = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    uploader = db.relationship("User")
+
+
 class Setting(db.Model):
     """Global key/value settings (e.g. the configurable app name)."""
     __tablename__ = "settings"
