@@ -1,0 +1,40 @@
+{# 공용 썸네일 그리드 + 라이트박스 — 앨범(memories)과 검색(memories_search)이 공유.
+   호출부는 `photos`(dict 리스트: id·caption·tags·caption_status·original_name)를
+   넘기고, 비어있을 때의 빈 상태는 각자 처리한다. 라이트박스 동작은 _lightbox_js.html. #}
+<div class="photo-grid">
+  {% for p in photos %}
+    <button type="button" class="photo-open"
+            data-id="{{ p.id }}"
+            data-full="{{ url_for('memory_image', photo_id=p.id) }}"
+            data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
+            data-delete="{{ url_for('memories_delete', photo_id=p.id) }}"
+            data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
+            data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
+            aria-label="{{ p.caption or p.original_name or '추억 사진' }} 크게 보기">
+      <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
+           loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+      {% if p.caption_status == 'pending' %}
+        <span class="thumb-badge" title="분석 중" aria-hidden="true">📝</span>
+      {% endif %}
+    </button>
+  {% endfor %}
+</div>
+
+{# 라이트박스 오버레이 — 원본 확대 + 캡션 + 태그 + 다운로드 + 삭제. #}
+<div class="lightbox" id="lightbox" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="사진 크게 보기">
+  <button type="button" class="lb-close" id="lb-close" aria-label="닫기">×</button>
+  <div class="lb-stage">
+    <img class="lb-img" id="lb-img" alt="추억 사진" />
+  </div>
+  <div class="lb-meta">
+    <p class="lb-caption" id="lb-caption" hidden></p>
+    <div class="lb-tags themes" id="lb-tags" hidden></div>
+    <div class="lb-actions">
+      <a class="btn primary lb-download" id="lb-download" href="#" download>다운로드</a>
+      <form method="post" id="lb-delete-form" class="lb-delete-form"
+            onsubmit="return confirm('이 사진을 삭제할까?');">
+        <button class="btn ghost lb-delete" type="submit">🗑 삭제</button>
+      </form>
+    </div>
+  </div>
+</div>

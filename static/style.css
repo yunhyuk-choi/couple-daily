@@ -235,6 +235,12 @@ h2.small, .question-text.small { font-size: 1.15rem; }
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
 .center { text-align: center; }
+/* 스크린리더 전용(시각적 숨김) — 검색 입력 라벨 등 */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.search-count { margin: 8px 0 12px; }
 
 /* forms */
 .stack { display: flex; flex-direction: column; gap: 12px; text-align: left; }
