@@ -1011,8 +1011,12 @@ def _register_routes(app: Flask):
         )
         db.session.commit()
         # Notify the OTHER partner (the one who didn't write this comment).
-        anchor = f"#c-q{q.id}"
-        link = (url_for("index") if q.q_date == date.today() else url_for("history")) + anchor
+        # Today's comments live on the dashboard; a past day's live on its
+        # detail page (/question/<qid>) — mirror that split in the deep link.
+        if q.q_date == date.today():
+            link = url_for("index") + f"#c-q{q.id}"
+        else:
+            link = url_for("question_detail", qid=q.id) + f"#c-q{q.id}"
         _safe_notify(
             u.partner,
             "comment",
@@ -1022,15 +1026,50 @@ def _register_routes(app: Flask):
         return _redirect_after_comment(q)
 
     def _redirect_after_comment(q):
-        anchor = f"#c-q{q.id}"
+        # Today is answered/commented on the dashboard; a past day returns to
+        # its own detail page so the reader stays on the day they're reading.
         if q.q_date == date.today():
-            return redirect(url_for("index") + anchor)
-        return redirect(url_for("history") + anchor)
+            return redirect(url_for("index") + f"#c-q{q.id}")
+        return redirect(url_for("question_detail", qid=q.id) + f"#c-q{q.id}")
+
+    # ---- single day detail ----
+    @app.route("/question/<int:qid>")
+    @active_couple_required
+    def question_detail(qid):
+        """A single day's question + both answers + comment thread.
+
+        Same reveal rule as the dashboard: both answers (and the comment box)
+        appear only once both partners have answered. Pure DB reads — never
+        touches claude. 404 for a missing question or one that isn't this
+        couple's, so a day can't be read across couples."""
+        u = current_user()
+        q = db.session.get(DailyQuestion, qid)
+        if q is None or q.couple_id != u.couple_id:
+            abort(404)
+        partner = u.partner
+        my_ans = q.answer_by(u.id)
+        partner_ans = q.answer_by(partner.id) if partner else None
+        revealed = q.both_answered
+        thread, comment_count = build_comment_thread(q) if revealed else ([], 0)
+        return render_template(
+            "question_detail.html",
+            question=q,
+            my_ans=my_ans,
+            partner_ans=partner_ans,
+            partner=partner,
+            revealed=revealed,
+            thread=thread,
+            comment_count=comment_count,
+        )
 
     # ---- history ----
     @app.route("/history")
     @active_couple_required
     def history():
+        """A clean, clickable list of past days. Each row links to the day's
+        detail page (/question/<qid>); the full answers + comment thread live
+        there, not inline here. Metadata (reveal state + comment count) is kept
+        cheap — a COUNT, never the built thread."""
         u = current_user()
         partner = u.partner
         qs = (
@@ -1040,20 +1079,15 @@ def _register_routes(app: Flask):
         )
         items = []
         for q in qs:
-            my = q.answer_by(u.id)
-            pa = q.answer_by(partner.id) if partner else None
             revealed = q.both_answered
-            thread, comment_count = build_comment_thread(q) if revealed else ([], 0)
             items.append(
                 {
-                    "qid": q.id,
+                    "id": q.id,
                     "date": q.q_date,
                     "question": q.text,
                     "revealed": revealed,
-                    "mine": my.text if my else None,
-                    "partner": pa.text if (pa and revealed) else None,
-                    "thread": thread,
-                    "comment_count": comment_count,
+                    "answered_mine": q.answer_by(u.id) is not None,
+                    "comment_count": q.comments.count() if revealed else 0,
                 }
             )
         return render_template("history.html", items=items, partner=partner)
