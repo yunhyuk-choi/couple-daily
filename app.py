@@ -342,14 +342,10 @@ def _register_routes(app: Flask):
         # can yield http.
         return url_for("kakao_callback", _external=True, _scheme="https")
 
-    @app.route("/auth/kakao/login")
-    def kakao_login():
-        if current_user():
-            return redirect(url_for("index"))
-        if not kakao_enabled():
-            flash("카카오 로그인이 설정되지 않았어.", "error")
-            return redirect(url_for("login"))
-        # CSRF: random state stored in session, verified on callback.
+    def _kakao_start_authorize():
+        # Build a fresh CSRF state, stash it, and hand off to Kakao's authorize
+        # endpoint. Shared by both the login flow and the link-existing flow so
+        # they stay in lockstep on state handling and redirect_uri.
         state = secrets.token_urlsafe(24)
         session["kakao_oauth_state"] = state
         params = {
@@ -359,6 +355,30 @@ def _register_routes(app: Flask):
             "state": state,
         }
         return redirect(KAKAO_AUTHORIZE_URL + "?" + urlencode(params))
+
+    @app.route("/auth/kakao/login")
+    def kakao_login():
+        if current_user():
+            return redirect(url_for("index"))
+        if not kakao_enabled():
+            flash("카카오 로그인이 설정되지 않았어.", "error")
+            return redirect(url_for("login"))
+        # Plain login: make sure we're not carrying a stale link intent.
+        session.pop("kakao_link_mode", None)
+        return _kakao_start_authorize()
+
+    @app.route("/auth/kakao/link")
+    @login_required
+    def kakao_link():
+        """Link Kakao to the *currently logged-in* account (no new account)."""
+        if not kakao_enabled():
+            flash("카카오 로그인이 설정되지 않았어.", "error")
+            return redirect(url_for("settings"))
+        if current_user().kakao_id:
+            flash("이미 카카오가 연결된 계정이야.", "error")
+            return redirect(url_for("settings"))
+        session["kakao_link_mode"] = True
+        return _kakao_start_authorize()
 
     @app.route("/auth/kakao/callback")
     def kakao_callback():
@@ -423,6 +443,29 @@ def _register_routes(app: Flask):
         nickname = (
             kprofile.get("nickname") or props.get("nickname") or "카카오 사용자"
         )[:60]
+
+        # ---- link-to-existing-account flow ------------------------------- #
+        # A logged-in email user chose "connect Kakao" in settings. Attach this
+        # Kakao identity to their EXISTING account instead of creating a new one.
+        # Pop unconditionally so a stale flag can never leak into a later login.
+        if session.pop("kakao_link_mode", False):
+            me = current_user()
+            if me is not None:
+                if me.kakao_id:
+                    flash("이미 카카오가 연결된 계정이야.", "error")
+                    return redirect(url_for("settings"))
+                other = User.query.filter_by(kakao_id=kakao_id).first()
+                if other is not None and other.id != me.id:
+                    # Never steal/merge — this Kakao already belongs elsewhere.
+                    flash("이 카카오 계정은 이미 다른 계정에 연결돼 있어.", "error")
+                    return redirect(url_for("settings"))
+                me.kakao_id = kakao_id
+                db.session.commit()
+                flash(
+                    "카카오 계정이 연결됐어! 이제 카카오로도 로그인할 수 있어.", "ok"
+                )
+                return redirect(url_for("settings"))
+            # Link mode but somehow not logged in → fall through to normal login.
 
         # Existing Kakao user → just log in.
         user = User.query.filter_by(kakao_id=kakao_id).first()
@@ -493,6 +536,22 @@ def _register_routes(app: Flask):
         return render_template(
             "kakao_connect.html", nickname=nickname, invite_code=""
         )
+
+    @app.route("/auth/kakao/unlink", methods=["POST"])
+    @login_required
+    def kakao_unlink():
+        """Detach Kakao from the current account. Refuse if it would lock the
+        user out (a Kakao-only account has no email/password to fall back on)."""
+        u = current_user()
+        if not u.kakao_id:
+            return redirect(url_for("settings"))
+        if not u.email:
+            flash("카카오만 연결된 계정은 연결을 해제할 수 없어.", "error")
+            return redirect(url_for("settings"))
+        u.kakao_id = None
+        db.session.commit()
+        flash("카카오 연결을 해제했어.", "ok")
+        return redirect(url_for("settings"))
 
     # ---- couple approval ----
     @app.route("/approve/<int:user_id>", methods=["POST"])
