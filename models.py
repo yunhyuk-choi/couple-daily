@@ -255,6 +255,29 @@ def notify(user, type, message, link):
     return n
 
 
+class PushSubscription(db.Model):
+    """A single browser/device Web Push subscription for a user.
+
+    Layered on top of the in-app ``Notification``: when an event fans out, we
+    persist the in-app row AND push to every ``PushSubscription`` the recipient
+    has registered. One user can have several (phone, laptop, installed PWA).
+    ``endpoint`` is globally unique — the same browser re-subscribing yields the
+    same endpoint, so we upsert by it. Created by ``db.create_all()``.
+    """
+    __tablename__ = "push_subscriptions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # The push service URL for this subscription. Unique across all users.
+    endpoint = db.Column(db.String(512), unique=True, nullable=False)
+    # Public key + auth secret the push service needs to encrypt the payload.
+    p256dh = db.Column(db.String(255), nullable=False)
+    auth = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Setting(db.Model):
     """Global key/value settings (e.g. the configurable app name)."""
     __tablename__ = "settings"

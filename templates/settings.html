@@ -41,6 +41,25 @@
   </form>
 </div>
 
+{% if push_enabled %}
+<div class="card" id="push-card">
+  <div class="q-head">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+    <span>알림</span>
+  </div>
+  <p class="muted small">
+    상대가 답을 남기거나 댓글을 달면, 그리고 매일 저녁 오늘의 질문 리마인더를
+    이 기기로 푸시 알림으로 받을 수 있어.
+  </p>
+  <button class="btn ghost" type="button" id="push-toggle" disabled>확인 중…</button>
+  <p class="muted small" id="push-status" aria-live="polite"></p>
+  <p class="muted small">
+    · iPhone은 iOS 16.4 이상에서, <strong>홈 화면에 설치한 PWA</strong>로 열었을
+    때만 푸시 알림이 와. (Safari 공유 → "홈 화면에 추가" 후 그 아이콘으로 열기)
+  </p>
+</div>
+{% endif %}
+
 <div class="card install-hint">
   <div class="q-head">
     <img class="emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
@@ -52,4 +71,126 @@
     · iOS/Safari: 공유 버튼 → "홈 화면에 추가"
   </p>
 </div>
+{% endblock %}
+
+{% block scripts %}
+{% if push_enabled %}
+<script>
+(function () {
+  const btn = document.getElementById("push-toggle");
+  const statusEl = document.getElementById("push-status");
+  if (!btn) return;
+
+  // Standard helper: VAPID public key (URL-safe base64) → Uint8Array.
+  function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(base64);
+    const output = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; ++i) output[i] = raw.charCodeAt(i);
+    return output;
+  }
+
+  const supported =
+    "serviceWorker" in navigator &&
+    "PushManager" in window &&
+    "Notification" in window;
+
+  if (!supported) {
+    btn.textContent = "이 브라우저는 알림을 지원하지 않아";
+    btn.disabled = true;
+    statusEl.textContent =
+      "iPhone은 홈 화면에 설치한 앱으로 열어야 알림을 켤 수 있어.";
+    return;
+  }
+
+  let publicKey = null;
+
+  function setState(subscribed) {
+    btn.disabled = false;
+    btn.textContent = subscribed ? "알림 끄기" : "알림 받기";
+    btn.dataset.subscribed = subscribed ? "1" : "0";
+    if (Notification.permission === "denied") {
+      statusEl.textContent =
+        "브라우저에서 알림이 차단돼 있어. 사이트 설정에서 알림을 허용해줘.";
+    } else {
+      statusEl.textContent = subscribed ? "이 기기에서 알림 켜짐" : "";
+    }
+  }
+
+  async function currentSubscription() {
+    const reg = await navigator.serviceWorker.ready;
+    return reg.pushManager.getSubscription();
+  }
+
+  async function refresh() {
+    try {
+      const sub = await currentSubscription();
+      setState(!!sub);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "알림 받기";
+    }
+  }
+
+  async function subscribe() {
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      setState(false);
+      statusEl.textContent = "알림 권한이 필요해.";
+      return;
+    }
+    if (!publicKey) {
+      const res = await fetch("/push/public-key");
+      publicKey = (await res.text()).trim();
+    }
+    if (!publicKey) {
+      statusEl.textContent = "알림 설정이 아직 준비되지 않았어.";
+      return;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+    await fetch("/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sub),
+    });
+    setState(true);
+  }
+
+  async function unsubscribe() {
+    const sub = await currentSubscription();
+    if (sub) {
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe().catch(() => {});
+      await fetch("/push/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: endpoint }),
+      });
+    }
+    setState(false);
+  }
+
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      if (btn.dataset.subscribed === "1") {
+        await unsubscribe();
+      } else {
+        await subscribe();
+      }
+    } catch (e) {
+      statusEl.textContent = "알림 설정 중 문제가 생겼어. 다시 시도해줘.";
+      btn.disabled = false;
+    }
+  });
+
+  refresh();
+})();
+</script>
+{% endif %}
 {% endblock %}
