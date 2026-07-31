@@ -13,7 +13,7 @@ import os
 import secrets
 import string
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from flask import (
     Flask,
@@ -70,6 +70,7 @@ def create_app():
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=is_prod,  # HTTPS-only cookies in prod
+        PERMANENT_SESSION_LIFETIME=timedelta(days=90),  # "로그인 유지" lifetime
     )
 
     db.init_app(app)
@@ -273,6 +274,7 @@ def _register_routes(app: Flask):
             db.session.commit()
             session.clear()
             session["user_id"] = user.id
+            session.permanent = True  # 새 커플은 로그인 상태 유지
             return redirect(url_for("index"))
         return render_template("signup.html")
 
@@ -294,6 +296,8 @@ def _register_routes(app: Flask):
                 return render_template("login.html")
             session.clear()
             session["user_id"] = user.id
+            # "로그인 유지" 체크 시 90일 지속 쿠키, 아니면 브라우저 세션 쿠키.
+            session.permanent = bool(request.form.get("remember"))
             nxt = request.args.get("next")
             return redirect(nxt or url_for("index"))
         return render_template("login.html")
