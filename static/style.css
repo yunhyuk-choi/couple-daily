@@ -17,6 +17,14 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute must ALWAYS win. Any class rule that sets `display`
+   (e.g. .modal-overlay{display:flex}, .lightbox{display:flex}, label{display:flex},
+   .themes{display:flex}) would otherwise override the UA `[hidden]{display:none}`
+   and leave the element visible AND intercepting pointer events. This keeps every
+   JS `.hidden` toggle (upload modal, lightbox, preview strip, caption/tag rows)
+   reliably hidden by default. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic",
