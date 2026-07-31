@@ -92,8 +92,21 @@ h2.small, .question-text.small { font-size: 1.15rem; }
 /* forms */
 .stack { display: flex; flex-direction: column; gap: 12px; text-align: left; }
 label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; font-size: 0.92rem; }
-label.check-row { flex-direction: row; align-items: center; gap: 8px; }
-label.check-row input { width: auto; margin: 0; }
+label.check-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+label.check-row input {
+  width: auto;
+  margin: 0;
+  flex: none;
+  accent-color: var(--pink);
+}
 input, textarea {
   font: inherit;
   padding: 12px 14px;
@@ -123,6 +136,25 @@ textarea { resize: vertical; }
 .btn.primary:hover { filter: brightness(1.05); }
 .btn.ghost { background: var(--pink-soft); color: var(--pink); }
 .btn.sm { padding: 7px 14px; font-size: 0.85rem; }
+/* Kakao brand button (official yellow #FEE500 / dark label #191600) */
+.btn.kakao { background: #FEE500; color: #191600; width: 100%; }
+.btn.kakao:hover { filter: brightness(0.97); }
+
+/* "또는" divider between email form and social login */
+.or-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  color: var(--muted, #999);
+  font-size: 0.85rem;
+}
+.or-divider::before, .or-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(0,0,0,0.1);
+}
 
 /* flash */
 .flash { padding: 12px 16px; border-radius: 12px; margin-bottom: 14px; font-size: 0.92rem; }

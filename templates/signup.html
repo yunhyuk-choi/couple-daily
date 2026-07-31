@@ -23,6 +23,10 @@
     </label>
     <button type="submit" class="btn primary">시작하기</button>
   </form>
+  {% if kakao_enabled %}
+  <div class="or-divider"><span>또는</span></div>
+  <a class="btn kakao" href="{{ url_for('kakao_login') }}">카카오로 시작하기</a>
+  {% endif %}
   <p class="muted center">
     이미 계정이 있어? <a href="{{ url_for('login') }}">로그인</a>
   </p>
