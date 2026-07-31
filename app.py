@@ -40,9 +40,11 @@ from models import (
     Comment,
     Couple,
     DailyQuestion,
+    Notification,
     Setting,
     User,
     db,
+    notify,
     run_startup_migrations,
 )
 
@@ -121,6 +123,26 @@ def current_user():
     if not uid:
         return None
     return db.session.get(User, uid)
+
+
+def _safe_notify(recipient, type, message, link):
+    """Create + commit a Notification without ever breaking the caller's action.
+
+    The main action (answer/comment/approval) is already committed by the time
+    this runs; a notification failure here is logged and swallowed so it can
+    never undo or block that action. Skips silently when there's no recipient.
+
+    This is the single fan-out point the future web-push branch will extend:
+    persist the in-app row here, then also enqueue a push to ``recipient``.
+    """
+    if recipient is None:
+        return
+    try:
+        notify(recipient, type, message, link)
+        db.session.commit()
+    except Exception:  # noqa: BLE001 — a notification must never break the action
+        db.session.rollback()
+        log.exception("notify failed (type=%s recipient=%s)", type, getattr(recipient, "id", None))
 
 
 def _gen_invite_code():
@@ -254,10 +276,19 @@ def build_comment_thread(q: DailyQuestion):
 def _register_routes(app: Flask):
     @app.context_processor
     def inject_globals():
+        me = current_user()
+        # Cheap unread COUNT for the topbar bell dot — only for a logged-in user
+        # who's in a couple (the only place the bell is shown).
+        notif_unread = 0
+        if me is not None and me.couple_id:
+            notif_unread = (
+                Notification.query.filter_by(user_id=me.id, is_read=False).count()
+            )
         return {
             "app_name": Setting.get("app_name", DEFAULT_APP_NAME),
-            "me": current_user(),
+            "me": me,
             "kakao_enabled": kakao_enabled(),
+            "notif_unread": notif_unread,
         }
 
     @app.template_filter("timeago")
@@ -639,6 +670,13 @@ def _register_routes(app: Flask):
             abort(400)
         partner.status = "approved"
         db.session.commit()
+        # Notify the just-approved partner (never the admin/actor).
+        _safe_notify(
+            partner,
+            "approval",
+            "커플 연결이 승인됐어! 🎉",
+            url_for("index"),
+        )
         flash(f"{partner.display_name}님과 연결됐어! 이제 함께 시작해봐.", "ok")
         return redirect(url_for("index"))
 
@@ -653,6 +691,7 @@ def _register_routes(app: Flask):
             return redirect(url_for("index"))
         q = get_or_create_today_question(u.couple)
         existing = q.answer_by(u.id)
+        is_new = existing is None  # only a first answer notifies (edits stay quiet)
         if existing:
             existing.text = text  # allow editing until reveal is fine; keep simple
         else:
@@ -661,6 +700,15 @@ def _register_routes(app: Flask):
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
+            is_new = False
+        if is_new:
+            # Notify the partner (the recipient) — never the answering user.
+            _safe_notify(
+                u.partner,
+                "answer",
+                f"{u.display_name}님이 오늘 답을 남겼어 💌",
+                url_for("index"),
+            )
         return redirect(url_for("index"))
 
     # ---- comments on a day's revealed answers ----
@@ -700,6 +748,15 @@ def _register_routes(app: Flask):
             )
         )
         db.session.commit()
+        # Notify the OTHER partner (the one who didn't write this comment).
+        anchor = f"#c-q{q.id}"
+        link = (url_for("index") if q.q_date == date.today() else url_for("history")) + anchor
+        _safe_notify(
+            u.partner,
+            "comment",
+            f"{u.display_name}님이 댓글을 남겼어",
+            link,
+        )
         return _redirect_after_comment(q)
 
     def _redirect_after_comment(q):
@@ -807,6 +864,26 @@ def _register_routes(app: Flask):
         return render_template(
             "settings.html", current_app_name=Setting.get("app_name", DEFAULT_APP_NAME)
         )
+
+    # ---- in-app notifications ----
+    @app.route("/notifications")
+    @login_required
+    def notifications():
+        u = current_user()
+        items = (
+            Notification.query.filter_by(user_id=u.id)
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .all()
+        )
+        # Viewing the page marks everything read so the bell dot clears. Keep
+        # the just-read ids so this render can still highlight them subtly.
+        fresh_ids = {n.id for n in items if not n.is_read}
+        if fresh_ids:
+            for n in items:
+                if n.id in fresh_ids:
+                    n.is_read = True
+            db.session.commit()
+        return render_template("notifications.html", items=items, fresh_ids=fresh_ids)
 
     # ---- PWA plumbing ----
     @app.route("/manifest.json")

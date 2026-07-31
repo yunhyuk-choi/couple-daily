@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}알림 · {{ app_name }}{% endblock %}
+{% set icons = {
+  'answer': 'emoji/love_letter.svg',
+  'comment': 'emoji/speech_balloon.svg',
+  'approval': 'emoji/party_popper.svg'
+} %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+  <h1>알림</h1>
+</div>
+
+{% if items %}
+<div class="notif-list">
+  {% for n in items %}
+  <a class="notif-row{% if n.id in fresh_ids %} unread{% endif %}" href="{{ n.link }}">
+    <span class="notif-icon">
+      <img class="emoji" src="{{ url_for('static', filename=icons.get(n.type, 'emoji/sparkles.svg')) }}" alt="" />
+    </span>
+    <span class="notif-body">
+      <span class="notif-msg">{{ n.message }}</span>
+      <span class="notif-time">{{ n.created_at | timeago }}</span>
+    </span>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card notif-empty">
+  <img class="emoji" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+  <p class="muted">아직 알림이 없어</p>
+</div>
+{% endif %}
+{% endblock %}
