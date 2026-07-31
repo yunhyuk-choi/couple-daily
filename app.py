@@ -1098,6 +1098,15 @@ def _register_routes(app: Flask):
     # ---- 추억 (memories): photos stored in OneDrive ----
     _ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
     _MAX_PHOTO_BYTES = 15 * 1024 * 1024  # 15 MB
+    _EXT_CONTENT_TYPES = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+        ".gif": "image/gif", ".webp": "image/webp",
+        ".heic": "image/heic", ".heif": "image/heif",
+    }
+
+    def _content_type_for(name):
+        ext = os.path.splitext(name or "")[1].lower()
+        return _EXT_CONTENT_TYPES.get(ext, "image/jpeg")
 
     @app.route("/memories")
     @active_couple_required
@@ -1105,9 +1114,11 @@ def _register_routes(app: Flask):
         """Gallery of the couple's photos (newest first) + an upload form.
 
         When OneDrive isn't configured we do NOT crash — we render a friendly
-        "connect OneDrive" note and hide the upload form. Thumbnails use Graph's
-        short-lived direct download URL, fetched through a brief in-process cache
-        so a gallery of N photos doesn't trigger N refetches on every render.
+        "connect OneDrive" note and hide the upload form. Each thumbnail's
+        ``<img src>`` points at our own ``/memories/<id>/image`` proxy route (see
+        ``memory_image``), NOT at a raw OneDrive URL — personal-OneDrive download
+        URLs expire almost immediately and would 401 in the browser. So this
+        render does NO network I/O; it's a pure DB read.
         """
         u = current_user()
         if not onedrive.onedrive_enabled():
@@ -1120,30 +1131,51 @@ def _register_routes(app: Flask):
             .order_by(Photo.created_at.desc(), Photo.id.desc())
             .all()
         )
-        photos = []
-        reconnect = False
-        for p in rows:
-            url = None
-            try:
-                url = onedrive.get_download_url_cached(p.onedrive_item_id)
-            except onedrive.OneDriveError:
-                # One bad item (or a dead token) must not blank the whole page.
-                log.warning("could not get download url for photo %s", p.id)
-                if onedrive.reconnect_needed():
-                    reconnect = True
-            photos.append(
-                {
-                    "id": p.id,
-                    "url": url,
-                    "caption": p.caption,
-                    "original_name": p.original_name,
-                    "uploaded_by": p.uploaded_by,
-                    "created_at": p.created_at,
-                }
-            )
+        photos = [
+            {
+                "id": p.id,
+                "caption": p.caption,
+                "original_name": p.original_name,
+                "uploaded_by": p.uploaded_by,
+                "created_at": p.created_at,
+            }
+            for p in rows
+        ]
         return render_template(
-            "memories.html", enabled=True, reconnect=reconnect, photos=photos
+            "memories.html",
+            enabled=True,
+            reconnect=onedrive.reconnect_needed(),
+            photos=photos,
         )
+
+    @app.route("/memories/<int:photo_id>/image")
+    @active_couple_required
+    def memory_image(photo_id):
+        """Backend image proxy: stream a photo's bytes from OneDrive.
+
+        The browser never sees a OneDrive URL. We fetch the bytes server-side
+        with a FRESH link every time (``get_photo_content`` hits /content, which
+        302s to a fresh pre-auth URL) so we can't serve an expired 401 body. A
+        brief in-process bytes cache absorbs refetch storms; ``Cache-Control:
+        private, max-age=3600`` lets the browser cache each image for an hour.
+        404 unless the photo belongs to the requester's couple.
+        """
+        u = current_user()
+        photo = db.session.get(Photo, photo_id)
+        if photo is None or photo.couple_id != u.couple_id:
+            abort(404)
+        try:
+            data, ctype = onedrive.get_photo_content_cached(photo.onedrive_item_id)
+        except onedrive.OneDriveError:
+            log.exception("could not fetch image bytes for photo %s", photo.id)
+            abort(502)
+        if data is None:
+            abort(404)  # gone from OneDrive
+        if not ctype or not ctype.startswith("image/"):
+            ctype = _content_type_for(photo.filename or photo.original_name)
+        resp = app.response_class(data, mimetype=ctype)
+        resp.headers["Cache-Control"] = "private, max-age=3600"
+        return resp
 
     @app.route("/memories/upload", methods=["POST"])
     @active_couple_required

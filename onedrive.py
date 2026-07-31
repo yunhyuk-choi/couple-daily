@@ -52,10 +52,13 @@ _access_token = None
 _access_expiry = 0.0  # epoch seconds; refresh a little before this
 _reconnect_needed = False
 
-# short-lived per-item download-url cache — avoids refetch storms when a gallery
-# of N thumbnails renders. Well under the URL's own (~1h) lifetime.
-_DL_CACHE_TTL = 240  # seconds
-_dl_cache: dict[str, tuple[str, float]] = {}
+# short-lived per-item IMAGE-BYTES cache for the backend image proxy. We cache
+# the fetched BYTES (not a download URL): personal-OneDrive pre-auth download
+# URLs expire very quickly, so a cached URL would 401 — but cached bytes are
+# always a valid response. Kept brief; the browser also caches via Cache-Control.
+_BYTES_CACHE_TTL = 60  # seconds
+_BYTES_CACHE_MAX = 24  # cap entries so memory can't grow unbounded
+_bytes_cache: dict[str, tuple[bytes, str, float]] = {}
 
 
 class OneDriveError(RuntimeError):
@@ -266,26 +269,61 @@ def get_download_url(item_id: str):
         raise OneDriveError(f"download-url request failed: {e}") from e
 
 
-def get_download_url_cached(item_id: str):
-    """``get_download_url`` with a short in-process cache.
+def get_photo_content(item_id: str):
+    """Fetch an item's raw image bytes SERVER-SIDE, always via a FRESH link.
 
-    A gallery renders many thumbnails at once; without this each render would
-    re-hit Graph per photo. The URL itself lives ~1h, so a few-minute cache is
-    safe and slashes request fan-out. Returns None if the item is gone.
+    Uses ``GET /me/drive/items/<id>/content`` which 302-redirects to a fresh,
+    short-lived pre-authenticated download URL; ``requests`` follows the redirect
+    by default (and drops the Bearer header on the cross-host hop, which is
+    correct — the redirect target is already pre-authenticated). This never
+    reuses a stale URL, so it can't serve an expired 401 body — the fix for
+    personal-OneDrive URLs that expire almost immediately.
+
+    Returns ``(bytes, content_type)``, or ``(None, None)`` if the item is gone.
+    """
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
+            headers=_auth_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code == 404:
+            return None, None
+        if r.status_code != 200:
+            raise OneDriveError(f"content fetch failed (status={r.status_code})")
+        return r.content, r.headers.get("Content-Type")
+    except requests.RequestException as e:
+        raise OneDriveError(f"content request failed: {e}") from e
+
+
+def get_photo_content_cached(item_id: str):
+    """``get_photo_content`` with a brief in-process BYTES cache.
+
+    Avoids refetch storms (e.g. a reload before the browser cache warms) without
+    ever serving an expired URL — the cached value is the decoded bytes, always
+    valid. TTL is short and the cache is size-capped. Returns ``(bytes, ctype)``
+    or ``(None, None)`` if the item is gone.
     """
     now = time.time()
-    hit = _dl_cache.get(item_id)
-    if hit and now < hit[1]:
-        return hit[0]
-    url = get_download_url(item_id)
-    if url:
-        _dl_cache[item_id] = (url, now + _DL_CACHE_TTL)
-    return url
+    hit = _bytes_cache.get(item_id)
+    if hit and now < hit[2]:
+        return hit[0], hit[1]
+    data, ctype = get_photo_content(item_id)
+    if data is not None:
+        # Evict expired / oldest entries before inserting to bound memory.
+        if len(_bytes_cache) >= _BYTES_CACHE_MAX:
+            for k in [k for k, v in _bytes_cache.items() if v[2] <= now]:
+                _bytes_cache.pop(k, None)
+            if len(_bytes_cache) >= _BYTES_CACHE_MAX:
+                oldest = min(_bytes_cache, key=lambda k: _bytes_cache[k][2])
+                _bytes_cache.pop(oldest, None)
+        _bytes_cache[item_id] = (data, ctype or "", now + _BYTES_CACHE_TTL)
+    return data, ctype
 
 
 def delete_photo(item_id: str):
     """Delete an item from OneDrive. A 404 (already gone) counts as success."""
-    _dl_cache.pop(item_id, None)
+    _bytes_cache.pop(item_id, None)
     try:
         r = requests.delete(
             f"{GRAPH_BASE}/me/drive/items/{item_id}",

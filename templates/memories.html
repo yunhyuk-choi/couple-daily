@@ -40,14 +40,8 @@
     <div class="photo-grid">
       {% for p in photos %}
         <figure class="photo-card">
-          {% if p.url %}
-            <img class="photo-img" src="{{ p.url }}" loading="lazy"
-                 alt="{{ p.caption or p.original_name or '추억 사진' }}" />
-          {% else %}
-            <div class="photo-img photo-missing">
-              <span class="muted small">사진을 불러올 수 없어</span>
-            </div>
-          {% endif %}
+          <img class="photo-img" src="{{ url_for('memory_image', photo_id=p.id) }}"
+               loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
           {% if p.caption %}
             <figcaption class="photo-caption">{{ p.caption }}</figcaption>
           {% endif %}
