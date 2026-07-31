@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}파트너 초대 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+  <h1>파트너를 초대해줘</h1>
+  <p class="muted">아래 초대 코드를 파트너에게 알려줘. 회원가입할 때 이 코드를 넣으면 돼.</p>
+  <div class="invite-code">{{ invite_code }}</div>
+  <p class="muted">파트너가 가입하면 여기서 수락할 수 있어.</p>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="btn ghost" type="submit">로그아웃</button>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}승인 대기 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+  <h1>수락을 기다리는 중이야</h1>
+  <p class="muted">파트너가 연결 요청을 수락하면 바로 함께 시작할 수 있어.<br />조금만 기다려줘!</p>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="btn ghost" type="submit">로그아웃</button>
+  </form>
+</div>
+{% endblock %}

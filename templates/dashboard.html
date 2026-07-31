@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}오늘의 질문 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card question-card">
+  <div class="q-head">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/sun.svg') }}" alt="" />
+    <span class="date">{{ today.strftime('%Y년 %m월 %d일') }} · 오늘의 질문</span>
+  </div>
+  <h1 class="question-text">{{ question.text }}</h1>
+
+  {% if revealed %}
+    <div class="reveal-banner">
+      <img class="emoji" src="{{ url_for('static', filename='emoji/party_popper.svg') }}" alt="" />
+      둘 다 답했어! 서로의 답을 확인해봐.
+    </div>
+    <div class="answers">
+      <div class="answer-block mine">
+        <div class="who"><img class="emoji sm" src="{{ url_for('static', filename='emoji/speech_balloon.svg') }}" alt="" /> {{ me.display_name }} (나)</div>
+        <p>{{ my_ans.text }}</p>
+      </div>
+      <div class="answer-block partner">
+        <div class="who"><img class="emoji sm" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" /> {{ partner.display_name }}</div>
+        <p>{{ partner_ans.text }}</p>
+      </div>
+    </div>
+    <form method="post" action="{{ url_for('answer') }}" class="stack edit-form">
+      <details>
+        <summary class="muted">내 답 수정하기</summary>
+        <textarea name="answer" rows="3" required>{{ my_ans.text }}</textarea>
+        <button class="btn ghost" type="submit">수정 저장</button>
+      </details>
+    </form>
+  {% elif my_ans %}
+    <div class="answer-block mine">
+      <div class="who"><img class="emoji sm" src="{{ url_for('static', filename='emoji/speech_balloon.svg') }}" alt="" /> 내 답변</div>
+      <p>{{ my_ans.text }}</p>
+    </div>
+    <div class="waiting">
+      <img class="emoji" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+      <p>{{ partner.display_name }}님이 아직 답하지 않았어.<br />둘 다 답하면 서로의 답이 공개돼!</p>
+    </div>
+    <form method="post" action="{{ url_for('answer') }}" class="stack edit-form">
+      <details>
+        <summary class="muted">내 답 수정하기</summary>
+        <textarea name="answer" rows="3" required>{{ my_ans.text }}</textarea>
+        <button class="btn ghost" type="submit">수정 저장</button>
+      </details>
+    </form>
+  {% else %}
+    <form method="post" action="{{ url_for('answer') }}" class="stack">
+      <textarea name="answer" rows="4" placeholder="여기에 오늘의 답을 적어줘..." required autofocus></textarea>
+      <button class="btn primary" type="submit">답변 남기기</button>
+      <p class="muted small center">내 답변은 {{ partner.display_name }}님이 답하기 전까지 공개되지 않아.</p>
+    </form>
+  {% endif %}
+</div>
+
+<div class="quicklinks">
+  <a class="quicklink" href="{{ url_for('history') }}">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/spiral_calendar.svg') }}" alt="" />
+    <span>지난 질문 보기</span>
+  </a>
+  <a class="quicklink" href="{{ url_for('insight') }}">
+    <img class="emoji" src="{{ url_for('static', filename='emoji/chart_increasing.svg') }}" alt="" />
+    <span>월간 인사이트</span>
+  </a>
+</div>
+{% endblock %}

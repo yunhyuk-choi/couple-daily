@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{{ app_name }}{% endblock %}
+{% block content %}
+<div class="card center-card">
+  <img class="emoji hero" src="{{ url_for('static', filename='emoji/two_hearts.svg') }}" alt="" />
+  <h1>커플 공간이 없어</h1>
+  <p class="muted">계정에 연결된 커플 공간이 없어. 다시 가입하거나 초대 코드로 참여해줘.</p>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="btn ghost" type="submit">로그아웃</button>
+  </form>
+</div>
+{% endblock %}
