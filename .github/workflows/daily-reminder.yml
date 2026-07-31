@@ -1,0 +1,31 @@
+name: daily-reminder
+
+# Nudges couple members who haven't answered today's question.
+# 20:30 KST == 11:30 UTC. GitHub cron is always UTC.
+on:
+  schedule:
+    - cron: "30 11 * * *"
+  workflow_dispatch: {}
+
+# Required repository secret:
+#   CRON_SECRET  — must exactly match the CRON_SECRET env var set on Render.
+# Optional repository variable:
+#   APP_URL      — override the target base URL (defaults to the Render app).
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger daily reminder
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ vars.APP_URL || 'https://couple-daily.onrender.com' }}
+        run: |
+          # Render free instances sleep after inactivity; the first request wakes
+          # them, which can take 30-60s. Use a generous timeout and retry once so
+          # a cold start doesn't cause a missed reminder.
+          set -e
+          curl --fail --show-error --silent \
+               --max-time 120 --retry 2 --retry-delay 30 --retry-all-errors \
+               -X POST \
+               -H "X-Cron-Secret: ${CRON_SECRET}" \
+               "${APP_URL}/internal/cron/daily-reminder"
