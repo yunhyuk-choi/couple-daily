@@ -4,7 +4,7 @@
  * network-first for pages with an offline fallback. Bump CACHE_VERSION to
  * invalidate old caches on deploy.
  */
-const CACHE_VERSION = "couple-daily-v2";
+const CACHE_VERSION = "couple-daily-v3";
 const APP_SHELL = [
   "/offline",
   "/static/style.css",
@@ -79,4 +79,49 @@ self.addEventListener("fetch", (event) => {
     );
     return;
   }
+});
+
+/* ---- Web Push -------------------------------------------------------------
+ * A push arrives as an encrypted JSON payload {title, body, url}. Show it as a
+ * system notification; tapping it focuses an already-open tab on that url or
+ * opens a new window. The in-app Notification row is written server-side at the
+ * same fan-out point — this is purely the OS-level delivery layer.
+ */
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch (e) {
+    payload = { body: event.data ? event.data.text() : "" };
+  }
+  const title = payload.title || "우리의 하루";
+  const url = payload.url || "/";
+  const options = {
+    body: payload.body || "",
+    icon: "/static/icons/icon-192.png",
+    badge: "/static/icons/icon-192.png",
+    data: { url },
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || "/";
+  const target = new URL(url, self.location.origin);
+  event.waitUntil(
+    clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clientList) => {
+        for (const client of clientList) {
+          const cu = new URL(client.url);
+          // Focus an existing tab already on this path (ignore hash noise).
+          if (cu.pathname === target.pathname && "focus" in client) {
+            client.navigate ? client.navigate(target.href) : null;
+            return client.focus();
+          }
+        }
+        if (clients.openWindow) return clients.openWindow(target.href);
+      })
+  );
 });

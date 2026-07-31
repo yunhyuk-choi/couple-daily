@@ -9,6 +9,8 @@ Run locally:   python app.py            (SQLite fallback, debug reloader)
 Run in prod:   gunicorn 'app:create_app()'   (Postgres via DATABASE_URL)
 """
 import functools
+import hmac
+import json
 import logging
 import os
 import secrets
@@ -18,6 +20,11 @@ from datetime import date, datetime, timedelta
 from urllib.parse import urlencode
 
 import requests
+
+try:  # web push is optional — the app runs fine without VAPID keys configured
+    import pywebpush
+except ImportError:  # pragma: no cover
+    pywebpush = None
 from flask import (
     Flask,
     abort,
@@ -41,6 +48,7 @@ from models import (
     Couple,
     DailyQuestion,
     Notification,
+    PushSubscription,
     Setting,
     User,
     db,
@@ -63,6 +71,69 @@ KAKAO_USERINFO_URL = "https://kapi.kakao.com/v2/user/me"
 def kakao_enabled() -> bool:
     """Kakao login is only offered when a REST API key is configured."""
     return bool(KAKAO_REST_API_KEY)
+
+
+# ---- Web Push (VAPID) config (read from env; NEVER hardcode/commit keys) ----
+# One VAPID keypair per deployment. The public key is the browser's
+# applicationServerKey; the private key signs pushes. Set once on Render and
+# keep stable — rotating them invalidates every existing subscription.
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT")  # e.g. mailto:you@example.com
+
+# Shared secret guarding the daily-reminder cron endpoint.
+CRON_SECRET = os.environ.get("CRON_SECRET")
+
+
+def push_enabled() -> bool:
+    """Web push is only wired up when a full VAPID keypair + subject exist and
+    the pywebpush library is importable."""
+    return bool(
+        pywebpush and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT
+    )
+
+
+def send_push(user, title, body, url):
+    """Best-effort Web Push fan-out to every device ``user`` has subscribed.
+
+    Layered on top of the in-app Notification (already persisted by the caller).
+    Never raises to the caller — a push-service hiccup must not break the main
+    action or the in-app row. Dead subscriptions (404/410) are pruned; other
+    errors are logged. No-op when push is disabled or there's no recipient.
+    """
+    if user is None or not push_enabled():
+        return
+    subs = PushSubscription.query.filter_by(user_id=user.id).all()
+    if not subs:
+        return
+    payload = json.dumps({"title": title, "body": body, "url": url})
+    for sub in subs:
+        try:
+            pywebpush.webpush(
+                subscription_info={
+                    "endpoint": sub.endpoint,
+                    "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
+                },
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_SUBJECT},
+            )
+        except pywebpush.WebPushException as e:  # noqa: BLE001
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (404, 410):
+                # Subscription is gone (unsubscribed / expired) — prune it.
+                try:
+                    db.session.delete(sub)
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception("failed pruning dead push subscription %s", sub.id)
+            else:
+                log.warning("web push failed (status=%s): %s", status, e)
+        except Exception:  # noqa: BLE001 — push must never break the caller
+            log.exception("unexpected web push error for user %s", user.id)
+
+
 _INVITE_ALPHABET = string.ascii_uppercase + string.digits  # unambiguous enough
 
 # ---- minimal in-memory login rate limiting (per IP) ----
@@ -143,6 +214,11 @@ def _safe_notify(recipient, type, message, link):
     except Exception:  # noqa: BLE001 — a notification must never break the action
         db.session.rollback()
         log.exception("notify failed (type=%s recipient=%s)", type, getattr(recipient, "id", None))
+        return
+    # In-app row is persisted; ALSO fan out a Web Push to the same recipient.
+    # send_push never raises and is a no-op when push is disabled, so this can
+    # neither undo the in-app row nor break the main action.
+    send_push(recipient, Setting.get("app_name", DEFAULT_APP_NAME), message, link)
 
 
 def _gen_invite_code():
@@ -288,6 +364,7 @@ def _register_routes(app: Flask):
             "app_name": Setting.get("app_name", DEFAULT_APP_NAME),
             "me": me,
             "kakao_enabled": kakao_enabled(),
+            "push_enabled": push_enabled(),
             "notif_unread": notif_unread,
         }
 
@@ -884,6 +961,109 @@ def _register_routes(app: Flask):
                     n.is_read = True
             db.session.commit()
         return render_template("notifications.html", items=items, fresh_ids=fresh_ids)
+
+    # ---- Web Push subscription management ----
+    @app.route("/push/public-key")
+    def push_public_key():
+        """The VAPID public key the browser needs as applicationServerKey.
+        Empty string when push is not configured (front-end hides the toggle)."""
+        return app.response_class(
+            VAPID_PUBLIC_KEY or "", mimetype="text/plain"
+        )
+
+    @app.route("/push/subscribe", methods=["POST"])
+    @login_required
+    def push_subscribe():
+        u = current_user()
+        data = request.get_json(silent=True) or {}
+        endpoint = data.get("endpoint")
+        keys = data.get("keys") or {}
+        p256dh = keys.get("p256dh")
+        auth = keys.get("auth")
+        if not endpoint or not p256dh or not auth:
+            return jsonify({"error": "invalid subscription"}), 400
+        # Upsert by endpoint: the same browser re-subscribing (or a device that
+        # switched accounts) reuses the row instead of duplicating.
+        sub = PushSubscription.query.filter_by(endpoint=endpoint).first()
+        if sub:
+            sub.user_id = u.id
+            sub.p256dh = p256dh
+            sub.auth = auth
+        else:
+            db.session.add(
+                PushSubscription(
+                    user_id=u.id, endpoint=endpoint, p256dh=p256dh, auth=auth
+                )
+            )
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    @app.route("/push/unsubscribe", methods=["POST"])
+    @login_required
+    def push_unsubscribe():
+        u = current_user()
+        data = request.get_json(silent=True) or {}
+        endpoint = data.get("endpoint")
+        if endpoint:
+            PushSubscription.query.filter_by(
+                endpoint=endpoint, user_id=u.id
+            ).delete()
+        else:
+            # No endpoint given → drop all of this user's subscriptions.
+            PushSubscription.query.filter_by(user_id=u.id).delete()
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    # ---- daily reminder cron (called by GitHub Actions on a schedule) ----
+    @app.route("/internal/cron/daily-reminder", methods=["POST"])
+    def cron_daily_reminder():
+        """Nudge every member who still hasn't answered today's question.
+
+        Protected by CRON_SECRET (header ``X-Cron-Secret`` or ``?token=``),
+        compared with a constant-time check. Creates an in-app Notification and
+        a Web Push for each un-answered member. Safe when a couple has no
+        question today (only couples WITH today's question are considered)."""
+        provided = request.headers.get("X-Cron-Secret") or request.args.get("token") or ""
+        if not CRON_SECRET or not hmac.compare_digest(provided, CRON_SECRET):
+            abort(403)
+
+        today = date.today()
+        questions = DailyQuestion.query.filter_by(q_date=today).all()
+        couples_with_question = 0
+        reminders_sent = 0
+        for q in questions:
+            couples_with_question += 1
+            couple = q.couple
+            if couple is None:
+                continue
+            for member in couple.approved_members:
+                if q.answer_by(member.id) is not None:
+                    continue  # already answered — no nudge
+                try:
+                    notify(
+                        member,
+                        "reminder",
+                        "오늘의 질문에 아직 답 안 했어! 답해줘 💌",
+                        url_for("index"),
+                    )
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception("reminder notify failed for user %s", member.id)
+                    continue
+                send_push(
+                    member,
+                    "오늘의 질문 💌",
+                    "오늘의 질문에 아직 답 안 했어! 답해줘",
+                    "/",
+                )
+                reminders_sent += 1
+        return jsonify(
+            {
+                "couples_with_question": couples_with_question,
+                "reminders_sent": reminders_sent,
+            }
+        )
 
     # ---- PWA plumbing ----
     @app.route("/manifest.json")
