@@ -836,19 +836,17 @@ body.lb-open { overflow: hidden; }
 .empathy-num { font-size: 1.5rem; font-weight: 900; color: var(--pink); }
 .empathy-body { min-width: 0; }
 
-/* 화해 미션 체크리스트 */
-.mission-list { list-style: none; counter-reset: mis; padding: 0; margin: 4px 0 0; }
-.mission-item { margin: 8px 0; }
-.mission-item label {
-  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
+/* 화해 미션 카드 — 체크박스가 미션 텍스트 왼쪽에 인라인 배치 */
+.mission-list { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 0; padding: 0; }
+.mission-card {
+  display: flex; align-items: flex-start; gap: 12px; padding: 14px;
+  border-radius: 16px; background: var(--pink-soft, #ffeef4);
+  border: 1px solid var(--line); cursor: pointer;
 }
-.mission-check { margin-top: 3px; width: 18px; height: 18px; accent-color: var(--pink); flex: none; }
+.mission-check { flex: none; width: 20px; height: 20px; margin-top: 1px; accent-color: var(--pink); }
+.mission-no { flex: none; font-weight: 800; color: var(--pink); }
 .mission-text { line-height: 1.5; }
-.mission-text::before {
-  counter-increment: mis; content: counter(mis) ". ";
-  font-weight: 800; color: var(--pink);
-}
-.mission-item.done .mission-text { text-decoration: line-through; color: var(--muted); }
+.mission-card.done .mission-text { text-decoration: line-through; color: var(--muted); }
 
 /* 종결 상태 */
 .resolved-state { font-size: 1.05rem; font-weight: 800; color: var(--pink); margin: 0; }
