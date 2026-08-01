@@ -13,7 +13,9 @@
             data-status="{{ p.caption_status }}"
             aria-label="{{ p.caption or p.original_name or '추억 사진' }} 크게 보기">
       <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
-           loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
+           loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}"
+           onload="this.classList.add('loaded'); this.closest('.photo-open').classList.add('is-loaded')"
+           onerror="this.closest('.photo-open').classList.add('is-error')" />
       {% if p.caption_status == 'pending' %}
         <span class="thumb-badge" title="분석 중" aria-hidden="true">📝</span>
       {% endif %}
@@ -40,3 +42,29 @@
     </div>
   </div>
 </div>
+
+{# 브라우저 캐시로 이미 로드된 이미지 처리 — onload가 핸들러 부착 전에 발화했을 수 있어
+   DOMContentLoaded 시점에 complete 상태를 훑어 로드/실패 클래스를 보정한다(무의존·이미지 없으면 no-op). #}
+<script>
+(function () {
+  function sweep() {
+    var imgs = document.querySelectorAll('.photo-img');
+    if (!imgs.length) return;
+    imgs.forEach(function (img) {
+      if (!img.complete) return;
+      var cell = img.closest('.photo-open');
+      if (img.naturalWidth > 0) {
+        img.classList.add('loaded');
+        if (cell) cell.classList.add('is-loaded');
+      } else if (cell) {
+        cell.classList.add('is-error');
+      }
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', sweep);
+  } else {
+    sweep();
+  }
+})();
+</script>
