@@ -381,9 +381,11 @@ a.history-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(
   background: var(--cream); border: 1px solid var(--line);
   border-radius: 999px; padding: 3px 10px;
   font-size: 0.75rem; font-weight: 600; color: var(--muted);
+  white-space: nowrap; flex: 0 0 auto;
 }
+.meta-pill.summary { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .meta-pill.revealed { background: var(--ok); color: var(--ok-ink); border-color: transparent; }
-.meta-arrow { margin-left: auto; font-size: 1.25rem; line-height: 1; color: var(--muted); }
+.meta-arrow { margin-left: auto; flex: 0 0 auto; font-size: 1.25rem; line-height: 1; color: var(--muted); }
 
 /* insight */
 .month-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
