@@ -21,15 +21,20 @@
         {{ item.title if item.title else (item.situation[:40] ~ ('…' if item.situation|length > 40 else '')) }}
       </h2>
       <div class="history-meta">
-        {% if item.status == 'decided' %}
-          <span class="meta-pill revealed">판결 완료</span>
+        {% if item.status in ['decided', 'resolved'] %}
+          {% if item.status == 'resolved' %}
+            <span class="meta-pill resolved">💗 화해 완료</span>
+          {% else %}
+            <span class="meta-pill revealed">판결 완료</span>
+          {% endif %}
           {% if item.fault %}
             <span class="meta-pill fault">
               {%- for f in item.fault -%}
                 {{ (' · ' if not loop.first else '') }}{{ '나' if me and f.name == me.display_name else f.name }} {{ f.percent }}%
               {%- endfor -%}
             </span>
-          {% elif item.summary %}
+          {% endif %}
+          {% if item.summary %}
             <span class="meta-pill">{{ item.summary[:24] }}{{ '…' if item.summary|length > 24 else '' }}</span>
           {% endif %}
         {% elif item.status == 'judging' %}

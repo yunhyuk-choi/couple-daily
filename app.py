@@ -1777,6 +1777,7 @@ def _register_routes(app: Flask):
             sides=sides,
             my_statement=my_st,
             has_statement=len(case.statements) >= 1,
+            resolved=(case.status == "resolved"),
         )
 
     @app.route("/cases/<int:case_id>/statement", methods=["POST"])
@@ -1788,6 +1789,9 @@ def _register_routes(app: Flask):
         manually with the '다시 판결 맡기기' button."""
         u = current_user()
         case = _get_case_or_404(u, case_id)
+        if case.status == "resolved":
+            flash("이미 종결된 사건이라 진술을 바꿀 수 없어.", "error")
+            return redirect(url_for("case_detail", case_id=case.id))
         text = (request.form.get("text") or "").strip()
         if not text:
             flash("진술 내용을 입력해줘.", "error")
@@ -1824,6 +1828,9 @@ def _register_routes(app: Flask):
         thread. The slow claude pass runs ONLY in ``judge_case`` — never here."""
         u = current_user()
         case = _get_case_or_404(u, case_id)
+        if case.status == "resolved":
+            flash("이미 화해로 종결된 사건이야. 다시 열면 판결을 새로 맡길 수 있어.", "ok")
+            return redirect(url_for("case_detail", case_id=case.id))
         if len(case.statements) < 1:
             flash("먼저 진술을 남겨줘.", "error")
             return redirect(url_for("case_detail", case_id=case.id))
@@ -1864,6 +1871,36 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("사건을 삭제했어.", "ok")
         return redirect(url_for("cases"))
+
+    @app.route("/cases/<int:case_id>/resolve", methods=["POST"])
+    @active_couple_required
+    def case_resolve(case_id):
+        """화해 완료 — 판결이 난('decided') 사건을 'resolved'로 종결한다.
+
+        새 DB 컬럼/마이그레이션 없이 기존 ``status`` 문자열만 바꾼다. 종결되면
+        진술 수정·재판결이 잠긴다(case_statement/case_judge 가드)."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        if case.status != "decided":
+            flash("판결이 난 사건만 화해 완료로 종결할 수 있어.", "error")
+            return redirect(url_for("case_detail", case_id=case.id))
+        case.status = "resolved"
+        case.updated_at = datetime.utcnow()
+        db.session.commit()
+        flash("화해 완료! 🎉 이 사건은 종결됐어.", "ok")
+        return redirect(url_for("case_detail", case_id=case.id))
+
+    @app.route("/cases/<int:case_id>/reopen", methods=["POST"])
+    @active_couple_required
+    def case_reopen(case_id):
+        """실수로 종결한 경우를 위한 안전장치 — 'resolved'를 'decided'로 되돌린다."""
+        u = current_user()
+        case = _get_case_or_404(u, case_id)
+        if case.status == "resolved":
+            case.status = "decided"
+            case.updated_at = datetime.utcnow()
+            db.session.commit()
+        return redirect(url_for("case_detail", case_id=case.id))
 
     # ---- monthly insight ----
     @app.route("/insight")

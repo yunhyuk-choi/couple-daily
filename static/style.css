@@ -753,3 +753,102 @@ body.lb-open { overflow: hidden; }
   background: linear-gradient(90deg, #ff8fb1, var(--pink));
   min-width: 2px;
 }
+
+/* ---- 판사 v2: 탭 · 우세도 · 공감링 · 미션 · 종결 ---- */
+
+/* 인페이지 탭 (서버 왕복 없음) */
+.case-tabs {
+  display: flex; gap: 6px; margin: 4px 0 14px;
+  background: var(--pink-soft); padding: 4px; border-radius: 999px;
+}
+.case-tab {
+  flex: 1; border: 0; cursor: pointer;
+  padding: 9px 8px; border-radius: 999px;
+  font: inherit; font-weight: 700; font-size: 0.9rem;
+  color: var(--pink); background: transparent;
+}
+.case-tab.active {
+  background: var(--card); color: var(--ink);
+  box-shadow: 0 2px 8px rgba(255,107,157,0.18);
+}
+
+/* 화해 완료 배지 (제목 옆 / 목록) */
+.resolved-badge {
+  display: inline-block; margin-left: 8px;
+  font-size: 0.78rem; font-weight: 800;
+  color: var(--pink); background: var(--pink-soft);
+  padding: 3px 10px; border-radius: 999px; vertical-align: middle;
+}
+.meta-pill.resolved { background: var(--pink-soft); color: var(--pink); border-color: transparent; }
+
+/* 사건 내용 접이식 */
+.case-situation > summary {
+  cursor: pointer; font-weight: 700; font-size: 0.9rem; color: var(--pink);
+  list-style: none;
+}
+.case-situation > summary::-webkit-details-marker { display: none; }
+.case-situation > summary::before { content: '▸ '; }
+.case-situation[open] > summary::before { content: '▾ '; }
+
+/* 잠금 안내 */
+.locked-note { font-size: 0.9rem; color: var(--muted); font-weight: 600; }
+
+/* 승자 한 줄 (부드럽게) */
+.winner-line {
+  margin: 0 0 8px; font-weight: 800; color: var(--pink);
+  font-size: 0.98rem;
+}
+
+/* 우세도: 한 막대 두 색 구간 */
+.dominance { margin: 4px 0 16px; }
+.dominance-heads {
+  display: flex; justify-content: space-between;
+  font-size: 0.88rem; font-weight: 700; margin-bottom: 5px;
+}
+.dominance-heads .dom-a { color: #d65b86; }
+.dominance-heads .dom-b { color: #8f7bd6; }
+.dominance-bar {
+  display: flex; height: 16px; border-radius: 999px; overflow: hidden;
+  background: var(--pink-soft);
+}
+.dom-seg { height: 100%; min-width: 2px; }
+.dom-seg-a { background: linear-gradient(90deg, #ff9ebb, #ff6b9d); }
+.dom-seg-b { background: linear-gradient(90deg, #b8a6f0, #8f7bd6); }
+.dom-caption { margin: 6px 0 0; }
+
+/* 주문 강조 박스 (두 사람에게 건네는 말) */
+.verdict-section.verdict-order {
+  background: var(--cream); border: 1px solid var(--pink-soft);
+  border-radius: 14px; padding: 12px 14px; margin-top: 16px;
+}
+.verdict-section.verdict-order h3 { color: var(--pink); }
+
+/* 공감 점수 링 (CSS만, 라이브러리 없음) */
+.empathy-card { display: flex; align-items: center; gap: 16px; }
+.empathy-ring {
+  --score: 60;
+  flex: none; width: 84px; height: 84px; border-radius: 50%;
+  display: grid; place-items: center;
+  background:
+    radial-gradient(closest-side, var(--card) 70%, transparent 71% 100%),
+    conic-gradient(var(--pink) calc(var(--score) * 1%), var(--pink-soft) 0);
+}
+.empathy-num { font-size: 1.5rem; font-weight: 900; color: var(--pink); }
+.empathy-body { min-width: 0; }
+
+/* 화해 미션 체크리스트 */
+.mission-list { list-style: none; counter-reset: mis; padding: 0; margin: 4px 0 0; }
+.mission-item { margin: 8px 0; }
+.mission-item label {
+  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
+}
+.mission-check { margin-top: 3px; width: 18px; height: 18px; accent-color: var(--pink); flex: none; }
+.mission-text { line-height: 1.5; }
+.mission-text::before {
+  counter-increment: mis; content: counter(mis) ". ";
+  font-weight: 800; color: var(--pink);
+}
+.mission-item.done .mission-text { text-decoration: line-through; color: var(--muted); }
+
+/* 종결 상태 */
+.resolved-state { font-size: 1.05rem; font-weight: 800; color: var(--pink); margin: 0; }

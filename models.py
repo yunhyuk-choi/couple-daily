@@ -451,6 +451,8 @@ class Case(db.Model):
       * 'open'    — created; awaiting judgment (allows judging once ≥1 진술).
       * 'judging' — a background thread is running the AI judge.
       * 'decided' — a verdict is ready (``verdict_json`` populated).
+      * 'resolved'— 두 사람이 화해로 종결(진술 수정·재판결 잠김). 새 컬럼 없이
+        기존 ``status`` 문자열 값만 추가한 것 (마이그레이션 불필요).
       * 'failed'  — the AI failed AND there is no prior good verdict to keep.
     """
     __tablename__ = "cases"

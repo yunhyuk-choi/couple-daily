@@ -6,122 +6,275 @@
   {% if case.status == 'judging' %}<meta http-equiv="refresh" content="4" />{% endif %}
 {% endblock %}
 {% block content %}
+{# 판결이 준비됐는지 / 기본 탭 결정 #}
+{% set has_verdict = verdict and case.status in ['decided', 'resolved'] %}
+{% set default_tab = 'verdict' if has_verdict else 'statements' %}
+
 <div class="page-head">
   <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
   <h1>{{ case.title if case.title else '사건' }}</h1>
+  {% if resolved %}<span class="resolved-badge">💗 화해 완료</span>{% endif %}
 </div>
 
-{# ---- 상황 설명 ---- #}
-<div class="card">
-  <div class="date muted">{{ case.created_at.strftime('%Y.%m.%d') }} · {{ case.creator.display_name }}님이 열었어</div>
-  <h2 class="small" style="margin:8px 0 6px">상황</h2>
-  <p style="margin:0; white-space:pre-wrap; word-break:break-word">{{ case.situation }}</p>
+{# ---- 탭 헤더 ---- #}
+<div class="case-tabs" role="tablist" aria-label="사건 보기">
+  <button class="case-tab" role="tab" id="tab-statements" aria-controls="panel-statements"
+          data-tab="statements" aria-selected="false" type="button">진술</button>
+  <button class="case-tab" role="tab" id="tab-verdict" aria-controls="panel-verdict"
+          data-tab="verdict" aria-selected="false" type="button">판결</button>
+  <button class="case-tab" role="tab" id="tab-missions" aria-controls="panel-missions"
+          data-tab="missions" aria-selected="false" type="button">화해미션</button>
 </div>
 
-{# ---- 각자 진술 ---- #}
-<div class="card">
-  <h2 class="small" style="margin-top:0">각자 진술</h2>
-  <div class="statements">
-    {% for side in sides %}
-      <div class="statement-row">
-        {% if side.user.profile_image_url %}
-          <img class="c-avatar" src="{{ side.user.profile_image_url }}" alt=""
-               referrerpolicy="no-referrer" loading="lazy" />
-        {% else %}
-          {% set palette = ['#ff8fb1', '#ffb37a', '#8fd6b4', '#8fb6ff', '#c79bff', '#ff9e9e'] %}
-          <span class="c-avatar c-avatar-fallback"
-                style="background: {{ palette[side.user.id % palette|length] }}">{{ (side.user.display_name or '?')[:1] }}</span>
-        {% endif %}
-        <div class="c-main">
-          <div class="c-head">
-            <span class="c-author">{{ side.user.display_name }}{% if side.is_me %} · 나{% endif %}</span>
-          </div>
-          {% if side.statement %}
-            <div class="c-text">{{ side.statement.text }}</div>
+{# ==================== 진술 탭 ==================== #}
+<div class="tab-panel" role="tabpanel" id="panel-statements" aria-labelledby="tab-statements" data-tab="statements">
+  {# 사건 내용(상황) — 접이식 #}
+  <div class="card">
+    <div class="date muted">{{ case.created_at.strftime('%Y.%m.%d') }} · {{ case.creator.display_name }}님이 열었어</div>
+    <details class="case-situation" style="margin-top:8px">
+      <summary>사건 내용 · 눌러서 보기</summary>
+      <p style="margin:8px 0 0; white-space:pre-wrap; word-break:break-word">{{ case.situation }}</p>
+    </details>
+  </div>
+
+  {# 각자 진술 #}
+  <div class="card">
+    <h2 class="small" style="margin-top:0">각자 진술</h2>
+    <div class="statements">
+      {% for side in sides %}
+        <div class="statement-row">
+          {% if side.user.profile_image_url %}
+            <img class="c-avatar" src="{{ side.user.profile_image_url }}" alt=""
+                 referrerpolicy="no-referrer" loading="lazy" />
           {% else %}
-            <div class="c-text muted">아직 진술을 남기지 않았어.</div>
+            {% set palette = ['#ff8fb1', '#ffb37a', '#8fd6b4', '#8fb6ff', '#c79bff', '#ff9e9e'] %}
+            <span class="c-avatar c-avatar-fallback"
+                  style="background: {{ palette[side.user.id % palette|length] }}">{{ (side.user.display_name or '?')[:1] }}</span>
           {% endif %}
-        </div>
-      </div>
-    {% endfor %}
-  </div>
-
-  {# ---- 내 진술 작성/수정 ---- #}
-  <form class="stack" method="post" action="{{ url_for('case_statement', case_id=case.id) }}"
-        style="margin-top:14px">
-    <label for="my-statement">{{ '내 진술 수정' if my_statement else '내 진술 남기기' }}
-      <textarea id="my-statement" name="text" rows="3" required
-                placeholder="내 입장에서 하고 싶은 말을 적어줘.">{{ my_statement.text if my_statement else '' }}</textarea>
-    </label>
-    <button class="btn ghost" type="submit">{{ '진술 수정' if my_statement else '진술 등록' }}</button>
-  </form>
-</div>
-
-{# ---- 판결 영역 ---- #}
-{% if case.status == 'judging' %}
-  <div class="card center-card verdict-judging">
-    <img class="emoji hero" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
-    <p class="muted">판결 내리는 중이에요…<br /><span class="small">잠시만 기다려줘. 다 되면 자동으로 결과가 나와.</span></p>
-  </div>
-{% elif case.status == 'decided' and verdict %}
-  <div class="card verdict-card">
-    <h2 class="small" style="margin-top:0">
-      <img class="emoji sm" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
-      판결
-    </h2>
-    {% if verdict.summary %}<p class="verdict-summary">{{ verdict.summary }}</p>{% endif %}
-
-    <div class="fault-bars">
-      {% for f in verdict.fault %}
-        <div class="fault-item">
-          <div class="fault-label">
-            <span>{{ '나' if me and f.name == me.display_name else f.name }}</span>
-            <strong>{{ f.percent }}%</strong>
-          </div>
-          <div class="fault-track">
-            <div class="fault-fill" style="width: {{ f.percent }}%"></div>
+          <div class="c-main">
+            <div class="c-head">
+              <span class="c-author">{{ side.user.display_name }}{% if side.is_me %} · 나{% endif %}</span>
+            </div>
+            {% if side.statement %}
+              <div class="c-text">{{ side.statement.text }}</div>
+            {% else %}
+              <div class="c-text muted">아직 진술을 남기지 않았어.</div>
+            {% endif %}
           </div>
         </div>
       {% endfor %}
     </div>
 
-    {% if verdict.reason %}
-      <div class="verdict-section">
-        <h3>판결 이유</h3>
-        <p>{{ verdict.reason }}</p>
-      </div>
-    {% endif %}
-    {% if verdict.resolution %}
-      <div class="verdict-section">
-        <h3>화해 방법</h3>
-        <p>{{ verdict.resolution }}</p>
-      </div>
-    {% endif %}
-    {% if verdict.note %}
-      <p class="verdict-note muted small">※ {{ verdict.note }}</p>
+    {# 내 진술 작성/수정 — 종결되면 잠금 #}
+    {% if resolved %}
+      <p class="locked-note" style="margin:14px 0 0">🔒 종결된 사건이라 진술을 바꿀 수 없어.</p>
+    {% else %}
+      <form class="stack" method="post" action="{{ url_for('case_statement', case_id=case.id) }}"
+            style="margin-top:14px">
+        <label for="my-statement">{{ '내 진술 수정' if my_statement else '내 진술 남기기' }}
+          <textarea id="my-statement" name="text" rows="3" required
+                    placeholder="내 입장에서 하고 싶은 말을 적어줘.">{{ my_statement.text if my_statement else '' }}</textarea>
+        </label>
+        <button class="btn ghost" type="submit">{{ '진술 수정' if my_statement else '진술 등록' }}</button>
+      </form>
     {% endif %}
   </div>
-{% elif case.status == 'failed' %}
-  <div class="card center-card">
-    <p class="muted">판결에 실패했어. 다시 시도해줘.</p>
-  </div>
-{% endif %}
 
-{# ---- 판결 맡기기 / 다시 맡기기 ---- #}
-<div class="card">
-  <form method="post" action="{{ url_for('case_judge', case_id=case.id) }}">
-    <button class="btn primary" type="submit" style="width:100%"
-            {% if not has_statement or case.status == 'judging' %}disabled{% endif %}>
-      {% if case.status == 'judging' %}판결 중…{% elif verdict %}다시 판결 맡기기{% else %}판결 맡기기{% endif %}
-    </button>
-  </form>
-  {% if not has_statement %}
-    <p class="muted small center" style="margin:10px 0 0">진술이 하나라도 있어야 판결을 맡길 수 있어.</p>
+  {# 판결 맡기기 / 다시 맡기기 — 종결 시 숨김 #}
+  {% if not resolved %}
+    <div class="card">
+      <form method="post" action="{{ url_for('case_judge', case_id=case.id) }}">
+        <button class="btn primary" type="submit" style="width:100%"
+                {% if not has_statement or case.status == 'judging' %}disabled{% endif %}>
+          {% if case.status == 'judging' %}판결 중…{% elif verdict %}다시 판결 맡기기{% else %}판결 맡기기{% endif %}
+        </button>
+      </form>
+      {% if not has_statement %}
+        <p class="muted small center" style="margin:10px 0 0">진술이 하나라도 있어야 판결을 맡길 수 있어.</p>
+      {% endif %}
+    </div>
   {% endif %}
 
-  <form method="post" action="{{ url_for('case_delete', case_id=case.id) }}"
-        onsubmit="return confirm('이 사건을 삭제할까? 되돌릴 수 없어.');" style="margin-top:12px">
-    <button class="btn ghost" type="submit" style="width:100%">사건 삭제</button>
-  </form>
+  {# 사건 삭제 #}
+  <div class="card">
+    <form method="post" action="{{ url_for('case_delete', case_id=case.id) }}"
+          onsubmit="return confirm('이 사건을 삭제할까? 되돌릴 수 없어.');">
+      <button class="btn ghost" type="submit" style="width:100%">사건 삭제</button>
+    </form>
+  </div>
 </div>
+
+{# ==================== 판결 탭 ==================== #}
+<div class="tab-panel" role="tabpanel" id="panel-verdict" aria-labelledby="tab-verdict" data-tab="verdict" hidden>
+  {% if case.status == 'judging' %}
+    <div class="card center-card verdict-judging">
+      <img class="emoji hero" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
+      <p class="muted">판결 내리는 중이에요…<br /><span class="small">잠시만 기다려줘. 다 되면 자동으로 결과가 나와.</span></p>
+    </div>
+  {% elif has_verdict %}
+    <div class="card verdict-card">
+      {# 부드러운 승자 한 줄 (승/패가 아니라 살짝 손들어주는 톤) #}
+      {% if verdict.winner and verdict.fault and verdict.fault|length == 2 %}
+        <p class="winner-line">
+          {% if verdict.winner == 'tie' %}
+            🤝 무승부 — 둘 다 조금씩!
+          {% elif verdict.winner == 'a' %}
+            🌸 이번엔 {{ '나' if me and verdict.fault[0].name == me.display_name else verdict.fault[0].name }} 쪽 손을 살짝 더 들어줬어
+          {% else %}
+            🌸 이번엔 {{ '나' if me and verdict.fault[1].name == me.display_name else verdict.fault[1].name }} 쪽 손을 살짝 더 들어줬어
+          {% endif %}
+        </p>
+      {% endif %}
+
+      {% if verdict.summary %}<p class="verdict-summary">{{ verdict.summary }}</p>{% endif %}
+
+      {# 우세도: 한 막대를 두 색 구간으로 나눔 (왼쪽 name_a, 오른쪽 name_b) #}
+      {% if verdict.fault and verdict.fault|length == 2 %}
+        {% set fa = verdict.fault[0] %}
+        {% set fb = verdict.fault[1] %}
+        <div class="dominance">
+          <div class="dominance-heads">
+            <span class="dom-a">{{ '나' if me and fa.name == me.display_name else fa.name }} {{ fa.percent }}%</span>
+            <span class="dom-b">{{ '나' if me and fb.name == me.display_name else fb.name }} {{ fb.percent }}%</span>
+          </div>
+          <div class="dominance-bar">
+            <div class="dom-seg dom-seg-a" style="width: {{ fa.percent }}%"></div>
+            <div class="dom-seg dom-seg-b" style="width: {{ fb.percent }}%"></div>
+          </div>
+          <p class="dom-caption muted small">판결 우세도 (잘못 비율이 낮을수록 이번엔 조금 더 이해받은 쪽)</p>
+        </div>
+      {% endif %}
+
+      {% if verdict.issue %}
+        <div class="verdict-section"><h3>쟁점</h3><p>{{ verdict.issue }}</p></div>
+      {% endif %}
+      {% if verdict.facts %}
+        <div class="verdict-section"><h3>인정되는 사실</h3><p>{{ verdict.facts }}</p></div>
+      {% endif %}
+      {% if verdict.consideration %}
+        <div class="verdict-section"><h3>참작 사유</h3><p>{{ verdict.consideration }}</p></div>
+      {% endif %}
+      {# 판단: 신 스키마 judgment, 없으면 구 스키마 reason 으로 폴백 #}
+      {% set judgment_text = verdict.judgment or verdict.reason %}
+      {% if judgment_text %}
+        <div class="verdict-section"><h3>판단</h3><p>{{ judgment_text }}</p></div>
+      {% endif %}
+      {% if verdict.order %}
+        <div class="verdict-section verdict-order">
+          <h3>주문</h3><p>{{ verdict.order }}</p>
+        </div>
+      {% endif %}
+      {% if verdict.note %}
+        <p class="verdict-note muted small">※ {{ verdict.note }}</p>
+      {% endif %}
+    </div>
+  {% elif case.status == 'failed' %}
+    <div class="card center-card">
+      <p class="muted">판결이 잘 안 됐어. 진술 탭에서 다시 한 번 맡겨줄래? 🙏</p>
+    </div>
+  {% else %}
+    <div class="card center-card">
+      <p class="muted">아직 판결 전이야. 진술 탭에서 진술을 남기고 판결을 맡겨봐.</p>
+    </div>
+  {% endif %}
+</div>
+
+{# ==================== 화해미션 탭 ==================== #}
+<div class="tab-panel" role="tabpanel" id="panel-missions" aria-labelledby="tab-missions" data-tab="missions" hidden>
+  {% if has_verdict %}
+    {# 공감 점수 링 #}
+    {% if verdict.get('empathy_score') is not none %}
+      <div class="card empathy-card">
+        <div class="empathy-ring" style="--score: {{ verdict.empathy_score }}">
+          <span class="empathy-num">{{ verdict.empathy_score }}</span>
+        </div>
+        <div class="empathy-body">
+          <h3 class="small" style="margin:0 0 4px">공감 점수</h3>
+          <p class="muted small" style="margin:0">{{ verdict.empathy_note or '두 사람의 마음이 얼마나 잘 통했는지 살펴봤어. 낮아도 괜찮아, 지금부터 채워가면 되니까 💗' }}</p>
+        </div>
+      </div>
+    {% endif %}
+
+    {# 화해 미션 체크리스트 (체크 상태는 localStorage — 서버 저장 없음) #}
+    {% set missions = verdict.missions %}
+    {% if not missions and verdict.resolution %}{% set missions = [verdict.resolution] %}{% endif %}
+    {% if missions %}
+      <div class="card">
+        <h2 class="small" style="margin-top:0">화해 미션</h2>
+        <ol class="mission-list" id="mission-list" data-case="{{ case.id }}">
+          {% for m in missions %}
+            <li class="mission-item">
+              <label>
+                <input type="checkbox" class="mission-check" data-idx="{{ loop.index0 }}" />
+                <span class="mission-text">{{ m }}</span>
+              </label>
+            </li>
+          {% endfor %}
+        </ol>
+      </div>
+    {% endif %}
+
+    {# 화해 완료 / 종결 상태 #}
+    <div class="card center-card">
+      {% if resolved %}
+        <p class="resolved-state">💗 화해 완료됨</p>
+        <form method="post" action="{{ url_for('case_reopen', case_id=case.id) }}" style="margin-top:10px">
+          <button class="btn ghost sm" type="submit">다시 열기</button>
+        </form>
+      {% elif case.status == 'decided' %}
+        <form method="post" action="{{ url_for('case_resolve', case_id=case.id) }}">
+          <button class="btn primary" type="submit" style="width:100%">화해 완료 (사건 종결) 🎉</button>
+        </form>
+        <p class="muted small" style="margin:10px 0 0">두 사람이 화해했다면 눌러줘. 종결하면 진술·판결은 잠겨.</p>
+      {% endif %}
+    </div>
+  {% else %}
+    <div class="card center-card">
+      <p class="muted">판결이 나오면 여기서 공감 점수와 화해 미션을 볼 수 있어 💗</p>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  // ---- 탭 전환 (의존성 없는 순수 JS) ----
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.case-tab'));
+  var panels = Array.prototype.slice.call(document.querySelectorAll('.tab-panel'));
+  function select(name) {
+    tabs.forEach(function (t) {
+      var on = t.getAttribute('data-tab') === name;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.classList.toggle('active', on);
+    });
+    panels.forEach(function (p) {
+      var on = p.getAttribute('data-tab') === name;
+      if (on) { p.removeAttribute('hidden'); } else { p.setAttribute('hidden', ''); }
+    });
+  }
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { select(t.getAttribute('data-tab')); });
+  });
+  select('{{ default_tab }}');
+
+  // ---- 화해 미션 체크 상태(localStorage, 사건별) — 순전히 커플 자기만족용 ----
+  var list = document.getElementById('mission-list');
+  if (list) {
+    var key = 'cd-missions-' + list.getAttribute('data-case');
+    var saved = {};
+    try { saved = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (e) { saved = {}; }
+    var boxes = Array.prototype.slice.call(list.querySelectorAll('.mission-check'));
+    boxes.forEach(function (b) {
+      var idx = b.getAttribute('data-idx');
+      if (saved[idx]) { b.checked = true; b.closest('.mission-item').classList.add('done'); }
+      b.addEventListener('change', function () {
+        saved[idx] = b.checked;
+        b.closest('.mission-item').classList.toggle('done', b.checked);
+        try { localStorage.setItem(key, JSON.stringify(saved)); } catch (e) {}
+      });
+    });
+  }
+})();
+</script>
 {% endblock %}
