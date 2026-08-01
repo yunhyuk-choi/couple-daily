@@ -1236,52 +1236,6 @@ def _register_routes(app: Flask):
             _kick_monthly_report(u.couple_id, today.year, today.month)
         return redirect(url_for("index"))
 
-    # ---- 오늘 질문 다시 뽑기 (regenerate today's question) ----
-    @app.route("/question/regenerate", methods=["POST"])
-    @active_couple_required
-    def question_regenerate():
-        """Re-roll TODAY's question for the couple and reset today's answers.
-
-        Destructive: because the question changes, today's existing answers no
-        longer apply, so they're deleted — both partners answer fresh. Generating
-        a new question calls ``ai.generate_daily_question`` synchronously, which is
-        acceptable ONLY because it mirrors the established get_or_create request-
-        path pattern for question gen (the one allowed synchronous claude call)."""
-        u = current_user()
-        couple = u.couple
-        today = date.today()
-
-        # Steer away from repeating recent topics (most recent first, excluding today).
-        recent = (
-            DailyQuestion.query.filter(
-                DailyQuestion.couple_id == couple.id, DailyQuestion.q_date < today
-            )
-            .order_by(DailyQuestion.q_date.desc())
-            .limit(8)
-            .all()
-        )
-        recent_pairs = [
-            {"question": r.text, "answers": [a.text for a in r.answers.all()]}
-            for r in recent
-        ]
-        text, source = ai.generate_daily_question(recent_pairs)
-
-        # Find today's row (or create it if somehow missing), then replace it.
-        q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
-        if q is None:
-            q = DailyQuestion(couple_id=couple.id, q_date=today, text=text, source=source)
-            db.session.add(q)
-            db.session.commit()
-        else:
-            # 질문이 바뀌었으니 오늘 답변은 더 이상 유효하지 않다 — 지워서 둘 다 새로 답하게.
-            Answer.query.filter_by(question_id=q.id).delete()
-            q.text = text
-            q.source = source
-            db.session.commit()
-
-        flash("새 질문을 뽑았어! 💫", "ok")
-        return redirect(url_for("index"))
-
     # ---- comments on a day's revealed answers ----
     @app.route("/question/<int:qid>/comment", methods=["POST"])
     @active_couple_required
