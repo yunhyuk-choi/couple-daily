@@ -4,7 +4,7 @@
  * network-first for pages with an offline fallback. Bump CACHE_VERSION to
  * invalidate old caches on deploy.
  */
-const CACHE_VERSION = "couple-daily-v4";
+const CACHE_VERSION = "couple-daily-v5";
 const APP_SHELL = [
   "/offline",
   "/static/style.css",

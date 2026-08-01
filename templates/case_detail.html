@@ -8,7 +8,8 @@
 {% block content %}
 {# 판결이 준비됐는지 / 기본 탭 결정 #}
 {% set has_verdict = verdict and case.status in ['decided', 'resolved'] %}
-{% set default_tab = 'verdict' if has_verdict else 'statements' %}
+{# 항상 진술 탭을 기본으로 — 구 스키마 판결은 판결 패널이 비어 빈 화면이 보이지만, 진술 패널은 늘 내용이 있다. #}
+{% set default_tab = 'statements' %}
 
 <div class="page-head">
   <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
@@ -201,16 +202,15 @@
     {% if missions %}
       <div class="card">
         <h2 class="small" style="margin-top:0">화해 미션</h2>
-        <ol class="mission-list" id="mission-list" data-case="{{ case.id }}">
+        <div class="mission-list" id="mission-list" data-case="{{ case.id }}">
           {% for m in missions %}
-            <li class="mission-item">
-              <label>
-                <input type="checkbox" class="mission-check" data-idx="{{ loop.index0 }}" />
-                <span class="mission-text">{{ m }}</span>
-              </label>
-            </li>
+            <label class="mission-card">
+              <input type="checkbox" class="mission-check" data-idx="{{ loop.index0 }}" />
+              <span class="mission-no">{{ loop.index }}</span>
+              <span class="mission-text">{{ m }}</span>
+            </label>
           {% endfor %}
-        </ol>
+        </div>
       </div>
     {% endif %}
 
@@ -256,7 +256,8 @@
   tabs.forEach(function (t) {
     t.addEventListener('click', function () { select(t.getAttribute('data-tab')); });
   });
-  select('{{ default_tab }}');
+  {# 기본 탭은 항상 진술(statements). default_tab은 content 블록에 있어 여기(scripts 블록) 스코프 밖이므로 값을 직접 쓴다. #}
+  select('statements');
 
   // ---- 화해 미션 체크 상태(localStorage, 사건별) — 순전히 커플 자기만족용 ----
   var list = document.getElementById('mission-list');
@@ -267,10 +268,10 @@
     var boxes = Array.prototype.slice.call(list.querySelectorAll('.mission-check'));
     boxes.forEach(function (b) {
       var idx = b.getAttribute('data-idx');
-      if (saved[idx]) { b.checked = true; b.closest('.mission-item').classList.add('done'); }
+      if (saved[idx]) { b.checked = true; b.closest('.mission-card').classList.add('done'); }
       b.addEventListener('change', function () {
         saved[idx] = b.checked;
-        b.closest('.mission-item').classList.toggle('done', b.checked);
+        b.closest('.mission-card').classList.toggle('done', b.checked);
         try { localStorage.setItem(key, JSON.stringify(saved)); } catch (e) {}
       });
     });
