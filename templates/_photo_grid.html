@@ -10,6 +10,7 @@
             data-delete="{{ url_for('memories_delete', photo_id=p.id) }}"
             data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
             data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
+            data-status="{{ p.caption_status }}"
             aria-label="{{ p.caption or p.original_name or '추억 사진' }} 크게 보기">
       <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
            loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}" />
@@ -28,6 +29,7 @@
   </div>
   <div class="lb-meta">
     <p class="lb-caption" id="lb-caption" hidden></p>
+    <p class="lb-failed muted small" id="lb-failed" hidden>분석 실패</p>
     <div class="lb-tags themes" id="lb-tags" hidden></div>
     <div class="lb-actions">
       <a class="btn primary lb-download" id="lb-download" href="#" download>다운로드</a>
