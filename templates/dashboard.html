@@ -9,12 +9,6 @@
   </div>
   <h1 class="question-text">{{ question.text }}</h1>
 
-  {# 질문이 어색하면 새로 뽑기 — 오늘 답변이 지워지므로 반드시 확인창을 거친다. #}
-  <form method="post" action="{{ url_for('question_regenerate') }}" class="regenerate-form center"
-        onsubmit="return confirm('오늘 질문을 새로 뽑을까? 지금까지의 오늘 답변은 지워져.');">
-    <button class="btn ghost small" type="submit">질문이 좀 이상해? 다시 뽑기</button>
-  </form>
-
   {% if revealed %}
     <div class="reveal-banner">
       <img class="emoji" src="{{ url_for('static', filename='emoji/party_popper.svg') }}" alt="" />
