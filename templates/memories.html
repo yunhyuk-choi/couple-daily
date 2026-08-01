@@ -25,6 +25,13 @@
     {# 공용 썸네일 그리드 + 라이트박스(_photo_grid.html). 캡션·태그·삭제는
        라이트박스(썸네일 탭)에 있어 그리드는 정사각 셀만 깔끔하게 유지된다. #}
     {% include "_photo_grid.html" %}
+
+    {% if any_failed %}
+    {# 캡션 분석에 실패한 사진이 하나라도 있으면 재분석 버튼을 조용히 보여준다. #}
+    <form method="post" action="{{ url_for('memories_recaption') }}" class="recaption-form center">
+      <button class="btn ghost small" type="submit">🔄 분석 안 된 사진 다시 분석</button>
+    </form>
+    {% endif %}
   {% endif %}
 
   {# Floating action button — the only entry point to adding photos. Opens the
@@ -229,11 +236,21 @@
 {% include "_lightbox_js.html" %}
 
 {% if any_pending %}
-{# At least one photo is still being captioned in the background — gently
-   auto-reload so its caption appears without a manual refresh. Same idea as
-   the insight page; only rendered while something is pending. #}
+{# 배경 캡셔닝이 아직 진행 중 — 완료된 캡션이 수동 새로고침 없이 뜨도록 부드럽게
+   자동 새로고침한다. 단, (a) 업로드 드로워가 열려 있으면 새로고침하지 않고(드로워가
+   닫히는 것 방지) 나중에 다시 확인하고, (b) 최대 시도 횟수(20회 ≈ 5분) 뒤엔 멈춘다
+   (막히거나 실패한 사진이 페이지를 무한 새로고침하지 못하게). 의존성 없음. #}
 <script>
-  setTimeout(function () { window.location.reload(); }, 15000);
+(function () {
+  var tries = 0, MAX = 20;
+  function tick() {
+    if (tries++ >= MAX) return;                 // 무한 새로고침 방지
+    var modal = document.getElementById('upload-modal');
+    if (modal && !modal.hidden) { setTimeout(tick, 15000); return; } // 드로워 열려있으면 방해 X
+    window.location.reload();
+  }
+  setTimeout(tick, 15000);
+})();
 </script>
 {% endif %}
 {% endblock %}

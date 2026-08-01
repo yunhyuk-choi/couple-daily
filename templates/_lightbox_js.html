@@ -7,6 +7,7 @@
 
   var lbImg = document.getElementById("lb-img");
   var lbCap = document.getElementById("lb-caption");
+  var lbFailed = document.getElementById("lb-failed");
   var lbTags = document.getElementById("lb-tags");
   var lbDownload = document.getElementById("lb-download");
   var lbDeleteForm = document.getElementById("lb-delete-form");
@@ -54,6 +55,8 @@
     var cap = el.getAttribute("data-caption") || "";
     if (cap) { lbCap.textContent = cap; lbCap.hidden = false; }
     else { lbCap.hidden = true; }
+    // 캡션 분석에 실패한 사진은 조용히 "분석 실패" 안내를 보여준다.
+    if (lbFailed) lbFailed.hidden = (el.getAttribute("data-status") !== "failed");
     var tags = (el.getAttribute("data-tags") || "").split(",").filter(Boolean);
     lbTags.innerHTML = "";
     if (tags.length) {
