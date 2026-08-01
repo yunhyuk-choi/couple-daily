@@ -35,7 +35,7 @@
             </span>
           {% endif %}
           {% if item.summary %}
-            <span class="meta-pill">{{ item.summary[:24] }}{{ '…' if item.summary|length > 24 else '' }}</span>
+            <span class="meta-pill summary">{{ item.summary[:16] }}{{ '…' if item.summary|length > 16 else '' }}</span>
           {% endif %}
         {% elif item.status == 'judging' %}
           <span class="meta-pill judging">판결 중…</span>
