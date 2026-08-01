@@ -549,6 +549,12 @@ def _kick_monthly_report(couple_id, year, month):
 _captioning_lock = threading.Lock()
 _captioning: set[int] = set()
 
+# 캡션 동시성 상한 — 기본 1(직렬화). 단일 워커 512MB 무료 티어는 `claude`(Node)
+# 프로세스를 한 번에 하나밖에 못 버틴다: N개의 캡션 스레드가 동시에 claude를 띄우면
+# OOM 나서 캡션이 실패한다(질문 생성은 한 개라 프로덕션에서 정상 동작). 이 세마포어로
+# 여러 스레드가 줄 서서 사진 바이트 로드+vision 호출을 하나씩 순차 처리하게 한다.
+_CAPTION_SEM = threading.Semaphore(int(os.environ.get("CAPTION_MAX_CONCURRENCY", "1")))
+
 # Image extensions claude's Read tool recognizes; used to give the temp file the
 # right suffix so vision actually ingests it. Falls back to .jpg.
 _CAPTION_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
@@ -595,29 +601,38 @@ def caption_photo(app, photo_id):
                 item_id = photo.onedrive_item_id
                 name_for_ext = photo.filename or photo.original_name or ""
 
+                # 메모리 무거운 구간(사진 바이트 다운로드 + 임시파일 기록 + claude
+                # vision)을 세마포어로 직렬화한다: 단일 워커 512MB 티어는 한 번에 사진
+                # 하나의 바이트만 메모리에 올리고 claude(Node) 프로세스도 하나만 돌릴 수
+                # 있다(동시 실행 시 OOM → 캡션 실패). 다른 캡션 스레드는 여기서 줄 서서
+                # 하나씩 순차 처리된다.
+                _CAPTION_SEM.acquire()
                 try:
-                    data, _ctype = onedrive.get_photo_content(item_id)
-                except onedrive.OneDriveError:
-                    log.exception(
-                        "caption_photo: OneDrive fetch failed (photo=%s)", photo_id
+                    try:
+                        data, _ctype = onedrive.get_photo_content(item_id)
+                    except onedrive.OneDriveError:
+                        log.exception(
+                            "caption_photo: OneDrive fetch failed (photo=%s)", photo_id
+                        )
+                        data = None
+
+                    if not data:
+                        photo.caption_status = "failed"
+                        db.session.commit()
+                        return
+
+                    ext = os.path.splitext(name_for_ext)[1].lower()
+                    if ext not in _CAPTION_IMAGE_EXTS:
+                        ext = ".jpg"
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix="cd_caption_", suffix=ext, dir=_caption_tmp_dir()
                     )
-                    data = None
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
 
-                if not data:
-                    photo.caption_status = "failed"
-                    db.session.commit()
-                    return
-
-                ext = os.path.splitext(name_for_ext)[1].lower()
-                if ext not in _CAPTION_IMAGE_EXTS:
-                    ext = ".jpg"
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix="cd_caption_", suffix=ext, dir=_caption_tmp_dir()
-                )
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(data)
-
-                result = ai.caption_image(tmp_path)
+                    result = ai.caption_image(tmp_path)
+                finally:
+                    _CAPTION_SEM.release()
 
                 # Re-load in case the row changed; commit the outcome.
                 photo = db.session.get(Photo, photo_id)
@@ -654,6 +669,24 @@ def caption_photo(app, photo_id):
     finally:
         with _captioning_lock:
             _captioning.discard(photo_id)
+
+
+def _spawn_caption_if_idle(app, photo_id):
+    """Spawn a background caption thread for ONE photo unless it's already
+    queued/running (checked against the same ``_captioning`` guard that
+    ``caption_photo`` uses, so we never pile a second thread on the same photo).
+    Best-effort — never raises. Safe now that captioning is serialized via the
+    semaphore, so re-spawning many pending photos just queues them one at a time.
+    """
+    with _captioning_lock:
+        if photo_id in _captioning:
+            return
+    try:
+        threading.Thread(
+            target=caption_photo, args=(app, photo_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — captioning is best-effort
+        log.exception("failed to spawn caption thread for photo %s", photo_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1203,6 +1236,52 @@ def _register_routes(app: Flask):
             _kick_monthly_report(u.couple_id, today.year, today.month)
         return redirect(url_for("index"))
 
+    # ---- 오늘 질문 다시 뽑기 (regenerate today's question) ----
+    @app.route("/question/regenerate", methods=["POST"])
+    @active_couple_required
+    def question_regenerate():
+        """Re-roll TODAY's question for the couple and reset today's answers.
+
+        Destructive: because the question changes, today's existing answers no
+        longer apply, so they're deleted — both partners answer fresh. Generating
+        a new question calls ``ai.generate_daily_question`` synchronously, which is
+        acceptable ONLY because it mirrors the established get_or_create request-
+        path pattern for question gen (the one allowed synchronous claude call)."""
+        u = current_user()
+        couple = u.couple
+        today = date.today()
+
+        # Steer away from repeating recent topics (most recent first, excluding today).
+        recent = (
+            DailyQuestion.query.filter(
+                DailyQuestion.couple_id == couple.id, DailyQuestion.q_date < today
+            )
+            .order_by(DailyQuestion.q_date.desc())
+            .limit(8)
+            .all()
+        )
+        recent_pairs = [
+            {"question": r.text, "answers": [a.text for a in r.answers.all()]}
+            for r in recent
+        ]
+        text, source = ai.generate_daily_question(recent_pairs)
+
+        # Find today's row (or create it if somehow missing), then replace it.
+        q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
+        if q is None:
+            q = DailyQuestion(couple_id=couple.id, q_date=today, text=text, source=source)
+            db.session.add(q)
+            db.session.commit()
+        else:
+            # 질문이 바뀌었으니 오늘 답변은 더 이상 유효하지 않다 — 지워서 둘 다 새로 답하게.
+            Answer.query.filter_by(question_id=q.id).delete()
+            q.text = text
+            q.source = source
+            db.session.commit()
+
+        flash("새 질문을 뽑았어! 💫", "ok")
+        return redirect(url_for("index"))
+
     # ---- comments on a day's revealed answers ----
     @app.route("/question/<int:qid>/comment", methods=["POST"])
     @active_couple_required
@@ -1389,12 +1468,24 @@ def _register_routes(app: Flask):
         # If anything is still being captioned, the template gently auto-reloads
         # so finished captions appear without a manual refresh.
         any_pending = any(p["caption_status"] == "pending" for p in photos)
+        any_failed = any(p["caption_status"] == "failed" for p in photos)
+
+        # Self-heal: re-spawn a caption thread for every photo stuck on 'pending'
+        # (its original thread may have died/OOM'd/never ran). The _captioning
+        # guard drops duplicates, and the semaphore serializes the work, so this
+        # is safe even with several stuck photos.
+        app_obj = current_app._get_current_object()
+        for p in photos:
+            if p["caption_status"] == "pending":
+                _spawn_caption_if_idle(app_obj, p["id"])
+
         return render_template(
             "memories.html",
             enabled=True,
             reconnect=onedrive.reconnect_needed(),
             photos=photos,
             any_pending=any_pending,
+            any_failed=any_failed,
         )
 
     @app.route("/memories/search")
@@ -1661,6 +1752,33 @@ def _register_routes(app: Flask):
             flash("사진 업로드에 실패했어. 잠시 후 다시 시도해줘.", "error")
         else:
             flash("이미지 파일만 50MB 이하로 올릴 수 있어.", "error")
+        return redirect(url_for("memories"))
+
+    @app.route("/memories/recaption", methods=["POST"])
+    @active_couple_required
+    def memories_recaption():
+        """Retry captioning for THIS couple's photos that failed: reset their
+        'failed' status back to 'pending', then (guarded) spawn a background
+        caption thread for every 'pending' photo. Safe now that captioning is
+        serialized — the photos queue up and caption one at a time."""
+        u = current_user()
+        # 이 커플의 실패한 사진만 다시 'pending'으로 되돌린다(커플 범위 밖은 절대 건드리지 않음).
+        failed = Photo.query.filter_by(
+            couple_id=u.couple_id, caption_status="failed"
+        ).all()
+        for p in failed:
+            p.caption_status = "pending"
+        db.session.commit()
+
+        # 이 커플의 모든 'pending' 사진에 대해 배경 캡셔너를 (중복 방지 가드로) 띄운다.
+        pending = Photo.query.filter_by(
+            couple_id=u.couple_id, caption_status="pending"
+        ).all()
+        app_obj = current_app._get_current_object()
+        for p in pending:
+            _spawn_caption_if_idle(app_obj, p.id)
+
+        flash("안 된 사진들을 다시 분석할게. 잠시 뒤 새로고침해줘.", "ok")
         return redirect(url_for("memories"))
 
     @app.route("/memories/<int:photo_id>/delete", methods=["POST"])
