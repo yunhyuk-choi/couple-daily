@@ -290,20 +290,98 @@ def _normalize_fault(raw_fault, name_a, name_b):
     ]
 
 
+# 미션이 하나도 없을 때 쓰는 부드럽고 일반적인 기본 화해 미션 (톤 유지용).
+DEFAULT_MISSIONS = [
+    "오늘 안에 서로 눈 보고 5초만 꼭 안아주기 🤗",
+    "고마웠던 점 하나씩 말해주기",
+]
+
+# 판결 텍스트 필드(순서/키 고정) — 정규화·기본값 처리에 함께 쓴다.
+_VERDICT_TEXT_FIELDS = (
+    "summary", "issue", "facts", "consideration", "judgment",
+    "order", "empathy_note",
+)
+
+
+def _normalize_verdict(data, name_a, name_b):
+    """claude가 준 원본 dict를 리치·일관 스키마로 정규화한다 (순수/오프라인).
+
+    claude 없이 가짜 dict로 바로 단위 테스트할 수 있게 만들었다. 규칙:
+      * ``fault`` 는 ``_normalize_fault`` 재사용.
+      * ``winner`` 는 'a'/'b'/'tie' 만 허용, 잘못됐으면 fault 에서 유도
+        (잘못 % 가 더 낮은 쪽 = 우리가 손들어주는 쪽 = winner; 같으면 'tie').
+      * ``empathy_score`` 는 int 로 강제, 0..100 클램프, 없거나 못 쓰면 60.
+      * ``missions`` 는 공백 제거한 비어있지 않은 문자열 리스트, 최대 3개,
+        비면 ``DEFAULT_MISSIONS`` 로 폴백.
+      * 모든 텍스트 필드는 ``.strip()``, 없으면 "".
+      * 쓸 만한 fault 도 없고 텍스트도 전혀 없으면 ``None`` (부분 판결은 살린다).
+    """
+    if not isinstance(data, dict):
+        return None
+
+    fault = _normalize_fault(data.get("fault"), name_a, name_b)
+
+    # 텍스트 필드 정규화.
+    texts = {}
+    for key in _VERDICT_TEXT_FIELDS:
+        v = data.get(key)
+        texts[key] = (v or "").strip() if isinstance(v, str) else ""
+
+    # winner: 유효값만 수용, 아니면 fault 에서 유도(잘못 낮은 쪽이 winner).
+    winner = data.get("winner")
+    if winner not in ("a", "b", "tie"):
+        if fault:
+            pa, pb = fault[0]["percent"], fault[1]["percent"]
+            winner = "a" if pa < pb else ("b" if pb < pa else "tie")
+        else:
+            winner = "tie"
+
+    # empathy_score: int 강제 → 0..100 클램프 → 기본 60.
+    try:
+        empathy = int(round(float(data.get("empathy_score"))))
+        empathy = max(0, min(100, empathy))
+    except (TypeError, ValueError):
+        empathy = 60
+
+    # missions: 문자열만, 공백 제거, 빈 것 제거, 최대 3개, 비면 기본 폴백.
+    raw_missions = data.get("missions")
+    missions = []
+    if isinstance(raw_missions, list):
+        for m in raw_missions:
+            s = str(m).strip() if m is not None else ""
+            if s:
+                missions.append(s)
+            if len(missions) >= 3:
+                break
+    if not missions:
+        missions = list(DEFAULT_MISSIONS)
+
+    # 부분 판결도 보여줄 가치가 있으니, fault·텍스트가 전부 없을 때만 None.
+    if not fault and not any(texts.values()):
+        return None
+
+    return {
+        "winner": winner,
+        "fault": fault or [],
+        "empathy_score": empathy,
+        "missions": missions,
+        **texts,
+    }
+
+
 def judge_fight(name_a, name_b, situation, statements):
     """Judge a couple's fight with `claude`, returning a normalized verdict dict.
 
     ``statements`` is a list of ``{"name": <display_name>, "text": <진술>}`` with
     1 or 2 entries (a partner who left no statement is simply absent). Builds a
-    warm-but-fair Korean prompt, runs `claude -p`, parses strict JSON, and returns
-    a normalized dict — or ``None`` on ANY failure (never raises), exactly like
-    ``generate_monthly_qualitative``. Because it runs the slow agent subprocess,
-    the caller MUST invoke it from a background thread, never on the request path.
+    warm, light Korean prompt, runs `claude -p`, parses strict JSON, and returns
+    a normalized RICH dict via ``_normalize_verdict`` — or ``None`` on ANY failure
+    (never raises), exactly like ``generate_monthly_qualitative``. Because it runs
+    the slow agent subprocess, the caller MUST invoke it from a background thread,
+    never on the request path.
 
-    Returns on success::
-
-        {"fault": [{"name": name_a, "percent": int}, {"name": name_b, "percent": int}],
-         "summary": str, "reason": str, "resolution": str, "note": str}
+    Returns on success a dict with keys: winner, fault, summary, issue, facts,
+    consideration, judgment, order, empathy_score, empathy_note, missions.
     """
     if not name_a or not name_b or not (situation or "").strip():
         return None
@@ -319,47 +397,58 @@ def judge_fight(name_a, name_b, situation, statements):
     only_one = len(statements) < 2
 
     prompt = (
-        f"너는 연인 두 사람({name_a}, {name_b})의 다툼을 판결하는, 다정하지만 공정한 "
-        "'AI 판사'야. 재미있고 따뜻하게, 그러나 어느 한쪽으로 치우치지 않고 균형 있고 "
-        "솔직하게 판결해.\n\n"
+        "[페르소나]\n"
+        f"너는 연인 두 사람({name_a}, {name_b})의 다툼을 봐주는, 밝고 다정한 "
+        "'커플 화해 판사'야. 무섭거나 권위적인 법정 판사가 아니라, 두 사람을 "
+        "아끼는 유쾌한 친구 같은 판사지.\n\n"
+        "[말투·태도 규칙 — 아주 중요]\n"
+        "- 밝고 다정하게, 유머 한 스푼. 반말체의 따뜻한 말투.\n"
+        "- 누구도 상처받지 않게. 잘못을 짚을 때도 귀엽고 부드럽게 돌려서 말해줘.\n"
+        "- 항상 관계 회복과 애정을 북돋는 마무리로.\n"
+        "- 무겁거나 훈계조·법정 위압감은 절대 금지. 비난·인신공격·한쪽만 편들기 금지.\n"
+        "- 이모지는 과하지 않게 한두 개까지만 허용.\n\n"
         "아래의 상황 설명과, 있는 만큼의 각자 진술만을 근거로 판단해. 지어내지 마.\n\n"
         f"[상황 설명]\n{(situation or '').strip()}\n\n"
         f"[각자 진술]\n{stmt_block}\n\n"
-        "판결 규칙:\n"
+        "[판결 규칙]\n"
         f"- 잘못 비율(fault)은 {name_a}와 {name_b} 두 사람 것을 합쳐 정확히 100이 되게, "
         "근거 있게 배분해.\n"
         + (
-            "- 지금은 한 사람의 진술만 있어. 그 한계를 감안해서 신중하게 판단하고, "
-            "note에 '한쪽 진술만 있어 판단에 한계가 있다'는 취지를 부드럽게 한 문장으로 "
-            "적어줘.\n"
+            "- 지금은 한 사람의 진술만 있어. 그 한계를 부드럽게 감안해서 신중히 판단하고, "
+            "그 뉘앙스를 consideration(참작)이나 summary 톤에 자연스럽게 녹여줘.\n"
             if only_one
             else "- 두 사람의 진술을 모두 고려해서 공평하게 판단해.\n"
         )
-        + "- 금지: 모욕, 인신공격, 한쪽 편만 들도록 부추기는 말, 과격하거나 비난하는 말투.\n"
-        "- 목표는 관계 회복이야. 구체적이고 실천 가능한 화해 방법을 제시해.\n\n"
-        "출력은 반드시 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+        + "- summary 는 누가 '아주 조금' 더 잘못인지 두 사람 다 피식 웃게, 기분 상하지 "
+        "않게 가볍고 다정하게 한 문장으로.\n"
+        "- 목표는 관계 회복이야. 구체적이고 실천 가능하고 귀여운 화해 미션을 제시해.\n\n"
+        "출력은 아래 JSON 스키마 하나만, 다른 텍스트/설명/코드펜스 없이 출력해. "
+        "각 필드의 톤·길이 지침을 지켜:\n"
         "{\n"
+        '  "winner": "a" | "b" | "tie",  '
+        f'// a={name_a} 쪽 손을 살짝 더 들어줌, b={name_b}, tie=무승부\n'
         f'  "fault": [{{"name": "{name_a}", "percent": <정수>}}, '
-        f'{{"name": "{name_b}", "percent": <정수>}}],\n'
-        '  "summary": "<한 줄 판결 요지>",\n'
-        '  "reason": "<양측을 고려한 판결 이유, 2~4문장>",\n'
-        '  "resolution": "<두 사람을 위한 구체적 화해/해결 제안, 2~3문장>",\n'
-        '  "note": "<한쪽만 진술 등 한계가 있으면 한 문장, 없으면 빈 문자열>"\n'
+        f'{{"name": "{name_b}", "percent": <정수>}}],  // 합 100\n'
+        '  "summary": "<한 줄 판결 요약: 누구 잘못이 조금 더 큰지 기분 상하지 않게 '
+        '가볍고 다정하게. 한 문장>",\n'
+        '  "issue": "<쟁점: 무엇 때문에 다퉜는지 1~2문장>",\n'
+        '  "facts": "<인정되는 사실: 양쪽이 공감할 객관적 사실 1~2문장>",\n'
+        '  "consideration": "<참작 사유: 서로 이해해줄 만한 사정 1~2문장>",\n'
+        '  "judgment": "<판단: 따뜻하고 위트있는 한 마디로 정리, 2~3문장. 비난조 금지>",\n'
+        '  "order": "<주문: 두 사람 모두에게 건네는 회복 지향의 마무리 한마디, 1~2문장>",\n'
+        '  "empathy_score": <0~100 정수>,  // 두 사람 의도가 얼마나 잘 통했는지(사랑/공감도). '
+        "낮아도 나쁜 게 아니라는 톤\n"
+        '  "empathy_note": "<공감 점수 한 줄 설명, 다정하게>",\n'
+        '  "missions": ["<화해 미션 2~3개, 구체적·실천가능·귀엽게. 예: 오늘 안에 서로 안아주기>"]\n'
         "}"
     )
     try:
         raw = _run_claude(prompt)
         data = _extract_json(raw)
-        fault = _normalize_fault(data.get("fault"), name_a, name_b)
-        if not fault:
-            raise ValueError("no usable fault data")
-        return {
-            "fault": fault,
-            "summary": (data.get("summary") or "").strip(),
-            "reason": (data.get("reason") or "").strip(),
-            "resolution": (data.get("resolution") or "").strip(),
-            "note": (data.get("note") or "").strip(),
-        }
+        verdict = _normalize_verdict(data, name_a, name_b)
+        if not verdict:
+            raise ValueError("empty verdict")
+        return verdict
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] fight judgment failed: {e}", file=sys.stderr)
         return None
