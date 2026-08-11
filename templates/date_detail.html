@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ item.title }} · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1 class="detail-title">데이트 뉴스</h1>
+</div>
+
+<article class="card event-detail">
+  <div class="event-hero{% if not item.image_url %} is-error{% endif %}">
+    {% if item.image_url %}
+    <img class="event-hero-img" src="{{ item.image_url }}"
+         alt="{{ item.title }}"
+         onload="this.classList.add('loaded'); this.closest('.event-hero').classList.add('is-loaded')"
+         onerror="this.closest('.event-hero').classList.add('is-error')" />
+    {% endif %}
+  </div>
+
+  {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+  <h2 class="event-detail-title">{{ item.title }}</h2>
+
+  <dl class="event-facts">
+    {% if item.start_date or item.end_date %}
+    <div class="event-fact">
+      <dt>기간</dt>
+      <dd>
+        {%- if item.start_date %}{{ item.start_date.strftime('%Y.%m.%d') }}{% endif -%}
+        {%- if item.start_date and item.end_date %} ~ {% endif -%}
+        {%- if item.end_date %}{{ item.end_date.strftime('%Y.%m.%d') }}{% endif -%}
+      </dd>
+    </div>
+    {% endif %}
+    {% if item.place or item.district %}
+    <div class="event-fact">
+      <dt>장소</dt>
+      <dd>{{ item.place or '' }}{% if item.place and item.district %} · {% endif %}{{ item.district or '' }}</dd>
+    </div>
+    {% endif %}
+    {% if item.is_free is not none or item.fee %}
+    <div class="event-fact">
+      <dt>요금</dt>
+      <dd>
+        {%- if item.is_free is not none %}<span class="chip small">{{ '무료' if item.is_free else '유료' }}</span>{% endif -%}
+        {%- if item.fee %} {{ item.fee }}{% endif -%}
+      </dd>
+    </div>
+    {% endif %}
+  </dl>
+
+  {% if item.description %}
+  <p class="event-desc">{{ item.description }}</p>
+  {% endif %}
+
+  {% if item.link %}
+  <a class="btn primary event-link" href="{{ item.link }}"
+     target="_blank" rel="noopener noreferrer">예약·안내 보기</a>
+  {% endif %}
+</article>
+{% endblock %}

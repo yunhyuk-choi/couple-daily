@@ -1,0 +1,31 @@
+name: refresh-events
+
+# 데이트 뉴스 피드를 밤마다 갱신(서울 문화행사 upsert + 만료 삭제).
+# 00:00 KST == 15:00 UTC. GitHub cron is always UTC.
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}
+
+# Required repository secret:
+#   CRON_SECRET  — must exactly match the CRON_SECRET env var set on Render.
+# Optional repository variable:
+#   APP_URL      — override the target base URL (defaults to the Render app).
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger events refresh
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ vars.APP_URL || 'https://couple-daily.onrender.com' }}
+        run: |
+          # Render free instances sleep after inactivity; the first request wakes
+          # them, which can take 30-60s. Use a generous timeout and retry once so
+          # a cold start doesn't cause a missed refresh.
+          set -e
+          curl --fail --show-error --silent \
+               --max-time 120 --retry 2 --retry-delay 30 --retry-all-errors \
+               -X POST \
+               -H "X-Cron-Secret: ${CRON_SECRET}" \
+               "${APP_URL}/internal/cron/refresh-events"
