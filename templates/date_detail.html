@@ -65,6 +65,15 @@
     <p class="pick-hidden-note muted small" id="pick-hidden-note" hidden></p>
   </div>
 
+  {# 확정(둘 다 찜)된 데이트면 '다녀왔어' → 추억 앨범 연결. 누르면 둘 다 방문함
+     처리 후 추억 업로드로 이동(캡션에 행사 제목 프리필). #}
+  {% if confirmed %}
+  <form method="post" action="{{ url_for('date_went', event_id=item.id) }}"
+        class="went-form went-detail">
+    <button type="submit" class="btn primary sm went-btn">📸 다녀왔어 — 추억으로 남기기</button>
+  </form>
+  {% endif %}
+
   <dl class="event-facts">
     {% if item.start_date or item.end_date %}
     <div class="event-fact">

@@ -6,6 +6,15 @@
   <h1>데이트 뉴스</h1>
 </div>
 
+{# '추천받기' 패널 — 피드 맨 위, 컨트롤(필터/정렬) 위에 자리한다. 카테고리·정렬을
+   바꿔도 아래 그리드(#dates-list)만 교체되므로 이 패널은 그대로 유지된다. 내용은
+   전부 JS가 그린다(초기 ready 추천은 아래 #reco-initial JSON을 읽어 같은 함수로
+   렌더). 의존성 없음·핑크 톤·모바일 맞춤. #}
+<div id="reco-panel" class="reco-panel" hidden></div>
+{% if recommendation %}
+<script type="application/json" id="reco-initial">{{ recommendation | tojson }}</script>
+{% endif %}
+
 {# 카테고리 칩 필터(가로 스크롤) + 정렬 컨트롤. 클라 상태로 구동되며 전체
    페이지 새로고침 없이 fetch로만 갱신한다. '기타' 버킷은 전체에서만 노출돼
    칩을 두지 않는다. '팝업'은 아직 소스가 없어 빈 상태로 우아히 처리한다. #}
@@ -48,6 +57,13 @@
 {# 무한스크롤 센티넬 — 항상 두고, 클라가 상태(done)로 제어한다(필터 전환 시
    재무장하기 쉽게 DOM에서 제거하지 않는다). #}
 <div id="dates-sentinel" aria-hidden="true"></div>
+
+{# 플로팅 '✨ 추천받기' 버튼 — 추억 FAB(.fab.glass)과 같은 글래스 스타일. 누르면
+   백그라운드 AI 추천을 요청하고 위 패널에 결과를 그린다(claude는 요청 경로 아님). #}
+<button type="button" class="fab glass fab-reco" id="fab-recommend"
+        aria-label="데이트 추천받기" title="추천받기">
+  <span class="fab-reco-ico" aria-hidden="true">✨</span>
+</button>
 
 <script>
 (function () {
@@ -331,6 +347,136 @@
   // 이미 보이면 이어 당긴다.
   startPolling();
   if (isVisible(sentinel)) loadMore();
+})();
+</script>
+
+{# 추천받기(P4) — FAB 클릭 → POST /dates/recommend → 패널을 "뽑는 중"으로 두고
+   GET /dates/recommend/status를 ~4s 간격(최대 15회)으로 폴링, ready면 렌더한다.
+   페이지 로드 시 이미 ready 추천이 있으면 즉시 렌더. 무한스크롤/필터/정렬과 독립
+   (패널은 그리드 위에 있어 그리드 교체에 영향받지 않는다). 의존성 없음. #}
+<script>
+(function () {
+  var panel = document.getElementById('reco-panel');
+  var fab = document.getElementById('fab-recommend');
+  if (!panel) return;
+
+  var POLL_MAX = 15, POLL_MS = 4000;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function recHead() {
+    return el('div', 'reco-head', '✨ 오늘의 추천 데이트');
+  }
+
+  // 상태: 뽑는 중.
+  function showLoading() {
+    panel.hidden = false;
+    panel.innerHTML = '';
+    panel.appendChild(recHead());
+    var p = el('p', 'reco-loading muted', '추천 뽑는 중이에요…');
+    panel.appendChild(p);
+  }
+
+  // 상태: 실패/후보 없음.
+  function showFailed() {
+    panel.hidden = false;
+    panel.innerHTML = '';
+    panel.appendChild(recHead());
+    panel.appendChild(el('p', 'reco-loading muted', '지금은 추천을 만들지 못했어. 잠시 후 다시 시도해줘.'));
+    panel.appendChild(againBtn());
+  }
+
+  function againBtn() {
+    var b = el('button', 'btn ghost sm reco-again', '다시 추천받기');
+    b.type = 'button';
+    b.addEventListener('click', requestReco);
+    return b;
+  }
+
+  // 픽 미니카드 — 제목 + 분류칩(+팝업 마커) + 이유 + 썸네일, date_detail로 링크.
+  function pickCard(pick) {
+    var a = document.createElement('a');
+    a.className = 'reco-card';
+    a.href = '/dates/' + pick.event_id;
+    if (pick.image_url) {
+      var img = document.createElement('img');
+      img.className = 'reco-thumb';
+      img.src = pick.image_url;
+      img.loading = 'lazy';
+      img.alt = '';
+      img.onerror = function () { this.style.display = 'none'; };
+      a.appendChild(img);
+    }
+    var body = el('div', 'reco-card-body');
+    var chips = el('div', 'reco-card-chips');
+    if (pick.category) chips.appendChild(el('span', 'chip small', pick.category));
+    if (pick.source === 'popup') chips.appendChild(el('span', 'ai-chip', '🛍️ AI 정보'));
+    if (chips.childNodes.length) body.appendChild(chips);
+    body.appendChild(el('h3', 'reco-card-title', pick.title || ''));
+    if (pick.why) body.appendChild(el('p', 'reco-card-why muted small', pick.why));
+    a.appendChild(body);
+    var arrow = el('span', 'meta-arrow', '›');
+    arrow.setAttribute('aria-hidden', 'true');
+    a.appendChild(arrow);
+    return a;
+  }
+
+  // ready 추천 렌더: 문구 + 픽 미니카드들 + 다시 추천받기.
+  function render(data) {
+    panel.hidden = false;
+    panel.innerHTML = '';
+    panel.appendChild(recHead());
+    if (data.message) panel.appendChild(el('p', 'reco-msg', data.message));
+    var picks = data.picks || [];
+    if (picks.length) {
+      var list = el('div', 'reco-picks');
+      picks.forEach(function (pk) { list.appendChild(pickCard(pk)); });
+      panel.appendChild(list);
+    }
+    panel.appendChild(againBtn());
+  }
+
+  var polling = false;
+  function poll(tries) {
+    if (tries >= POLL_MAX) { showFailed(); polling = false; return; }
+    fetch('/dates/recommend/status', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) { setTimeout(function () { poll(tries + 1); }, POLL_MS); return; }
+        if (d.status === 'ready') { render(d); polling = false; return; }
+        if (d.status === 'failed') { showFailed(); polling = false; return; }
+        setTimeout(function () { poll(tries + 1); }, POLL_MS);
+      })
+      .catch(function () { setTimeout(function () { poll(tries + 1); }, POLL_MS); });
+  }
+
+  function requestReco() {
+    if (polling) return;
+    polling = true;
+    showLoading();
+    fetch('/dates/recommend', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'X-Requested-With': 'fetch' }
+    })
+      .then(function () { poll(0); })
+      .catch(function () { poll(0); });
+  }
+
+  if (fab) fab.addEventListener('click', requestReco);
+
+  // 페이지 로드 시 이미 ready 추천이 있으면 즉시 패널을 그린다.
+  var initEl = document.getElementById('reco-initial');
+  if (initEl) {
+    try {
+      var initial = JSON.parse(initEl.textContent || 'null');
+      if (initial && initial.status === 'ready') render(initial);
+    } catch (e) { /* 무시 — 패널은 숨김 상태 유지 */ }
+  }
 })();
 </script>
 {% endblock %}

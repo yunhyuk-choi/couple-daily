@@ -16,7 +16,17 @@
   {% if confirmed_items %}
   <h2 class="wishlist-section">💘 확정 <span class="muted small">둘 다 찜했어</span></h2>
   <div class="event-list wishlist-grid">
-    {% with items = confirmed_items %}{% include "_date_cards.html" %}{% endwith %}
+    {# 확정 카드마다 '다녀왔어' 폼을 카드 아래에 붙인다 — 카드는 <a>라 폼을 안에
+       넣을 수 없어 형제로 둔다. 누르면 둘 다 방문함 처리 후 추억 업로드로 이동. #}
+    {% for it in confirmed_items %}
+    <div class="wishlist-confirmed-item">
+      {% with items = [it] %}{% include "_date_cards.html" %}{% endwith %}
+      <form method="post" action="{{ url_for('date_went', event_id=it.event.id) }}"
+            class="went-form">
+        <button type="submit" class="btn sm went-btn">📸 다녀왔어</button>
+      </form>
+    </div>
+    {% endfor %}
   </div>
   {% endif %}
   {% if wish_items %}
@@ -49,7 +59,12 @@
       .then(function (d) {
         btn.disabled = false;
         if (!d || !d.ok) return;
-        if ((d.interested_count || 0) === 0) { card.remove(); return; }
+        if ((d.interested_count || 0) === 0) {
+          // 확정 카드는 '다녀왔어' 폼을 감싼 래퍼째 제거(폼이 고아로 남지 않게).
+          var wrapper = card.closest('.wishlist-confirmed-item');
+          (wrapper || card).remove();
+          return;
+        }
         var on = d.my_status === 'interested';
         btn.setAttribute('data-picked', on ? 'true' : 'false');
         btn.setAttribute('aria-pressed', on ? 'true' : 'false');
