@@ -579,3 +579,112 @@ def score_events(profile_text, events):
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] event scoring failed: {e}", file=sys.stderr)
         return []
+
+
+# ---------------------------------------------------------------------------
+# 데이트 뉴스 '추천받기' — 온디맨드 커플 맞춤 데이트 추천 (1콜) — P4
+# ---------------------------------------------------------------------------
+def recommend_dates(profile_text, candidates):
+    """커플 취향 프로필 + 현재 피드 후보로 '한 번'(1콜) 맞춤 데이트를 추천한다.
+
+    페르소나 = 다정한 데이트 큐레이터. 번호(ref) 매긴 후보 목록을 주고, 따뜻한
+    한국어 추천 문구(2~3문장, "이런 데이트 어때?" 톤)와 가장 좋은 2~3개 후보를
+    각각 한 줄 이유와 함께 고르게 한다. 프로필이 빈약하면 일반적 매력 기준으로
+    부드럽게 추천한다. 느린 서브프로세스라 호출부가 반드시 백그라운드에서 돌린다.
+
+    ``candidates``: ``{"ref": <event_id>, "title", "category", "place",
+    "description", "score"}`` dict의 리스트(호출부가 상위 ~20개를 넘긴다).
+
+    반환(정규화): ``{"message": <str>, "picks": [{"ref", "why"}, ...]}``.
+      * message → .strip(),
+      * picks → 후보에 실제 존재하는 ref만 남기고, 최대 3개, why → .strip(),
+        중복 ref 제거.
+    실패(파싱 실패·빈 message 등) 시 ``None`` 반환, 절대 raise 안 함(다른 ai.py
+    함수와 동일).
+    """
+    if not candidates:
+        return None
+
+    # 번호 매긴 후보 목록. ref는 정수 event_id를 그대로 쓴다(모델이 되돌려줌).
+    valid_refs = set()
+    lines = []
+    for c in candidates:
+        ref = c.get("ref")
+        valid_refs.add(ref)
+        title = (c.get("title") or "").strip() or "(제목 없음)"
+        parts = [f"[ref {ref}] {title}"]
+        cat = (c.get("category") or "").strip()
+        place = (c.get("place") or "").strip()
+        desc = (c.get("description") or "").strip()
+        if cat:
+            parts.append(f"분류: {cat}")
+        if place:
+            parts.append(f"장소: {place}")
+        if desc:
+            parts.append(f"설명: {desc[:200]}")  # 프롬프트 폭주 방지로 잘라 붙임
+        lines.append(" / ".join(parts))
+    catalog = "\n".join(lines)
+
+    profile = (profile_text or "").strip()
+    has_profile = bool(profile)
+    profile_block = profile if has_profile else "(아직 이 커플에 대한 정보가 거의 없어)"
+
+    prompt = (
+        "[페르소나]\n"
+        "너는 연인 두 사람에게 딱 맞는 데이트를 골라주는, 밝고 다정한 '데이트 "
+        "큐레이터'야.\n\n"
+        "[할 일]\n"
+        "아래 '커플 취향 프로필'과 '후보 행사' 목록을 보고, 이 두 사람에게 오늘 "
+        "제안할 데이트를 골라줘. 먼저 따뜻한 추천 문구를 2~3문장으로 쓰고("
+        "\"이런 데이트 어때?\" 같은 다정한 톤), 후보 중 가장 잘 어울리는 2~3개를 "
+        "골라 각각 한 줄짜리 이유를 붙여줘.\n\n"
+        "[규칙 — 중요]\n"
+        "- 말투는 앱 전체와 같은 결로 가볍고 다정한 반말체. 훈계·비난 금지.\n"
+        "- picks는 2개 이상 3개 이하로. 각 이유는 그 행사에 맞춰 서로 다르게.\n"
+        + (
+            "- 프로필에 드러난 두 사람의 관심사·취향·분위기에 잘 맞는 걸 골라줘.\n"
+            if has_profile
+            else "- 지금은 이 커플에 대한 정보가 거의 없어. 그러니 데이트로서의 "
+            "일반적인 매력(접근성·분위기·함께 즐기기 좋은 정도)으로 부드럽게 "
+            "골라주고, 문구에 '아직 두 사람을 잘 몰라서 일반적인 기준으로 골랐어' "
+            "같은 뉘앙스를 한 번 살짝 녹여줘.\n"
+        )
+        + f"\n[커플 취향 프로필]\n{profile_block}\n\n"
+        f"[후보 행사]\n{catalog}\n\n"
+        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이. ref는 위에 "
+        "주어진 값을 '그대로' 되돌려줘:\n"
+        '{"message": "<추천 문구 2~3문장>", '
+        '"picks": [{"ref": <ref>, "why": "<한 줄 이유>"}, ...]}'
+    )
+    try:
+        raw = _run_claude(prompt)
+        data = _extract_json(raw)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        message = (data.get("message") or "").strip()
+
+        raw_picks = data.get("picks")
+        if not isinstance(raw_picks, list):
+            raw_picks = []
+        picks = []
+        seen = set()
+        for entry in raw_picks:
+            if not isinstance(entry, dict):
+                continue
+            ref = entry.get("ref")
+            # 후보에 실제 있는 ref만, 중복 제거, 최대 3개.
+            if ref not in valid_refs or ref in seen:
+                continue
+            why = entry.get("why")
+            why = why.strip() if isinstance(why, str) else ""
+            picks.append({"ref": ref, "why": why})
+            seen.add(ref)
+            if len(picks) >= 3:
+                break
+
+        if not message:
+            raise ValueError("empty message field")
+        return {"message": message, "picks": picks}
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] date recommendation failed: {e}", file=sys.stderr)
+        return None

@@ -638,3 +638,51 @@ class EventPick(db.Model):
     # 편의용 관계(찜 → 사용자·행사 조회).
     user = db.relationship("User")
     event = db.relationship("EventItem")
+
+
+class DateRecommendation(db.Model):
+    """커플별 '추천받기' 최신 결과 (P4) — 온디맨드 비동기 AI 데이트 추천.
+
+    사용자가 피드에서 '✨ 추천받기'를 누르면 백그라운드 스레드가 이 커플의 취향
+    프로필 + 현재 피드(서울 행사 + 팝업 포함) 상위 후보로 `claude`를 '한 번'
+    돌려(요청 경로가 아님·_CAPTION_SEM으로 직렬화) 따뜻한 추천 문구 + 2~3개 픽을
+    만든다. couple_id 유니크라 커플당 '최신 하나'만 upsert한다. brand-new 테이블 —
+    db.create_all()가 만들어 ALTER 불필요.
+
+    ``status`` 라이프사이클:
+      * 'pending' — 추천 생성 대기/진행 중(UI "추천 뽑는 중").
+      * 'ready'   — message + picks_json 채워짐(패널 렌더 가능).
+      * 'failed'  — 이번 생성 실패 & 직전 ready 결과도 없음.
+    """
+    __tablename__ = "date_recommendations"
+
+    id = db.Column(db.Integer, primary_key=True)
+    # 커플당 최신 추천 하나만 — 유니크로 upsert한다.
+    couple_id = db.Column(
+        db.Integer,
+        db.ForeignKey("couples.id"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    status = db.Column(db.String(16), default="pending", nullable=False)
+    message = db.Column(db.Text, nullable=True)       # 따뜻한 추천 문단
+    picks_json = db.Column(db.Text, nullable=True)    # JSON list[{event_id, why}]
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    @property
+    def picks(self):
+        """picks_json을 리스트로 디코드(없거나 깨졌으면 [])."""
+        if not self.picks_json:
+            return []
+        try:
+            v = json.loads(self.picks_json)
+            return v if isinstance(v, list) else []
+        except (ValueError, TypeError):
+            return []

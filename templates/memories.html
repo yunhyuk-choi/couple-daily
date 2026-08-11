@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 {% block title %}추억 · {{ app_name }}{% endblock %}
 {% block content %}
+{# 데이트 '다녀왔어'에서 넘어오면(?compose=<행사제목>) 업로드 모달을 자동으로 열고
+   캡션을 이 제목으로 프리필한다 — 그 날의 사진이 데이트 이름으로 태깅되게. 힌트는
+   아래 스크립트가 읽어 쓴다(enabled일 때 모달이 있으면 자동 오픈). #}
+{% if compose_hint %}
+<span id="compose-hint" data-hint="{{ compose_hint }}" hidden></span>
+{% endif %}
 <div class="page-head">
   <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/sparkling_heart.svg') }}" alt="" />
   <h1>우리의 추억</h1>
@@ -98,6 +104,15 @@
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape" && !modal.hidden) closeModal();
     });
+
+    // 데이트 '다녀왔어' → 여기로 넘어온 경우: 모달 자동 오픈 + 캡션 프리필.
+    var hintEl = document.getElementById("compose-hint");
+    var hint = hintEl ? (hintEl.getAttribute("data-hint") || "") : "";
+    if (hint) {
+      openModal();
+      var capInput = document.querySelector('#upload-form input[name="caption"]');
+      if (capInput) capInput.value = hint;
+    }
   }
 
   // ---- upload: multi-file preview + submit state -------------------------- #
