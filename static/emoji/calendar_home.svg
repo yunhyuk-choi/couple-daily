@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="100%" height="100%">
+  <defs>
+    <!-- 달력 몸통 그라데이션 -->
+    <linearGradient id="calHomeGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FF7EB3" />
+      <stop offset="100%" stop-color="#FF758C" />
+    </linearGradient>
+
+    <!-- 부드러운 발광 효과 -->
+    <filter id="calHomeGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#FF758C" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- 상단 바인더 고리 -->
+  <rect x="38" y="18" width="8" height="20" rx="4" fill="#FF4D79" />
+  <rect x="74" y="18" width="8" height="20" rx="4" fill="#FF4D79" />
+
+  <!-- 달력 몸통 -->
+  <rect x="24" y="30" width="72" height="66" rx="14"
+        fill="url(#calHomeGrad)" filter="url(#calHomeGlow)" />
+
+  <!-- 상단 헤더 밴드(위쪽 모서리만 둥글게) -->
+  <path d="M 24 44
+           C 24 36.3, 30.3 30, 38 30
+           L 82 30
+           C 89.7 30, 96 36.3, 96 44
+           L 96 48
+           L 24 48 Z"
+        fill="#FF4D79" />
+
+  <!-- 하트(오늘 마크) -->
+  <path d="M 60 84
+           C 53 78.5, 44 71.5, 44 63.5
+           A 7.5 7.5 0 0 1 60 59.8
+           A 7.5 7.5 0 0 1 76 63.5
+           C 76 71.5, 67 78.5, 60 84 Z"
+        fill="#FFFFFF" opacity="0.95" />
+</svg>
