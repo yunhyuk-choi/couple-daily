@@ -895,10 +895,14 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
     두고, 프로필을 한 번 만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번'
     호출한다. 돌아온 ref → score/reason/status='ready'; 안 돌아온 ref →
     status='failed'(이 패스에서 무한 재시도 방지; 이후 패스가 재시도 가능).
+
+    반환값: 이 패스에서 새로 'ready'가 된 행사 수(int). 채점할 게 없거나
+    이미 이 커플 채점 중이거나 에러면 0. 선채점 루프(prewarm_scores)가 이 값이
+    0이 될 때까지(또는 하드 캡까지) 반복 호출한다.
     """
     with _scoring_lock:
         if couple_id in _scoring:
-            return  # 이미 이 커플 채점 중 — 겹치지 않게
+            return 0  # 이미 이 커플 채점 중 — 겹치지 않게
         _scoring.add(couple_id)
 
     try:
@@ -906,7 +910,7 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
             try:
                 couple = db.session.get(Couple, couple_id)
                 if couple is None:
-                    return
+                    return 0
                 today = date.today()
 
                 # 진행 중 행사 중 이 커플에 'ready' 점수가 없는 것 — 마감 임박 순.
@@ -939,7 +943,7 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     .all()
                 )
                 if not rows:
-                    return
+                    return 0
 
                 # 선택된 행에 EventScore 행을 'pending'으로 보장(UI "분석 중").
                 selected = []  # (event, score_row)
@@ -958,7 +962,7 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     # 동시 패스가 행을 먼저 만들었을 수 있음 — 롤백하고 이번 패스는
                     # 양보(다음 on-view 트리거가 재시도).
                     db.session.rollback()
-                    return
+                    return 0
 
                 # 프로필 1회 + 배치 페이로드.
                 profile_text = build_couple_taste_profile(couple)
@@ -994,13 +998,16 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         by_ref[ref] = r
 
                 # 결과 반영: 받은 ref → ready, 안 받은 ref → failed.
+                # scored = 이 패스에서 새로 ready가 된 수(선채점 루프 종료 신호).
                 now = datetime.utcnow()
+                scored = 0
                 for ev, sc_row in selected:
                     r = by_ref.get(ev.id)
                     if r is not None:
                         sc_row.score = r.get("score")
                         sc_row.reason = (r.get("reason") or "")[:1000]
                         sc_row.status = "ready"
+                        scored += 1
                     else:
                         sc_row.status = "failed"
                     sc_row.updated_at = now
@@ -1011,9 +1018,12 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     log.exception(
                         "commit failed for event scores (couple=%s)", couple_id
                     )
+                    return 0  # 반영 실패 — 진전 없음(루프 종료)
+                return scored
             except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
                 db.session.rollback()
                 log.exception("score_events_for_couple failed (couple=%s)", couple_id)
+                return 0
     finally:
         with _scoring_lock:
             _scoring.discard(couple_id)
@@ -1036,17 +1046,83 @@ def _spawn_scoring_if_idle(app, couple_id):
         log.exception("failed to spawn scoring thread for couple %s", couple_id)
 
 
+# 선채점 커플당 하드 캡 — 워커 배치(≈24행)를 최대 이만큼 반복(≈480행)해
+# 부분 실패로 인한 폭주(무한 재선택)를 막는다.
+_PREWARM_MAX_BATCHES = 20
+
+
+def prewarm_scores(app):
+    """야간 갱신 직후 선채점(先採点) — 활성 커플마다 진행 중 행사 중 'ready'
+    점수가 없는 것을 미리 채점해, 누가 탭을 열기 전에 점수가 준비되게 한다.
+
+    활성 커플 = 승인 멤버(status='approved')가 2명 이상인 커플. 커플당
+    score_events_for_couple을 '무점수가 사라질 때까지'(반환 0) 또는 하드 캡
+    (_PREWARM_MAX_BATCHES)까지 순차 반복한다. 워커가 자기 app_context를 열고
+    캡션과 공유하는 _CAPTION_SEM으로 claude를 직렬화하므로 동시에 claude는
+    항상 하나뿐이다. _scoring 가드는 호출 사이에 풀리므로 순차 루프는 데드락
+    없다. 절대 스레드 밖으로 raise하지 않는다(모두 감싸고 로그).
+
+    ⚠️ 중복 안전(dedupe 유지): 행사 원본의 (source, source_uid) upsert와
+    uq_event_source_uid 제약은 전혀 손대지 않는다 — 신규 행사 삽입이 기존 행을
+    복제하지 않는다. 선채점은 워커의 아웃터조인(EventScore 없음 OR status!=
+    'ready') 대상만 골라 EventScore를 만들고, uq_eventscore_couple_event가
+    커플·행사당 한 행을 보장하므로 점수 행도 중복되지 않는다.
+    """
+    try:
+        active_ids = []
+        with app.app_context():
+            try:
+                for c in Couple.query.all():
+                    try:
+                        if len(c.approved_members) >= 2:
+                            active_ids.append(c.id)
+                    except Exception:  # noqa: BLE001 — 한 커플 실패가 전체 막지 않게
+                        continue
+            except Exception:  # noqa: BLE001
+                db.session.rollback()
+                log.exception("prewarm: 활성 커플 조회 실패")
+                return
+
+        # 커플별로 순차 선채점(워커가 각자 자기 app_context를 연다).
+        for couple_id in active_ids:
+            try:
+                batches = 0
+                while batches < _PREWARM_MAX_BATCHES:
+                    n = score_events_for_couple(app, couple_id)
+                    batches += 1
+                    if not n:  # 남은 무점수 없음(또는 진전 없음) → 이 커플 종료
+                        break
+            except Exception:  # noqa: BLE001 — best-effort, 절대 탈출 금지
+                log.exception("prewarm: 커플 %s 선채점 실패", couple_id)
+    except Exception:  # noqa: BLE001 — belt & suspenders
+        log.exception("prewarm_scores failed")
+
+
 # 데이트 뉴스 목록 무한스크롤 배치 크기(초기 렌더·/dates/more 공통).
 _DATES_BATCH = 18
 
 
-def _ordered_date_items(couple_id):
-    """진행 중(만료 안 된) 행사 전체를 이 커플 EventScore와 LEFT JOIN해
-    {event, score, reason, score_status} 리스트로 만들고 정렬해 반환한다.
+def _ordered_date_items(couple_id, cat=None, sort="score", direction="desc"):
+    """진행 중(만료 안 된) 행사를 이 커플 EventScore와 LEFT JOIN해
+    {event, score, reason, score_status, bucket} 리스트로 만들고, 카테고리
+    버킷(cat)으로 거르고 정렬해 반환한다.
 
-    정렬: ready 먼저(점수 높은 순, 동점이면 마감 임박 순·시작 순) → pending →
-    나머지(failed/없음). end_date NULL은 날짜 정렬에서 맨 뒤로 간다. ~300행 기준
-    저렴하다. dates()·dates_more()가 이 단일 원천을 공유해 정렬이 일관된다."""
+    cat: None/"전체"이면 전체(“기타” 버킷은 여기서만 노출). 그 외는
+         events.event_category_bucket 결과가 cat과 같은 것만("팝업"은 아직
+         소스가 없어 빈 목록).
+    sort/direction(모르는 값은 기본값으로 정규화):
+      * sort="score"(추천순) — ready 먼저(점수순, direction=="desc"면 높은 순·
+        "asc"면 낮은 순, 동점이면 마감 임박·시작 순) → pending → 나머지.
+      * sort="date"(최신순) — 필터된 전부를 start_date(폴백 created_at)로만 정렬,
+        direction=="desc"면 최신 먼저·"asc"면 오래된 먼저. NULL은 항상 맨 뒤.
+    ~300행 기준 저렴하다. dates()·dates_more()가 이 단일 원천을 공유해 일관된다."""
+    # sort/direction 정규화 — 알 수 없는 값은 안전한 기본으로.
+    if sort not in ("score", "date"):
+        sort = "score"
+    if direction not in ("desc", "asc"):
+        direction = "desc"
+    want_bucket = cat if (cat and cat != "전체") else None
+
     today = date.today()
     rows = (
         db.session.query(EventItem, EventScore)
@@ -1065,6 +1141,9 @@ def _ordered_date_items(couple_id):
 
     items = []
     for ev, sc in rows:
+        bucket = events.event_category_bucket(ev.category)
+        if want_bucket is not None and bucket != want_bucket:
+            continue
         status = sc.status if sc is not None else None
         items.append(
             {
@@ -1072,19 +1151,41 @@ def _ordered_date_items(couple_id):
                 "score": sc.score if sc is not None else None,
                 "reason": sc.reason if sc is not None else None,
                 "score_status": status,
+                "bucket": bucket,
             }
         )
 
     # 마감 없는(end_date NULL) 건 날짜 정렬에서 맨 뒤로 가도록 큰 값을 준다.
     _far = date.max
 
+    if sort == "date":
+        # 최신순: 점수 그룹 무시, start_date(폴백 created_at)로만 정렬. NULL은
+        # 방향과 무관하게 항상 맨 뒤(플래그 0=있음/1=없음이 1차 키).
+        asc = (direction == "asc")
+
+        def _dkey(it):
+            ev = it["event"]
+            d = ev.start_date
+            if d is None:
+                ca = getattr(ev, "created_at", None)
+                d = ca.date() if ca is not None else None
+            if d is None:
+                return (1, 0)  # 날짜 없음 → 맨 뒤
+            ordv = d.toordinal()
+            return (0, ordv if asc else -ordv)
+
+        items.sort(key=_dkey)
+        return items
+
     def _rank(it):
         st = it["score_status"]
         ev = it["event"]
         end = ev.end_date or _far
         if st == "ready":
-            # 점수 내림차순 → -score, 동점은 마감 임박 순(end asc), 시작 순.
-            return (0, -(it["score"] or 0), end, ev.start_date or _far)
+            # ready 내부: direction=="desc"면 점수 높은 순(-score), "asc"면 낮은 순.
+            s = it["score"] or 0
+            skey = -s if direction == "desc" else s
+            return (0, skey, end, ev.start_date or _far)
         if st == "pending":
             return (1, 0, end, ev.start_date or _far)
         return (2, 0, end, ev.start_date or _far)
@@ -2443,7 +2544,13 @@ def _register_routes(app: Flask):
         'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점 스레드를 스폰한다
         (요청은 절대 블록 안 함)."""
         u = current_user()
-        items = _ordered_date_items(u.couple_id)
+        # 선택 쿼리 파라미터(칩/정렬). 첫 로드가 일관되도록 기본값을 명시한다.
+        cat = request.args.get("cat") or "전체"
+        sort = request.args.get("sort") or "score"
+        direction = request.args.get("dir") or "desc"
+        items = _ordered_date_items(
+            u.couple_id, cat=cat, sort=sort, direction=direction
+        )
 
         # 셀프힐: 'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점을 스폰.
         # (뷰를 반복 조회해도 _scoring 가드로 스레드가 쌓이지 않는다. 요청 블록 X.)
@@ -2454,7 +2561,14 @@ def _register_routes(app: Flask):
         # 첫 배치만 그리고, 더 있으면 센티넬을 띄운다(클라가 이어서 당겨온다).
         first = items[:_DATES_BATCH]
         has_more = len(items) > _DATES_BATCH
-        return render_template("dates.html", items=first, has_more=has_more)
+        return render_template(
+            "dates.html",
+            items=first,
+            has_more=has_more,
+            cur_cat=cat,
+            cur_sort=sort,
+            cur_dir=direction,
+        )
 
     @app.route("/dates/more")
     @active_couple_required
@@ -2470,7 +2584,12 @@ def _register_routes(app: Flask):
             offset = 0
         if offset < 0:
             offset = 0
-        items = _ordered_date_items(u.couple_id)
+        cat = request.args.get("cat") or "전체"
+        sort = request.args.get("sort") or "score"
+        direction = request.args.get("dir") or "desc"
+        items = _ordered_date_items(
+            u.couple_id, cat=cat, sort=sort, direction=direction
+        )
         batch = items[offset:offset + _DATES_BATCH]
         return render_template("_date_cards.html", items=batch)
 
@@ -2704,6 +2823,18 @@ def _register_routes(app: Flask):
             except Exception:  # noqa: BLE001
                 db.session.rollback()
                 log.exception("event expiry delete failed")
+
+            # 선채점(비차단): 갱신 직후 활성 커플들의 미채점 진행 행사를 백그라운드
+            # 데몬 스레드로 미리 채점해 둔다. 요청은 이 스레드를 기다리지 않고 즉시
+            # 응답한다(선채점은 자기 안에서 모든 예외를 삼킨다).
+            try:
+                threading.Thread(
+                    target=prewarm_scores,
+                    args=(app,),
+                    daemon=True,
+                ).start()
+            except Exception:  # noqa: BLE001 — 선채점 스폰 실패가 응답을 막지 않게
+                log.exception("failed to spawn prewarm thread")
 
             return jsonify(
                 {

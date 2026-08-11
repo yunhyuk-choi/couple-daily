@@ -893,6 +893,39 @@ body.lb-open { overflow: hidden; }
 .resolved-state { font-size: 1.05rem; font-weight: 800; color: var(--pink); margin: 0; }
 
 /* ===== 데이트 뉴스 (서울 문화행사 피드) ===== */
+/* 데이트 뉴스 카테고리 칩 필터 바 + 정렬 컨트롤 (핑크 테마·모바일 폭) */
+.dates-controls { margin-bottom: 14px; }
+.chip-bar {
+  display: flex; flex-wrap: nowrap; gap: 8px;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  padding-bottom: 4px; scrollbar-width: none;
+}
+.chip-bar::-webkit-scrollbar { display: none; }
+.chip-filter {
+  flex: 0 0 auto; white-space: nowrap; cursor: pointer;
+  background: var(--pink-soft); color: var(--pink);
+  border: 1px solid transparent; padding: 6px 14px; border-radius: 999px;
+  font-size: 0.82rem; font-weight: 800; line-height: 1;
+  transition: background 0.12s, color 0.12s;
+}
+.chip-filter.active { background: var(--pink); color: #fff; }
+.dates-sort {
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+  margin-top: 8px;
+}
+.dates-sort select {
+  padding: 5px 12px; border-radius: 999px;
+  border: 1px solid var(--pink-soft); background: var(--card);
+  color: var(--ink); font-size: 0.8rem; font-weight: 700; cursor: pointer;
+}
+.dates-dir-btn {
+  flex: 0 0 auto; width: 34px; height: 34px; border-radius: 999px;
+  border: 1px solid var(--pink-soft); background: var(--pink-soft);
+  color: var(--pink); font-size: 0.85rem; font-weight: 800;
+  cursor: pointer; line-height: 1;
+}
+.dates-dir-btn:hover { background: var(--pink); color: #fff; }
+
 .event-list { display: flex; flex-direction: column; gap: 12px; }
 a.event-item {
   display: flex; align-items: center; gap: 14px; padding: 12px;

@@ -6,26 +6,82 @@
   <h1>데이트 뉴스</h1>
 </div>
 
-{% if not items %}
-  <div class="card center-card">
-    <img class="emoji hero" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
-    <p class="muted">아직 모아온 행사가 없어 — 매일 밤 자동으로 새 전시·행사를 담아올게 💫</p>
+{# 카테고리 칩 필터(가로 스크롤) + 정렬 컨트롤. 클라 상태로 구동되며 전체
+   페이지 새로고침 없이 fetch로만 갱신한다. '기타' 버킷은 전체에서만 노출돼
+   칩을 두지 않는다. '팝업'은 아직 소스가 없어 빈 상태로 우아히 처리한다. #}
+<div class="dates-controls">
+  <div class="chip-bar" id="dates-chipbar" role="tablist" aria-label="카테고리 필터">
+    {% for c in ['전체','전시','공연','축제','체험','팝업'] %}
+    <button type="button" class="chip-filter{% if (cur_cat or '전체') == c %} active{% endif %}"
+            role="tab" data-cat="{{ c }}"
+            aria-selected="{{ 'true' if (cur_cat or '전체') == c else 'false' }}">{{ c }}</button>
+    {% endfor %}
   </div>
-{% else %}
-  <div class="event-list" id="dates-list">
-  {% include "_date_cards.html" %}
+  <div class="dates-sort">
+    <select id="dates-sort" aria-label="정렬 기준">
+      <option value="score"{% if (cur_sort or 'score') == 'score' %} selected{% endif %}>추천순</option>
+      <option value="date"{% if (cur_sort or 'score') == 'date' %} selected{% endif %}>최신순</option>
+    </select>
+    <button type="button" class="dates-dir-btn" id="dates-dir"
+            data-dir="{{ cur_dir or 'desc' }}"
+            aria-label="정렬 방향 전환">{{ '▲' if (cur_dir or 'desc') == 'asc' else '▼' }}</button>
   </div>
-  {# 더 있으면 관찰용 센티넬 — 뷰포트에 닿으면 다음 배치를 /dates/more로 당겨온다.
-     페이지네이션 UI는 두지 않는다(하단 내비 알약이 이미 하단을 무겁게 함). #}
-  {% if has_more %}<div id="dates-sentinel" aria-hidden="true"></div>{% endif %}
-{% endif %}
+</div>
+
+{# 그리드는 항상 존재한다(빈 상태도 이 안에 들어간다). 클라가 칩/정렬 전환 시
+   내용만 교체한다. #}
+<div class="event-list" id="dates-list">
+  {% if items %}
+    {% include "_date_cards.html" %}
+  {% elif (cur_cat or '전체') == '팝업' %}
+    <div class="card center-card">
+      <img class="emoji hero" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+      <p class="muted">팝업 정보는 곧 자동으로 모아올게 🛍️</p>
+    </div>
+  {% else %}
+    <div class="card center-card">
+      <img class="emoji hero" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+      <p class="muted">아직 모아온 행사가 없어 — 매일 밤 자동으로 새 전시·행사를 담아올게 💫</p>
+    </div>
+  {% endif %}
+</div>
+{# 무한스크롤 센티넬 — 항상 두고, 클라가 상태(done)로 제어한다(필터 전환 시
+   재무장하기 쉽게 DOM에서 제거하지 않는다). #}
+<div id="dates-sentinel" aria-hidden="true"></div>
 
 <script>
 (function () {
   var grid = document.getElementById('dates-list');
+  if (!grid) return;
+  var sentinel = document.getElementById('dates-sentinel');
+  var chipbar = document.getElementById('dates-chipbar');
+  var sortSel = document.getElementById('dates-sort');
+  var dirBtn = document.getElementById('dates-dir');
 
-  // 썸네일 스켈레톤 보정 — onload가 핸들러 부착 전 발화(브라우저 캐시)했을 수 있어
-  // complete 상태를 훑어 로드/실패 클래스를 보정한다. 초기·추가 로드 모두 재사용.
+  var BATCH_EMPTY_POPUP = '팝업 정보는 곧 자동으로 모아올게 🛍️';
+  var BATCH_EMPTY_GENERIC = '이 카테고리엔 아직 모아온 행사가 없어 — 매일 밤 자동으로 담아올게 💫';
+  var EMOJI_SRC = "{{ url_for('static', filename='emoji/date_calendar.svg') }}";
+
+  // ---- 클라 상태 ----
+  var state = {
+    cat: (chipbar && chipbar.querySelector('.chip-filter.active')
+            ? chipbar.querySelector('.chip-filter.active').getAttribute('data-cat') : '전체'),
+    sort: (sortSel ? sortSel.value : 'score'),
+    dir: (dirBtn ? (dirBtn.getAttribute('data-dir') || 'desc') : 'desc'),
+    rendered: grid.querySelectorAll('.event-item').length,
+    loading: false,
+    done: false,
+    gen: 0            // 세대 토큰 — 필터 전환 시 증가시켜 stale 콜백을 무시한다
+  };
+
+  function moreUrl(offset) {
+    return '/dates/more?offset=' + offset
+      + '&cat=' + encodeURIComponent(state.cat)
+      + '&sort=' + encodeURIComponent(state.sort)
+      + '&dir=' + encodeURIComponent(state.dir);
+  }
+
+  // 썸네일 스켈레톤 보정 — 초기·추가 로드 모두 재사용.
   function initEventImages(root) {
     var imgs = (root || document).querySelectorAll('.event-img');
     imgs.forEach(function (img) {
@@ -41,13 +97,17 @@
   }
   initEventImages(document);
 
-  if (!grid) return;
-
-  // ---- 무한 스크롤: 센티넬이 보이면 다음 배치를 붙인다(페이지네이션 X) ----
-  var sentinel = document.getElementById('dates-sentinel');
-  // 이미 그려진 카드 수 = 다음 요청 offset. dedupe로 실제 붙은 수만 증가시킨다.
-  var rendered = grid.querySelectorAll('.event-item').length;
-  var loading = false, done = false;
+  function emptyCard(cat) {
+    var msg = (cat === '팝업') ? BATCH_EMPTY_POPUP : BATCH_EMPTY_GENERIC;
+    var wrap = document.createElement('div');
+    wrap.className = 'card center-card';
+    var img = document.createElement('img');
+    img.className = 'emoji hero'; img.src = EMOJI_SRC; img.alt = '';
+    var p = document.createElement('p');
+    p.className = 'muted'; p.textContent = msg;
+    wrap.appendChild(img); wrap.appendChild(p);
+    return wrap;
+  }
 
   function seenIds() {
     var set = {};
@@ -57,43 +117,76 @@
     return set;
   }
 
-  function loadMore() {
-    if (loading || done || !sentinel) return;
-    loading = true;
-    fetch('/dates/more?offset=' + rendered, { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.text() : ''; })
-      .then(function (html) {
-        var tmp = document.createElement('div');
-        tmp.innerHTML = html;
-        var cards = tmp.querySelectorAll('.event-item');
-        if (!cards.length) {  // 빈 조각 → 더 없음
-          done = true;
-          if (sentinel) { observer.disconnect(); sentinel.remove(); }
-          return;
-        }
-        var seen = seenIds();
-        var appended = 0;
-        cards.forEach(function (card) {
-          var id = card.getAttribute('data-id');
-          if (seen[id]) return;   // 정렬이 살짝 밀려 겹쳐도 id로 중복 제거
-          seen[id] = true;
-          grid.appendChild(card);
-          appended++;
-        });
-        initEventImages(grid);  // 새로 붙은 이미지 스켈레톤 재배선
-        rendered += appended;
-        loading = false;
-        // 센티넬이 여전히 보이면(짧은 배치) 곧바로 다음 배치를 이어 당긴다.
-        if (sentinel && observer && isVisible(sentinel)) loadMore();
-      })
-      .catch(function () { loading = false; });  // 방어적 — 조용히 무시
-  }
-
   function isVisible(el) {
+    if (!el) return false;
     var r = el.getBoundingClientRect();
     return r.top < (window.innerHeight || document.documentElement.clientHeight);
   }
 
+  // ---- 다음 배치 붙이기(무한스크롤) — 현재 cat/sort/dir 파라미터 포함 ----
+  function loadMore() {
+    if (state.loading || state.done || !sentinel) return;
+    var myGen = state.gen;
+    state.loading = true;
+    fetch(moreUrl(state.rendered), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (html) {
+        if (myGen !== state.gen) return;  // 필터가 바뀐 뒤 온 stale 응답 — 무시
+        var tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        var cards = tmp.querySelectorAll('.event-item');
+        if (!cards.length) { state.done = true; return; }  // 빈 조각 → 더 없음
+        var seen = seenIds();
+        var appended = 0;
+        cards.forEach(function (card) {
+          var id = card.getAttribute('data-id');
+          if (seen[id]) return;             // id로 중복 제거
+          seen[id] = true;
+          grid.appendChild(card);
+          appended++;
+        });
+        initEventImages(grid);              // 새로 붙은 이미지 스켈레톤 재배선
+        state.rendered += appended;
+        state.loading = false;
+        if (isVisible(sentinel)) loadMore(); // 짧은 배치면 곧바로 이어 당김
+      })
+      .catch(function () { if (myGen === state.gen) state.loading = false; });
+  }
+
+  // ---- 필터/정렬 전환: 그리드 리셋 + 첫 배치를 fetch로만 교체(새로고침 X) ----
+  function resetAndLoad() {
+    state.gen++;                            // 진행 중 콜백/폴링 무효화
+    var myGen = state.gen;
+    state.rendered = 0;
+    state.done = false;
+    state.loading = true;
+    grid.innerHTML = '';                    // 카드 전부 제거
+    fetch(moreUrl(0), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (html) {
+        if (myGen !== state.gen) return;    // 더 최신 전환이 왔으면 무시
+        var tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        var cards = tmp.querySelectorAll('.event-item');
+        if (!cards.length) {                // 빈 결과 → 카테고리별 빈 상태 표시
+          grid.appendChild(emptyCard(state.cat));
+          state.done = true;
+          state.loading = false;
+          return;
+        }
+        var frag = document.createDocumentFragment();
+        cards.forEach(function (card) { frag.appendChild(card); });
+        grid.appendChild(frag);
+        state.rendered = grid.querySelectorAll('.event-item').length;
+        state.loading = false;
+        initEventImages(grid);
+        startPolling();                     // 점수 폴링 재시작
+        if (isVisible(sentinel)) loadMore(); // 첫 화면이 짧으면 이어 당김
+      })
+      .catch(function () { if (myGen === state.gen) state.loading = false; });
+  }
+
+  // ---- IntersectionObserver 센티넬(항상 관찰; done/loading 가드로 제어) ----
   var observer = null;
   if (sentinel && 'IntersectionObserver' in window) {
     observer = new IntersectionObserver(function (entries) {
@@ -102,8 +195,8 @@
     observer.observe(sentinel);
   }
 
-  // ---- 점수 칩 제자리 갱신: pending/none 카드가 있으면 폴링(전체 새로고침 X) ----
-  var pollTries = 0, POLL_MAX = 20;
+  // ---- 점수 칩 제자리 갱신: pending/none 카드가 있으면 폴링(세대 토큰으로 정리) ----
+  var POLL_MAX = 20;
 
   function pendingIds() {
     var ids = [];
@@ -141,22 +234,67 @@
     }
   }
 
-  function pollScores() {
-    if (pollTries++ >= POLL_MAX) return;
+  function pollScores(myGen, tries) {
+    if (myGen !== state.gen) return;        // 필터가 바뀌었으면 이 폴링 사슬 종료
+    if (tries >= POLL_MAX) return;
     var ids = pendingIds();
-    if (!ids.length) return;  // 다 채워짐 — 폴링 종료
+    if (!ids.length) return;                // 다 채워짐 — 종료
     fetch('/dates/scores?ids=' + ids.join(','), { credentials: 'same-origin' })
       .then(function (r) { return r.ok ? r.json() : {}; })
       .then(function (data) {
+        if (myGen !== state.gen) return;
         Object.keys(data).forEach(function (id) {
           var card = grid.querySelector('.event-item[data-id="' + id + '"]');
           if (card) applyScore(card, data[id]);
         });
-        if (pendingIds().length) setTimeout(pollScores, 6000);  // 남았으면 계속
+        if (pendingIds().length) setTimeout(function () { pollScores(myGen, tries + 1); }, 6000);
       })
-      .catch(function () { setTimeout(pollScores, 6000); });  // 방어적 — 재시도
+      .catch(function () {
+        if (myGen === state.gen) setTimeout(function () { pollScores(myGen, tries + 1); }, 6000);
+      });
   }
-  if (pendingIds().length) setTimeout(pollScores, 6000);
+
+  function startPolling() {
+    var myGen = state.gen;
+    if (pendingIds().length) setTimeout(function () { pollScores(myGen, 0); }, 6000);
+  }
+
+  // ---- 컨트롤 배선 ----
+  if (chipbar) {
+    chipbar.addEventListener('click', function (e) {
+      var btn = e.target.closest('.chip-filter');
+      if (!btn) return;
+      var cat = btn.getAttribute('data-cat');
+      if (cat === state.cat) return;
+      state.cat = cat;
+      chipbar.querySelectorAll('.chip-filter').forEach(function (b) {
+        var on = (b === btn);
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      resetAndLoad();
+    });
+  }
+  if (sortSel) {
+    sortSel.addEventListener('change', function () {
+      if (sortSel.value === state.sort) return;
+      state.sort = sortSel.value;
+      resetAndLoad();
+    });
+  }
+  if (dirBtn) {
+    dirBtn.addEventListener('click', function () {
+      state.dir = (state.dir === 'desc') ? 'asc' : 'desc';
+      dirBtn.setAttribute('data-dir', state.dir);
+      dirBtn.textContent = (state.dir === 'asc') ? '▲' : '▼';
+      resetAndLoad();
+    });
+  }
+
+  // 초기 로드: 서버가 그린 첫 배치가 이미 있다. 폴링만 시작하고, 센티넬이
+  // 이미 보이면 이어 당긴다.
+  startPolling();
+  if (isVisible(sentinel)) loadMore();
 })();
 </script>
 {% endblock %}
