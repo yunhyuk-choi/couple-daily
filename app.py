@@ -1171,9 +1171,26 @@ def refresh_popups_worker(app):
                 db.session.rollback()
                 log.exception("popup expiry delete failed")
 
+            # 무기한(end_date NULL) 팝업 안전 만료: 종료일을 못 뽑은 팝업은
+            # 21일 넘게 묵으면 지운다(무기한 잔류 방지). dedupe upsert는 그대로.
+            stale_deleted = 0
+            try:
+                cutoff = datetime.utcnow() - timedelta(days=21)
+                stale_deleted = (
+                    EventItem.query.filter(
+                        EventItem.source == "popup",
+                        EventItem.end_date.is_(None),
+                        EventItem.created_at < cutoff,
+                    ).delete(synchronize_session=False)
+                )
+                db.session.commit()
+            except Exception:  # noqa: BLE001
+                db.session.rollback()
+                log.exception("popup stale(undated) expiry delete failed")
+
             log.info(
-                "popup refresh done: fetched=%s upserted=%s expired=%s",
-                fetched, upserted, expired_deleted,
+                "popup refresh done: fetched=%s upserted=%s expired=%s stale=%s",
+                fetched, upserted, expired_deleted, stale_deleted,
             )
     except Exception:  # noqa: BLE001 — 스레드 밖으로 절대 raise 금지
         log.exception("refresh_popups_worker failed")

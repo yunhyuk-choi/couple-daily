@@ -16,6 +16,7 @@
 import hashlib
 import logging
 import os
+import re
 from datetime import date
 
 import requests
@@ -270,11 +271,75 @@ def popups_enabled() -> bool:
     return True
 
 
+# 기간 문자열에서 날짜 토큰을 뽑기 위한 범위 구분자(다양한 대시·물결).
+_PERIOD_SEPS = ("~", "〜", "～", "–", "—", " - ", " ~ ")
+
+
+def _parse_loose_date(token, default_year):
+    """'8/1', '2026.08.01', '2026-08-01', '8월 1일' 류 토큰 하나를 date로(관대).
+
+    연도가 없으면 default_year를 가정한다. 실패 시 None."""
+    if not token:
+        return None
+    s = str(token).strip()
+    if not s:
+        return None
+    # 먼저 연도까지 있는 완전한 ISO/점/슬래시 형식은 기존 _parse_date로.
+    full = _parse_date(s)
+    if full is not None:
+        return full
+    # 'M월 D일' → 'M/D'
+    m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", s)
+    if m:
+        mo, da = int(m.group(1)), int(m.group(2))
+    else:
+        # 'M/D' 또는 'M.D' (연도 없음) — 앞의 두 숫자를 월/일로.
+        m = re.search(r"(\d{1,2})[./](\d{1,2})", s)
+        if not m:
+            return None
+        mo, da = int(m.group(1)), int(m.group(2))
+    try:
+        return date(default_year, mo, da)
+    except ValueError:
+        return None
+
+
+def _parse_period(period):
+    """자유 텍스트 기간 문자열 → (start_date, end_date) 관대 파싱. 실패분은 None.
+
+    '8/1~8/14', '2026.08.01 ~ 2026.08.31', '8월 1일 - 8월 14일' 등을 처리한다.
+    범위 구분자로 좌/우를 나눠 왼쪽=시작, 오른쪽=종료로 본다. 연도가 없으면
+    올해로 가정한다. 구분자가 없으면 하나의 날짜로 보고 시작만 채운다."""
+    if not period:
+        return None, None
+    s = str(period).strip()
+    if not s:
+        return None, None
+    year = date.today().year
+
+    left, right = s, None
+    for sep in _PERIOD_SEPS:
+        if sep in s:
+            parts = s.split(sep, 1)
+            left, right = parts[0], parts[1]
+            break
+    else:
+        # 공백 없는 순수 대시 범위('8/1-8/14')도 시도(ISO 'YYYY-MM-DD'는 위에서 통과).
+        if _parse_date(s) is None and s.count("-") == 1:
+            left, right = s.split("-", 1)
+
+    start = _parse_loose_date(left, year)
+    end = _parse_loose_date(right, year) if right else None
+    return start, end
+
+
 def _normalize_popup(entry):
     """claude가 준 팝업 dict 하나 → 서울 페처와 같은 모양의 EventItem용 dict.
 
-    제목(name) 없으면 None. 날짜는 관대하게 파싱하고 모르면 None. category는
-    '팝업'으로 고정해 event_category_bucket이 '팝업'을 돌려주게 한다."""
+    제목(name) 없으면 None. category는 '팝업'으로 고정해 event_category_bucket이
+    '팝업'을 돌려주게 한다. 날짜는 관대하게: end_date 필드를 먼저 파싱하고, 없으면
+    period 문자열의 오른쪽(종료)에서, start_date는 period 왼쪽(시작)에서 best-effort로
+    뽑는다. 별도 desc가 없으면 period 텍스트를 설명으로 쓴다."""
     if not isinstance(entry, dict):
         return None
     title = (entry.get("name") or "").strip()
@@ -283,8 +348,15 @@ def _normalize_popup(entry):
     place = (entry.get("place") or "").strip() or None
     link = (entry.get("link") or "").strip() or None
     desc = (entry.get("desc") or "").strip() or None
-    start_date = _parse_date(entry.get("start_date"))
-    end_date = _parse_date(entry.get("end_date"))
+    period = (entry.get("period") or "").strip() or None
+
+    # period에서 best-effort 시작/종료를 뽑고, 명시 end_date가 있으면 그걸 우선.
+    p_start, p_end = _parse_period(period)
+    end_date = _parse_date(entry.get("end_date")) or p_end
+    start_date = _parse_date(entry.get("start_date")) or p_start
+    # 별도 설명이 없으면 기간 텍스트라도 설명으로 남겨 카드가 비지 않게.
+    description = desc or period
+
     # 소스에 id가 없어 title|place의 sha1을 안정적 dedupe 키로.
     source_uid = hashlib.sha1(f"{title}|{place or ''}".encode("utf-8")).hexdigest()
     return {
@@ -292,7 +364,7 @@ def _normalize_popup(entry):
         "source_uid": source_uid,
         "title": title[:300],
         "category": "팝업",  # event_category_bucket이 '팝업' 버킷을 돌려줌
-        "description": desc,
+        "description": description,
         "place": place[:200] if place else None,
         "district": None,
         "image_url": None,
@@ -304,33 +376,37 @@ def _normalize_popup(entry):
     }
 
 
-def fetch_popups(max_items=10):
+def fetch_popups(max_items=5):
     """claude 웹검색으로 서울의 실제 팝업스토어를 찾아 정규화 dict 리스트로 반환.
 
-    백그라운드 전용(네트워크+claude). 어떤 실패/타임아웃/파싱 에러에도 예외를
-    밖으로 던지지 않는다 — []를 반환해 피드가 우아하게 degrade하도록 한다."""
+    백그라운드 전용(네트워크+claude). 프롬프트는 '가볍게' 유지한다 — 정확한 ISO
+    날짜 검증을 강요하면 웹검색이 너무 오래 걸려(240s 타임아웃) 실측했다. 그래서
+    기간은 자유 텍스트(period)로 받고 종료일만 '이미 명백하면' ISO로 받는다. 어떤
+    실패/타임아웃/파싱 에러에도 예외를 밖으로 던지지 않는다 — []를 반환해 피드가
+    우아하게 degrade하도록 한다."""
     try:
         n = int(max_items or 0)
     except (TypeError, ValueError):
-        n = 10
+        n = 5
     if n <= 0:
-        n = 10
+        n = 5
 
     today = date.today().isoformat()
     prompt = (
         "너는 서울의 '팝업스토어' 정보를 모으는 도우미야. 반드시 웹 검색을 사용해서 "
         f"(오늘 날짜: {today}) 지금 서울에서 실제로 '열려 있거나 곧 여는' 팝업스토어를 "
-        f"최대 {n}개 찾아줘.\n\n"
+        f"최대 {n}개만 찾아줘.\n\n"
         "규칙(아주 중요):\n"
         "- 반드시 실제로 웹을 검색해서 확인된 것만 담아. 절대 지어내지 마.\n"
         "- 이미 종료된(기간이 지난) 팝업은 제외해.\n"
         "- 전시·공연·페스티벌 말고 '팝업스토어'만. 확실하지 않으면 그냥 빼.\n"
         "- 각 항목의 링크(link)는 실제 예약·안내 페이지나 출처 URL로.\n"
-        "- 날짜를 정확히 모르면 그 날짜 필드는 빈 문자열로 둬(지어내지 마).\n\n"
-        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이. 날짜는 ISO "
-        "(YYYY-MM-DD), 모르면 빈 문자열:\n"
-        '{"popups":[{"name":"","place":"","start_date":"YYYY-MM-DD",'
-        '"end_date":"YYYY-MM-DD","link":"","desc":""}]}'
+        "- period는 검색 결과에 보이는 기간을 '그대로' 자유롭게 적어(예: '8/1~8/14', "
+        "'8월 중순까지'). 날짜를 정확히 맞추려고 추가 검색으로 시간 쓰지 마.\n"
+        "- end_date는 검색 결과에서 종료일이 '이미 명백할 때만' YYYY-MM-DD로 적고, "
+        "아니면 빈 문자열로 둬(확인하려 추가 검색하지 마).\n\n"
+        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+        '{"popups":[{"name":"","place":"","period":"","link":"","end_date":""}]}'
     )
 
     try:
