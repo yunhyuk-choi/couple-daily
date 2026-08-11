@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}내기 · {{ app_name }}{% endblock %}
+{% block content %}
+{# 캘린더 '내기' 목록 — 습관 내기(주 N회). 진행 중 먼저, 종료 나중.
+   각 내기는 대상·이번 주 진행·오늘 달성 토글·벌칙을 보여준다. #}
+<div class="cal-nav">
+  <h1 class="cal-title">내기 🔥</h1>
+  <a class="btn primary sm" href="{{ url_for('bet_new') }}">+ 내기 추가</a>
+</div>
+
+{% if not rows %}
+<div class="card center">
+  <p class="muted">아직 만든 내기가 없어.<br />“일주일에 N번 같이 해보자” 하는 습관 내기를 만들어봐! 🌱</p>
+  <a class="btn primary" href="{{ url_for('bet_new') }}">첫 내기 만들기</a>
+</div>
+{% else %}
+<ul class="bet-list">
+  {% for r in rows %}
+  {% set b = r.bet %}
+  <li class="bet-card{% if b.status == 'ended' %} is-ended{% endif %}">
+    <a class="bet-card-main" href="{{ url_for('bet_detail', bid=b.id) }}">
+      <div class="bet-card-head">
+        <span class="bet-title">{{ b.title }}</span>
+        {% if b.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+      </div>
+      <div class="bet-meta">
+        <span class="chip small">주 {{ b.count_target }}회</span>
+        <span class="chip small">{% if r.target_name %}{{ r.target_name }}{% else %}같이{% endif %}</span>
+      </div>
+      {% if r.progress.started %}
+      <div class="bet-progress">
+        {% for p in r.progress.participants %}
+        <span class="bet-prog-pill{% if p.met %} met{% endif %}">
+          {{ p.name }} {{ p.count }}/{{ p.target }}
+          {% if p.met %}✅{% endif %}
+        </span>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="bet-progress"><span class="muted small">{{ b.start_date.strftime('%m월 %d일') }} 시작 예정</span></div>
+      {% endif %}
+      {% if b.penalty %}<div class="bet-penalty muted small">벌칙 · {{ b.penalty }}</div>{% endif %}
+    </a>
+    {% if b.status == 'active' and r.is_participant %}
+    <form class="bet-checkin-form" method="post"
+          action="{{ url_for('bet_checkin', bid=b.id) }}">
+      <input type="hidden" name="next" value="{{ url_for('calendar_bets') }}" />
+      {% if r.done_today %}
+      <button class="btn ghost sm bet-done" type="submit">오늘 달성함 ✓</button>
+      {% else %}
+      <button class="btn primary sm" type="submit">오늘 달성</button>
+      {% endif %}
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

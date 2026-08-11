@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}{{ bet.title }} · {{ app_name }}{% endblock %}
+{% block content %}
+{# 내기 상세 — 대상·시작일·벌칙 + 이번 주 요일 체크 + 지난 주 요약 + 관리 버튼. #}
+<div class="page-head">
+  <span class="hero-sm" aria-hidden="true" style="font-size:1.6rem">🔥</span>
+  <h1>내기</h1>
+</div>
+
+<article class="card">
+  <div class="bet-detail-head">
+    <h2 style="margin:0">{{ bet.title }}</h2>
+    {% if bet.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+  </div>
+  <div class="bet-meta" style="margin-top:8px">
+    <span class="chip small">주 {{ bet.count_target }}회</span>
+    <span class="chip small">{% if target_name %}{{ target_name }}{% else %}같이{% endif %}</span>
+    <span class="chip small">시작 {{ bet.start_date.strftime('%Y.%m.%d') }}</span>
+  </div>
+  {% if bet.description %}
+  <p class="muted small" style="white-space:pre-wrap;margin:12px 0 0">{{ bet.description }}</p>
+  {% endif %}
+  {% if bet.penalty %}
+  <p class="bet-penalty" style="margin:10px 0 0">🎯 벌칙 · {{ bet.penalty }}</p>
+  {% endif %}
+
+  {% if bet.status == 'active' and is_participant %}
+  <form class="bet-checkin-form" method="post" style="margin-top:14px"
+        action="{{ url_for('bet_checkin', bid=bet.id) }}">
+    <input type="hidden" name="next" value="{{ url_for('bet_detail', bid=bet.id) }}" />
+    {% if done_today %}
+    <button class="btn ghost bet-done" type="submit">오늘 달성함 ✓ (취소)</button>
+    {% else %}
+    <button class="btn primary" type="submit">오늘 달성 🔥</button>
+    {% endif %}
+  </form>
+  {% endif %}
+</article>
+
+{# 이번 주 창(롤링) — 참여자별 7일 체크 #}
+<article class="card">
+  <h3 class="bet-section-title">이번 주
+    <span class="muted small">
+      {{ progress.week_start.strftime('%m.%d') }} ~ {{ progress.week_end.strftime('%m.%d') }}
+    </span>
+  </h3>
+  {% if not progress.started %}
+  <p class="muted small">아직 시작 전이야 — {{ bet.start_date.strftime('%m월 %d일') }}부터 시작해.</p>
+  {% else %}
+  {% for row in week_rows %}
+  <div class="bet-week-row">
+    <div class="bet-week-name">
+      {{ row.p.name }}
+      <span class="bet-prog-pill{% if row.p.met %} met{% endif %}">
+        {{ row.p.count }}/{{ row.p.target }} {% if row.p.met %}✅{% else %}진행중{% endif %}
+      </span>
+    </div>
+    <div class="bet-week-cells">
+      {% for c in row.cells %}
+      <span class="bet-day{% if c.checked %} on{% endif %}{% if c.is_today %} today{% endif %}"
+            title="{{ c.date.strftime('%m.%d') }}">
+        {% if c.checked %}🔥{% else %}{{ c.date.day }}{% endif %}
+      </span>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+</article>
+
+{# 지난 주 요약(최근 ~8주) #}
+{% if past %}
+<article class="card">
+  <h3 class="bet-section-title">지난 주 기록</h3>
+  <ul class="bet-past-list">
+    {% for w in past %}
+    <li class="bet-past-row">
+      <span class="bet-past-week muted small">
+        {{ w.week_start.strftime('%m.%d') }}~{{ w.week_end.strftime('%m.%d') }}
+      </span>
+      <span class="bet-past-parts">
+        {% for p in w.participants %}
+        <span class="bet-prog-pill{% if p.met %} met{% else %} miss{% endif %}">
+          {{ p.name }} {{ p.count }}/{{ p.target }} {% if p.met %}지킴{% else %}못지킴{% endif %}
+        </span>
+        {% endfor %}
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+</article>
+{% endif %}
+
+<div class="card">
+  <div class="pick-btns">
+    <a class="btn sm" href="{{ url_for('bet_edit', bid=bet.id) }}">수정</a>
+    <a class="btn ghost sm" href="{{ url_for('calendar_bets') }}">목록으로</a>
+    {% if bet.status == 'active' %}
+    <form method="post" action="{{ url_for('bet_end', bid=bet.id) }}"
+          onsubmit="return confirm('이 내기를 종료할까? 기록은 남아.');" style="margin:0">
+      <button class="btn ghost sm" type="submit">종료</button>
+    </form>
+    {% endif %}
+  </div>
+  <form method="post" action="{{ url_for('bet_delete', bid=bet.id) }}"
+        onsubmit="return confirm('이 내기를 삭제할까? 체크인 기록까지 사라져. 되돌릴 수 없어.');"
+        style="margin-top:12px">
+    <button class="btn ghost sm" type="submit">삭제</button>
+  </form>
+</div>
+{% endblock %}
