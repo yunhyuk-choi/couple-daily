@@ -21,6 +21,8 @@ CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
 # Vision (reading an image off disk) is markedly slower than a text prompt on
 # the 0.1-CPU free tier — give it generous headroom so it isn't killed mid-read.
 CAPTION_TIMEOUT = 180
+# 팝업 수집은 웹 검색(WebSearch/WebFetch)을 돌리므로 훨씬 느리다(~120s+).
+POPUP_TIMEOUT = 300
 
 # Gentle fallbacks used only if the CLI is unavailable / errors out.
 FALLBACK_QUESTIONS = [
@@ -32,14 +34,24 @@ FALLBACK_QUESTIONS = [
 ]
 
 
-def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT) -> str:
+def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
+                allow_web: bool = False) -> str:
     """Run `claude -p`, feeding the prompt via stdin. Returns raw stdout text.
+
+    ``allow_web=True`` grants the CLI web tools (``--allowedTools WebSearch
+    WebFetch``) so the prompt can search the live web. Default False keeps the
+    existing behavior UNCHANGED — used ONLY by the popup fetcher, nowhere else.
+    (프로덕션의 claude(CLAUDE_CODE_OAUTH_TOKEN)가 WebSearch를 허용해야 팝업이
+    실제로 채워진다 — 이 플래그로 동작함을 검증했다.)
 
     Raises RuntimeError on non-zero exit / timeout / missing binary.
     """
+    argv = ["claude", "-p"]
+    if allow_web:
+        argv += ["--allowedTools", "WebSearch", "WebFetch"]
     try:
         proc = subprocess.run(
-            ["claude", "-p"],
+            argv,
             input=prompt,
             capture_output=True,
             text=True,

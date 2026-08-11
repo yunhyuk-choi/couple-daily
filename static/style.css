@@ -1011,6 +1011,14 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .rec-chip.pending {
   background: var(--pink-soft); color: var(--pink);
 }
+/* AI(claude 웹검색) 출처 팝업 표식 — 은은하게, 앱 핑크 톤 유지 */
+.ai-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: var(--pink-soft); color: var(--pink);
+  padding: 3px 9px; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 700; white-space: nowrap;
+}
+.ai-source-note { margin: 6px 0 10px; line-height: 1.45; }
 .rec-reason {
   margin: 6px 0 0; line-height: 1.45;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
