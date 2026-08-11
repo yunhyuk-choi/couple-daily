@@ -1,0 +1,33 @@
+name: refresh-popups
+
+# 팝업스토어 피드를 밤마다 갱신(claude 웹검색으로 수집 → upsert + 만료 삭제).
+# 01:00 KST == 16:00 UTC. GitHub cron is always UTC.
+# 이벤트 갱신(00:00 KST)에서 한 시간 오프셋을 둬 겹치지 않게 한다.
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch: {}
+
+# Required repository secret:
+#   CRON_SECRET  — must exactly match the CRON_SECRET env var set on Render.
+# Optional repository variable:
+#   APP_URL      — override the target base URL (defaults to the Render app).
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger popups refresh
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ vars.APP_URL || 'https://couple-daily.onrender.com' }}
+        run: |
+          # Render free instances sleep after inactivity; the first request wakes
+          # them, which can take 30-60s. Use a generous timeout and retry once so
+          # a cold start doesn't cause a missed refresh. The endpoint returns
+          # immediately (spawns a background thread) — it does NOT block on claude.
+          set -e
+          curl --fail --show-error --silent \
+               --max-time 120 --retry 2 --retry-delay 30 --retry-all-errors \
+               -X POST \
+               -H "X-Cron-Secret: ${CRON_SECRET}" \
+               "${APP_URL}/internal/cron/refresh-popups"

@@ -22,6 +22,8 @@
     <div class="event-body">
       <div class="event-chips">
         {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+        {# 팝업은 claude 웹검색으로 모은 AI 출처 — 살짝 라벨링해 알려준다. #}
+        {% if item.source == 'popup' %}<span class="ai-chip">🛍️ AI 정보</span>{% endif %}
         {% if it.score_status == 'ready' and it.score is not none %}
           <span class="rec-chip">❤️ {{ it.score }}</span>
         {% elif it.score_status == 'pending' %}

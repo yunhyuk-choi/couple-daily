@@ -20,6 +20,8 @@ from datetime import date
 
 import requests
 
+import ai  # 팝업 수집만 claude(웹검색)를 쓴다 — 서울 페처는 여전히 AI 없음(P1)
+
 log = logging.getLogger(__name__)
 
 # 무료 인증키. 없으면 페처는 조용히 []를 반환하고 기능은 빈 상태로만 보인다.
@@ -251,4 +253,109 @@ def fetch_seoul_events(max_rows=1000):
         _consume(more)
         start += _BLOCK
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 팝업스토어 수집 — claude 웹검색(--allowedTools WebSearch WebFetch)
+# ---------------------------------------------------------------------------
+# 서울 문화행사 API엔 '팝업스토어'가 없다. 그래서 claude에게 실제 웹 검색을
+# 시켜 지금 서울에서 열려있거나 곧 여는 팝업을 찾아 EventItem(source='popup')로
+# 흘려보낸다. AI 출처라 UI에서 라벨링한다. 네트워크+claude 조합이라 느리고
+# (~120s+) 백그라운드 전용이다 — 절대 요청 경로에서 부르지 마.
+
+
+def popups_enabled() -> bool:
+    """팝업 수집은 별도 키가 필요 없다 — 이미 쓰는 claude 인증에만 의존한다."""
+    return True
+
+
+def _normalize_popup(entry):
+    """claude가 준 팝업 dict 하나 → 서울 페처와 같은 모양의 EventItem용 dict.
+
+    제목(name) 없으면 None. 날짜는 관대하게 파싱하고 모르면 None. category는
+    '팝업'으로 고정해 event_category_bucket이 '팝업'을 돌려주게 한다."""
+    if not isinstance(entry, dict):
+        return None
+    title = (entry.get("name") or "").strip()
+    if not title:
+        return None
+    place = (entry.get("place") or "").strip() or None
+    link = (entry.get("link") or "").strip() or None
+    desc = (entry.get("desc") or "").strip() or None
+    start_date = _parse_date(entry.get("start_date"))
+    end_date = _parse_date(entry.get("end_date"))
+    # 소스에 id가 없어 title|place의 sha1을 안정적 dedupe 키로.
+    source_uid = hashlib.sha1(f"{title}|{place or ''}".encode("utf-8")).hexdigest()
+    return {
+        "source": "popup",
+        "source_uid": source_uid,
+        "title": title[:300],
+        "category": "팝업",  # event_category_bucket이 '팝업' 버킷을 돌려줌
+        "description": desc,
+        "place": place[:200] if place else None,
+        "district": None,
+        "image_url": None,
+        "link": link,
+        "fee": None,
+        "is_free": None,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
+def fetch_popups(max_items=10):
+    """claude 웹검색으로 서울의 실제 팝업스토어를 찾아 정규화 dict 리스트로 반환.
+
+    백그라운드 전용(네트워크+claude). 어떤 실패/타임아웃/파싱 에러에도 예외를
+    밖으로 던지지 않는다 — []를 반환해 피드가 우아하게 degrade하도록 한다."""
+    try:
+        n = int(max_items or 0)
+    except (TypeError, ValueError):
+        n = 10
+    if n <= 0:
+        n = 10
+
+    today = date.today().isoformat()
+    prompt = (
+        "너는 서울의 '팝업스토어' 정보를 모으는 도우미야. 반드시 웹 검색을 사용해서 "
+        f"(오늘 날짜: {today}) 지금 서울에서 실제로 '열려 있거나 곧 여는' 팝업스토어를 "
+        f"최대 {n}개 찾아줘.\n\n"
+        "규칙(아주 중요):\n"
+        "- 반드시 실제로 웹을 검색해서 확인된 것만 담아. 절대 지어내지 마.\n"
+        "- 이미 종료된(기간이 지난) 팝업은 제외해.\n"
+        "- 전시·공연·페스티벌 말고 '팝업스토어'만. 확실하지 않으면 그냥 빼.\n"
+        "- 각 항목의 링크(link)는 실제 예약·안내 페이지나 출처 URL로.\n"
+        "- 날짜를 정확히 모르면 그 날짜 필드는 빈 문자열로 둬(지어내지 마).\n\n"
+        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이. 날짜는 ISO "
+        "(YYYY-MM-DD), 모르면 빈 문자열:\n"
+        '{"popups":[{"name":"","place":"","start_date":"YYYY-MM-DD",'
+        '"end_date":"YYYY-MM-DD","link":"","desc":""}]}'
+    )
+
+    try:
+        raw = ai._run_claude(prompt, timeout=ai.POPUP_TIMEOUT, allow_web=True)
+    except Exception as e:  # noqa: BLE001 — claude 실패는 팝업 없음으로 degrade
+        log.warning("popup fetch: claude run failed: %s", e)
+        return []
+
+    # 디버깅용으로 원본 출력을 한 번 남긴다(필드/스키마 대조).
+    log.info("popup fetch raw output: %s", (raw or "")[:2000])
+
+    try:
+        data = ai._extract_json(raw)
+    except Exception as e:  # noqa: BLE001
+        log.warning("popup fetch: JSON parse failed: %s", e)
+        return []
+
+    raw_popups = data.get("popups") if isinstance(data, dict) else None
+    if not isinstance(raw_popups, list):
+        log.warning("popup fetch: no popups array in output")
+        return []
+
+    out = []
+    for entry in raw_popups[:n]:
+        item = _normalize_popup(entry)
+        if item:
+            out.append(item)
     return out
