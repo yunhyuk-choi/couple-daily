@@ -54,6 +54,7 @@ from models import (
     Comment,
     Couple,
     DailyQuestion,
+    DateRecommendation,
     EventItem,
     EventPick,
     EventScore,
@@ -1050,6 +1051,197 @@ def _spawn_scoring_if_idle(app, couple_id):
         log.exception("failed to spawn scoring thread for couple %s", couple_id)
 
 
+# --------------------------------------------------------------------------- #
+# 데이트 뉴스 '추천받기' (P4) — 온디맨드 비동기 AI 맞춤 데이트 추천(팝업 포함)
+# --------------------------------------------------------------------------- #
+# 채점 워커와 같은 규율: 자기 app_context(→ 새 스레드로컬 세션)를 열고, 캡션·채점과
+# 공유하는 _CAPTION_SEM으로 claude 콜을 직렬화하고(512MB: 동시에 claude 하나만),
+# 모든 예외를 삼키며 스레드 밖으로 절대 raise 안 하고, finally에서 가드를 해제한다.
+# 커플당 in-process 가드 집합으로 중복 실행을 막는다.
+_recommending_lock = threading.Lock()
+_recommending: set[int] = set()
+_RECO_CANDIDATES = 20  # claude에 넘길 현재 피드 후보 상한
+
+
+def recommend_dates_for_couple(app, couple_id):
+    """백그라운드 워커: 이 커플의 현재 피드에서 맞춤 데이트 하나를 추천한다.
+
+    DateRecommendation 행을 'pending'으로 보장 → 취향 프로필 1회 조립 → 현재
+    진행 중(만료 안 된) 행사 최대 20개를 후보로(EventScore 높은 순 우선, 팝업 포함)
+    모아 _CAPTION_SEM 안에서 ai.recommend_dates를 '한 번' 호출한다. 성공하면
+    message + picks_json + status='ready', 실패하면 status='failed'(단, 직전
+    ready 추천이 있으면 그걸 그대로 유지). 커밋은 rollback 가드. 절대 raise 안 하고
+    finally에서 가드 키를 해제한다.
+    """
+    with _recommending_lock:
+        if couple_id in _recommending:
+            return  # 이미 이 커플 추천 생성 중 — 겹치지 않게
+        _recommending.add(couple_id)
+
+    try:
+        with app.app_context():
+            try:
+                couple = db.session.get(Couple, couple_id)
+                if couple is None:
+                    return
+
+                # 최신 추천 행을 'pending'으로 보장. 직전 ready 여부/내용을 먼저
+                # 보관해 두어(실패 시 유지용) 덮어쓰기 전에 캡처한다.
+                rec = DateRecommendation.query.filter_by(
+                    couple_id=couple_id
+                ).first()
+                prior_ready = (
+                    rec is not None and rec.status == "ready" and bool(rec.message)
+                )
+                prior_message = rec.message if rec is not None else None
+                prior_picks = rec.picks_json if rec is not None else None
+                if rec is None:
+                    rec = DateRecommendation(couple_id=couple_id, status="pending")
+                    db.session.add(rec)
+                else:
+                    rec.status = "pending"
+                    rec.updated_at = datetime.utcnow()
+                try:
+                    db.session.commit()
+                except IntegrityError:
+                    # 동시 요청이 행을 먼저 만들었을 수 있음 — 재조회.
+                    db.session.rollback()
+                    rec = DateRecommendation.query.filter_by(
+                        couple_id=couple_id
+                    ).first()
+                    if rec is None:
+                        return
+
+                # 취향 프로필(비-AI) 1회.
+                profile_text = build_couple_taste_profile(couple)
+
+                # 현재(만료 안 된) 행사 + 이 커플 점수 LEFT JOIN → EventScore가
+                # ready·높은 점수 먼저 오도록 정렬해 상위 후보를 고른다(팝업 포함).
+                today = date.today()
+                rows = (
+                    db.session.query(EventItem, EventScore)
+                    .outerjoin(
+                        EventScore,
+                        db.and_(
+                            EventScore.event_id == EventItem.id,
+                            EventScore.couple_id == couple_id,
+                        ),
+                    )
+                    .filter(
+                        db.or_(
+                            EventItem.end_date.is_(None),
+                            EventItem.end_date >= today,
+                        )
+                    )
+                    .all()
+                )
+
+                def _cand_key(row):
+                    _ev, sc = row
+                    # ready 점수가 높은 것 우선(-score), 나머지는 뒤로(-(-1)=1).
+                    s = (
+                        sc.score
+                        if (sc is not None and sc.status == "ready" and sc.score is not None)
+                        else -1
+                    )
+                    return -s
+                rows.sort(key=_cand_key)
+
+                candidates = []
+                for ev, sc in rows[:_RECO_CANDIDATES]:
+                    candidates.append(
+                        {
+                            "ref": ev.id,
+                            "title": ev.title,
+                            "category": ev.category,
+                            "place": ev.place,
+                            "description": ev.description,
+                            "score": sc.score if sc is not None else None,
+                        }
+                    )
+
+                if not candidates:
+                    # 추천할 후보가 없음 — 직전 ready가 있으면 유지, 없으면 실패.
+                    rec = DateRecommendation.query.filter_by(
+                        couple_id=couple_id
+                    ).first()
+                    if rec is not None:
+                        rec.status = "ready" if prior_ready else "failed"
+                        rec.updated_at = datetime.utcnow()
+                        try:
+                            db.session.commit()
+                        except Exception:  # noqa: BLE001
+                            db.session.rollback()
+                    return
+
+                # 캡션·채점과 '같은' 세마포어로 claude 콜을 직렬화(512MB: 동시에
+                # claude 하나만). claude가 터져도 실패로만 취급.
+                _CAPTION_SEM.acquire()
+                try:
+                    try:
+                        result = ai.recommend_dates(profile_text, candidates)
+                    except Exception:  # noqa: BLE001 — claude가 스레드 죽이지 못하게
+                        log.exception(
+                            "claude date recommend raised (couple=%s)", couple_id
+                        )
+                        result = None
+                finally:
+                    _CAPTION_SEM.release()
+
+                # 결과 반영(행이 바뀌었을 수 있어 재조회).
+                rec = DateRecommendation.query.filter_by(
+                    couple_id=couple_id
+                ).first()
+                if rec is None:
+                    return
+                now = datetime.utcnow()
+                if result and result.get("message"):
+                    rec.message = result["message"]
+                    rec.picks_json = json.dumps(
+                        result.get("picks") or [], ensure_ascii=False
+                    )
+                    rec.status = "ready"
+                elif prior_ready:
+                    # 실패했지만 직전 ready 추천이 있으니 그걸 그대로 유지.
+                    rec.message = prior_message
+                    rec.picks_json = prior_picks
+                    rec.status = "ready"
+                else:
+                    rec.status = "failed"
+                rec.updated_at = now
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception(
+                        "commit failed for date recommendation (couple=%s)", couple_id
+                    )
+            except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
+                db.session.rollback()
+                log.exception(
+                    "recommend_dates_for_couple failed (couple=%s)", couple_id
+                )
+    finally:
+        with _recommending_lock:
+            _recommending.discard(couple_id)
+
+
+def _spawn_recommend_if_idle(app, couple_id):
+    """이 커플 추천 생성 백그라운드 스레드를 스폰(이미 진행 중이면 no-op).
+
+    _spawn_scoring_if_idle과 같은 패턴 — _recommending 가드로 중복을 떨군다.
+    best-effort, 절대 raise 안 함."""
+    with _recommending_lock:
+        if couple_id in _recommending:
+            return
+    try:
+        threading.Thread(
+            target=recommend_dates_for_couple, args=(app, couple_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — 추천은 best-effort
+        log.exception("failed to spawn recommend thread for couple %s", couple_id)
+
+
 # 선채점 커플당 하드 캡 — 워커 배치(≈24행)를 최대 이만큼 반복(≈480행)해
 # 부분 실패로 인한 폭주(무한 재선택)를 막는다.
 _PREWARM_MAX_BATCHES = 20
@@ -1388,6 +1580,44 @@ def _ordered_date_items(couple_id, user_id, cat=None, sort="score", direction="d
 
     items.sort(key=_rank)
     return items
+
+
+def _date_recommendation_payload(couple_id):
+    """이 커플 최신 '추천받기' 결과를 렌더/JSON 공용 dict로 만든다(순수 DB 읽기).
+
+    반환: ``{status, message, picks:[{event_id, title, why, image_url, category,
+    source}]}``. picks는 status=='ready'일 때만 채우고, 각 픽의 행사를 조회해
+    존재하지 않거나 만료된(end_date < 오늘) 픽은 떨군다. 행이 없으면 status
+    'none'. dates()·date_recommend_status()가 이 단일 원천을 공유한다."""
+    rec = DateRecommendation.query.filter_by(couple_id=couple_id).first()
+    if rec is None:
+        return {"status": "none", "message": None, "picks": []}
+    picks = []
+    if rec.status == "ready":
+        today = date.today()
+        for pk in rec.picks:
+            if not isinstance(pk, dict):
+                continue
+            ref = pk.get("ref")
+            if ref is None:
+                continue
+            ev = db.session.get(EventItem, ref)
+            if ev is None:
+                continue
+            # 더 이상 존재하지 않거나 만료된 행사는 픽에서 제외.
+            if ev.end_date is not None and ev.end_date < today:
+                continue
+            picks.append(
+                {
+                    "event_id": ev.id,
+                    "title": ev.title,
+                    "why": (pk.get("why") or ""),
+                    "image_url": ev.image_url,
+                    "category": ev.category,
+                    "source": ev.source,
+                }
+            )
+    return {"status": rec.status, "message": rec.message or "", "picks": picks}
 
 
 # --------------------------------------------------------------------------- #
@@ -2014,9 +2244,12 @@ def _register_routes(app: Flask):
         render does NO network I/O; it's a pure DB read.
         """
         u = current_user()
+        # 데이트 '다녀왔어'에서 넘어오면 caption 프리필 힌트(행사 제목)를 받는다.
+        compose_hint = (request.args.get("compose") or "").strip()[:1000]
         if not onedrive.onedrive_enabled():
             return render_template(
-                "memories.html", enabled=False, reconnect=False, photos=[]
+                "memories.html", enabled=False, reconnect=False, photos=[],
+                compose_hint=compose_hint,
             )
 
         rows = (
@@ -2057,6 +2290,7 @@ def _register_routes(app: Flask):
             photos=photos,
             any_pending=any_pending,
             any_failed=any_failed,
+            compose_hint=compose_hint,
         )
 
     @app.route("/memories/search")
@@ -2754,6 +2988,10 @@ def _register_routes(app: Flask):
         if items and needs_scoring:
             _spawn_scoring_if_idle(current_app._get_current_object(), u.couple_id)
 
+        # 이미 준비된(ready) 추천이 있으면 첫 로드에서 패널을 바로 그린다.
+        rec_payload = _date_recommendation_payload(u.couple_id)
+        recommendation = rec_payload if rec_payload["status"] == "ready" else None
+
         # 첫 배치만 그리고, 더 있으면 센티넬을 띄운다(클라가 이어서 당겨온다).
         first = items[:_DATES_BATCH]
         has_more = len(items) > _DATES_BATCH
@@ -2761,10 +2999,49 @@ def _register_routes(app: Flask):
             "dates.html",
             items=first,
             has_more=has_more,
+            recommendation=recommendation,
             cur_cat=cat,
             cur_sort=sort,
             cur_dir=direction,
         )
+
+    @app.route("/dates/recommend", methods=["POST"])
+    @active_couple_required
+    def date_recommend():
+        """'✨ 추천받기' — 이 커플 추천을 pending으로 세팅하고 백그라운드 워커를
+        (가드로) 스폰한다. claude는 절대 여기(요청 경로)서 돌지 않는다 — 워커에서만.
+        FAB이 fetch로 치므로 JSON을 돌려준다."""
+        u = current_user()
+        rec = DateRecommendation.query.filter_by(couple_id=u.couple_id).first()
+        if rec is None:
+            rec = DateRecommendation(couple_id=u.couple_id, status="pending")
+            db.session.add(rec)
+        else:
+            rec.status = "pending"
+            rec.updated_at = datetime.utcnow()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            rec = DateRecommendation.query.filter_by(couple_id=u.couple_id).first()
+            if rec is not None:
+                rec.status = "pending"
+                rec.updated_at = datetime.utcnow()
+                db.session.commit()
+
+        # 백그라운드 워커 스폰(요청은 절대 블록 안 함). 중복은 _recommending 가드가 떨군다.
+        _spawn_recommend_if_idle(current_app._get_current_object(), u.couple_id)
+        return jsonify({"ok": True, "status": "pending"})
+
+    @app.route("/dates/recommend/status")
+    @active_couple_required
+    def date_recommend_status():
+        """이 커플 최신 추천 상태 JSON — FAB 패널 폴링용. 순수 DB 읽기(claude 없음).
+
+        {status, message, picks:[{event_id, title, why, image_url, category,
+        source}]}. 존재하지 않거나 만료된 픽은 떨군다."""
+        u = current_user()
+        return jsonify(_date_recommendation_payload(u.couple_id))
 
     @app.route("/dates/more")
     @active_couple_required
@@ -2935,6 +3212,30 @@ def _register_routes(app: Flask):
             return jsonify({"ok": False}), 404
         _upsert_pick(u, event_id, "dismissed")
         return jsonify(_pick_json(u, event_id))
+
+    @app.route("/dates/<int:event_id>/went", methods=["POST"])
+    @active_couple_required
+    def date_went(event_id):
+        """확정(둘 다 찜)된 데이트를 '다녀왔어'로 마감 → 추억 앨범으로 연결한다.
+
+        확정 상태일 때만 동작한다: 커플 두 사람 모두의 EventPick.status를
+        'visited'로 바꿔(활성 플랜/피드에서 빠짐) 추억 업로드 화면으로 보낸다 —
+        행사 제목을 caption 프리필 힌트로 넘겨(url `?compose=<title>`) 그 날의
+        사진이 데이트 이름으로 태깅되게 한다. 확정이 아니면 부드러운 안내 후
+        되돌아간다(상태 변경 없음)."""
+        u = current_user()
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            abort(404)
+        st = _pick_states(u.couple_id, u.id, [event_id]).get(event_id, {})
+        if not st.get("confirmed"):
+            flash("아직 둘 다 찜한 확정 데이트가 아니야.", "error")
+            return redirect(request.referrer or url_for("dates_wishlist"))
+        # 커플 두 사람 모두의 이 행사 찜을 'visited'로 — 활성 플랜에서 빠진다.
+        for member in u.couple.approved_members:
+            _upsert_pick(member, event_id, "visited")
+        # 추억 업로드로 이동 — 캡션 프리필 힌트(행사 제목)를 쿼리로 넘긴다.
+        return redirect(url_for("memories", compose=item.title))
 
     @app.route("/dates/wishlist")
     @active_couple_required
