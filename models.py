@@ -756,3 +756,81 @@ class Schedule(db.Model):
 
     creator = db.relationship("User")
     event = db.relationship("EventItem")
+
+
+class Bet(db.Model):
+    """커플 '내기' 한 건 — 캘린더 PHASE 2의 게임화 요소.
+
+    두 종류를 담는 단일 테이블이다(2a=habit만 구현, 2b=prediction은 컬럼만 미리):
+      * 'habit'      — '일주일에 N번 <활동> 하기' 습관 내기. 주(week)는 달력 주가
+        아니라 ``start_date``를 기점으로 7일씩 굴러가는 *롤링 윈도우*다. 대상
+        (``target_user_id``)이 NULL이면 둘 다(같이), 아니면 그 한 명만 참여한다.
+      * 'prediction' — (2b, 아직 미구현) '언제 ~할까?' 날짜 맞히기 내기.
+        ``guess_a_date``/``guess_b_date``/``actual_date``/``winner`` 컬럼은 2b가
+        마이그레이션 없이 바로 쓰도록 지금 nullable로 추가만 해 둔다(2a 미사용).
+
+    couple_id로 커플 스코프. brand-new 테이블 — db.create_all()가 만들어 ALTER 불필요."""
+    __tablename__ = "bets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    # 'habit' | 'prediction' (2a는 habit만 생성)
+    type = db.Column(db.String(16), nullable=False, default="habit")
+    # 습관 활동명(예: "하루 한 편 시 쓰기") / 예측 질문
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    # NULL = 같이(둘 다) · 값이 있으면 그 한 명만 대상
+    target_user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=True
+    )
+    # 롤링 주 기준점(달력 주가 아니라 이 날짜 + 7*k 로 굴러간다)
+    start_date = db.Column(db.Date, nullable=False)
+    # habit: 주 N회 목표
+    count_target = db.Column(db.Integer, nullable=True)
+    penalty = db.Column(db.Text, nullable=True)  # 벌칙
+    # 'active' | 'ended'
+    status = db.Column(db.String(16), nullable=False, default="active")
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+
+    # ---- 2b(prediction) 전용 컬럼 — 지금은 미사용, 마이그레이션 회피용 선반영 ----
+    guess_a_date = db.Column(db.Date, nullable=True)
+    guess_b_date = db.Column(db.Date, nullable=True)
+    actual_date = db.Column(db.Date, nullable=True)
+    winner = db.Column(db.String(8), nullable=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    target_user = db.relationship("User", foreign_keys=[target_user_id])
+    creator = db.relationship("User", foreign_keys=[created_by])
+    checkins = db.relationship(
+        "BetCheckin", backref="bet", cascade="all, delete-orphan"
+    )
+
+
+class BetCheckin(db.Model):
+    """습관 내기의 '오늘 달성' 체크인 한 건 — (내기, 사용자, 날짜)당 최대 하나.
+
+    롤링 주 안에서의 체크인 개수가 그 주의 달성 카운트가 된다. 유니크 제약으로
+    같은 날 중복 체크인을 막고, 토글(생성/삭제)로 오늘 상태를 뒤집는다."""
+    __tablename__ = "bet_checkins"
+    __table_args__ = (
+        db.UniqueConstraint("bet_id", "user_id", "date", name="uq_betcheckin"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    bet_id = db.Column(
+        db.Integer, db.ForeignKey("bets.id"), nullable=False, index=True
+    )
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    user = db.relationship("User")

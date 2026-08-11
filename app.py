@@ -50,6 +50,8 @@ import insights
 import onedrive
 from models import (
     Answer,
+    Bet,
+    BetCheckin,
     Case,
     CaseStatement,
     Comment,
@@ -316,6 +318,160 @@ def _rate_limited(ip: str) -> bool:
 
 def _record_attempt(ip: str):
     _LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+# --------------------------------------------------------------------------- #
+# 내기(Bet) — 롤링 주 헬퍼 (순수/테스트 가능; HTTP·요청 컨텍스트 불필요)
+# --------------------------------------------------------------------------- #
+def bet_week_window(bet, on=None):
+    """습관 내기의 '현재 롤링 주' 창을 계산한다.
+
+    주(week)는 달력 주(월~일)가 아니라 ``bet.start_date``를 기점으로 7일씩 굴러가는
+    윈도우다. ``week_index = (on - start_date).days // 7`` 이고
+    ``week_start = start_date + 7*week_index``, ``week_end = week_start + 6일``.
+
+    반환: ``(week_start, week_end, week_index)``.
+    ``on < start_date`` (아직 시작 전)이면 첫 주(week 0) 창을 돌려주되 ``week_index``
+    를 음수로 반환해 '시작 안 함'을 신호한다(호출부가 부드럽게 처리)."""
+    if on is None:
+        on = date.today()
+    start = bet.start_date
+    delta_days = (on - start).days
+    if delta_days < 0:
+        # 시작 전 — 첫 주 창을 주되 음수 인덱스로 not-started 신호
+        return start, start + timedelta(days=6), delta_days // 7
+    k = delta_days // 7
+    week_start = start + timedelta(days=7 * k)
+    week_end = week_start + timedelta(days=6)
+    return week_start, week_end, k
+
+
+def bet_participants(bet, couple):
+    """이 내기의 참여자 목록(안정적 id 순).
+
+    ``target_user_id``가 NULL이면 승인된 커플 구성원 두 명 모두(같이), 아니면 그
+    한 명만(아직 커플에 남아 있을 때). 커플에서 빠진 대상이면 빈 목록."""
+    members = sorted(couple.approved_members, key=lambda u: u.id)
+    if bet.target_user_id is None:
+        return members
+    return [u for u in members if u.id == bet.target_user_id]
+
+
+def bet_progress(bet, couple, on=None):
+    """현재 롤링 주 기준 참여자별 진행 상황.
+
+    반환 dict: ``week_start``·``week_end``·``week_index``·``started`` +
+    ``participants``: 각 ``{user_id, name, count, target, done_today, met}``.
+    ``count`` = 그 사용자의 [week_start, week_end] 내 BetCheckin 수,
+    ``met`` = count ≥ count_target, ``done_today`` = ``on`` 날짜 체크인 존재."""
+    if on is None:
+        on = date.today()
+    week_start, week_end, week_index = bet_week_window(bet, on)
+    started = week_index >= 0
+    target = bet.count_target or 0
+    # 이 내기의 이번 주 체크인만 한 번에 조회(bet 자체가 커플 스코프라 커플 안전).
+    rows = (
+        BetCheckin.query.filter(
+            BetCheckin.bet_id == bet.id,
+            BetCheckin.date >= week_start,
+            BetCheckin.date <= week_end,
+        ).all()
+    )
+    by_user = {}
+    for r in rows:
+        by_user.setdefault(r.user_id, set()).add(r.date)
+    participants = []
+    for u in bet_participants(bet, couple):
+        dates = by_user.get(u.id, set())
+        count = len(dates)
+        participants.append(
+            {
+                "user_id": u.id,
+                "name": u.display_name,
+                "count": count,
+                "target": target,
+                "done_today": on in dates,
+                "met": started and target > 0 and count >= target,
+            }
+        )
+    return {
+        "week_start": week_start,
+        "week_end": week_end,
+        "week_index": week_index,
+        "started": started,
+        "participants": participants,
+    }
+
+
+def bet_week_days(week_start):
+    """롤링 주 창의 7개 날짜(week_start..week_start+6)."""
+    return [week_start + timedelta(days=i) for i in range(7)]
+
+
+def bet_week_checkins(bet, week_start, week_end):
+    """[week_start, week_end] 창의 (user_id, date) 체크인 집합 맵을 돌려준다.
+    상세 화면의 요일별 체크 표시에 쓴다."""
+    rows = (
+        BetCheckin.query.filter(
+            BetCheckin.bet_id == bet.id,
+            BetCheckin.date >= week_start,
+            BetCheckin.date <= week_end,
+        ).all()
+    )
+    by_user = {}
+    for r in rows:
+        by_user.setdefault(r.user_id, set()).add(r.date)
+    return by_user
+
+
+def bet_past_weeks(bet, couple, on=None, cap=8):
+    """완료된 지난 주들의 참여자별 지킴/못지킴 요약(최근 ~cap개, 최신 먼저).
+
+    현재 주(week_index) 직전부터 과거로 최대 cap개 창을 훑는다. 작업량을 묶기 위해
+    전체 범위 체크인을 한 번만 조회한 뒤 파이썬에서 창별로 센다."""
+    if on is None:
+        on = date.today()
+    _, _, cur_index = bet_week_window(bet, on)
+    if cur_index <= 0:
+        return []  # 아직 완료된 지난 주가 없음
+    parts = bet_participants(bet, couple)
+    target = bet.count_target or 0
+    start = bet.start_date
+    first = max(0, cur_index - cap)
+    range_start = start + timedelta(days=7 * first)
+    range_end = start + timedelta(days=7 * cur_index - 1)  # 현재 주 직전까지
+    rows = (
+        BetCheckin.query.filter(
+            BetCheckin.bet_id == bet.id,
+            BetCheckin.date >= range_start,
+            BetCheckin.date <= range_end,
+        ).all()
+    )
+    weeks = []
+    for k in range(cur_index - 1, first - 1, -1):  # 직전 주 → 과거 순
+        ws = start + timedelta(days=7 * k)
+        we = ws + timedelta(days=6)
+        per = []
+        for u in parts:
+            cnt = sum(1 for r in rows if r.user_id == u.id and ws <= r.date <= we)
+            per.append(
+                {
+                    "user_id": u.id,
+                    "name": u.display_name,
+                    "count": cnt,
+                    "target": target,
+                    "met": target > 0 and cnt >= target,
+                }
+            )
+        weeks.append(
+            {
+                "week_index": k,
+                "week_start": ws,
+                "week_end": we,
+                "participants": per,
+            }
+        )
+    return weeks
 
 
 def get_or_create_today_question(couple: Couple) -> DailyQuestion:
@@ -1779,6 +1935,29 @@ def _register_routes(app: Flask):
                 {"id": s.id, "title": s.title, "event_id": s.event_id}
             )
 
+        # 이번 달 '내기 체크인'을 조회해 같은 days_data에 병합한다(커플 스코프).
+        # 이 커플의 내기(Bet)에 속한 체크인만 세며, 체크인이 하나라도 있는 날은
+        # 셀에 🔥 아이콘을 띄운다("bet": True). 사진·일정이 전혀 없고 체크인만 있는
+        # 날도 엔트리를 만들어 셀이 눌리고 아이콘이 보이게 한다.
+        bet_days = (
+            db.session.query(BetCheckin.date)
+            .join(Bet, BetCheckin.bet_id == Bet.id)
+            .filter(
+                Bet.couple_id == couple.id,
+                BetCheckin.date >= month_start,
+                BetCheckin.date < next_start,
+            )
+            .distinct()
+            .all()
+        )
+        for (cd,) in bet_days:
+            key = str(cd.day)
+            entry = days_data.get(key)
+            if entry is None:
+                entry = {"count": 0, "cover": None, "ids": [], "schedules": []}
+                days_data[key] = entry
+            entry["bet"] = True
+
         # 일요일 시작 그리드 — 앞쪽 빈칸 = (첫날 요일 +1) % 7 (월=0..일=6).
         lead = (month_start.weekday() + 1) % 7
         cells = [None] * lead + list(range(1, days_in_month + 1))
@@ -1954,6 +2133,307 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("일정을 삭제했어.", "ok")
         return redirect(url_for("index", month=month))
+
+    # ---- 캘린더 '내기'(Bet) — 습관 내기(2a) ----
+    def _get_bet_or_404(u, bid):
+        """내기를 로드하되, 요청자 커플의 것이 아니면 404 — 커플 간 접근 차단."""
+        b = db.session.get(Bet, bid)
+        if b is None or b.couple_id != u.couple_id:
+            abort(404)
+        return b
+
+    def _resolve_target(u, raw):
+        """대상 select 값 → target_user_id 매핑.
+        ""(같이) → None · 커플 구성원 id → 그 id · 그 외 → (None, False) 무효."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None, True  # 같이(둘 다)
+        try:
+            tid = int(raw)
+        except (TypeError, ValueError):
+            return None, False
+        member_ids = {m.id for m in u.couple.approved_members}
+        if tid in member_ids:
+            return tid, True
+        return None, False
+
+    @app.route("/calendar/bets")
+    @active_couple_required
+    def calendar_bets():
+        """이 커플의 내기 목록(진행 중 먼저, 종료 나중). 습관 내기는 이번 주 진행·
+        오늘 달성 토글·벌칙을 함께 보여준다."""
+        u = current_user()
+        couple = u.couple
+        bets = (
+            Bet.query.filter(Bet.couple_id == couple.id)
+            .order_by(Bet.status.asc(), Bet.created_at.desc())
+            .all()
+        )
+        # 'active' < 'ended' 알파벳 순이라 status asc면 active가 먼저 온다.
+        today = date.today()
+        rows = []
+        for b in bets:
+            prog = bet_progress(b, couple, today)
+            # 지금 사용자가 이 내기 참여자인지 + 오늘 이미 달성했는지
+            mine = next(
+                (p for p in prog["participants"] if p["user_id"] == u.id), None
+            )
+            rows.append(
+                {
+                    "bet": b,
+                    "progress": prog,
+                    "is_participant": mine is not None,
+                    "done_today": bool(mine and mine["done_today"]),
+                    "target_name": (b.target_user.display_name
+                                    if b.target_user_id else None),
+                }
+            )
+        return render_template("bets.html", rows=rows, me=u)
+
+    @app.route("/calendar/bets/new", methods=["GET", "POST"])
+    @active_couple_required
+    def bet_new():
+        """습관 내기 추가. 활동·주 N회·대상·시작일·벌칙·설명. 대상 select는
+        같이/나/상대 중 선택하며 각각 NULL/내 id/상대 id로 매핑한다."""
+        u = current_user()
+        partner = u.partner
+        if request.method == "POST":
+            title = (request.form.get("title") or "").strip()[:200]
+            penalty = (request.form.get("penalty") or "").strip() or None
+            description = (request.form.get("description") or "").strip() or None
+            start = _parse_date(request.form.get("start_date")) or date.today()
+            target_id, target_ok = _resolve_target(u, request.form.get("target"))
+            try:
+                count_target = int((request.form.get("count_target") or "").strip())
+            except (TypeError, ValueError):
+                count_target = 0
+            errs = []
+            if not title:
+                errs.append("활동")
+            if count_target < 1:
+                errs.append("주 N회(1 이상)")
+            if not target_ok:
+                errs.append("대상")
+            if errs:
+                flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
+                return render_template(
+                    "bet_form.html",
+                    mode="new",
+                    bet=None,
+                    me=u,
+                    partner=partner,
+                    form_title=title,
+                    form_count=(request.form.get("count_target") or ""),
+                    form_target=(request.form.get("target") or ""),
+                    form_start=(request.form.get("start_date")
+                                or date.today().strftime("%Y-%m-%d")),
+                    form_penalty=penalty or "",
+                    form_description=description or "",
+                )
+            bet = Bet(
+                couple_id=u.couple_id,
+                type="habit",
+                title=title,
+                description=description,
+                target_user_id=target_id,
+                start_date=start,
+                count_target=count_target,
+                penalty=penalty,
+                status="active",
+                created_by=u.id,
+            )
+            db.session.add(bet)
+            db.session.commit()
+            flash("내기를 만들었어. 화이팅! 🔥", "ok")
+            return redirect(url_for("bet_detail", bid=bet.id))
+
+        return render_template(
+            "bet_form.html",
+            mode="new",
+            bet=None,
+            me=u,
+            partner=partner,
+            form_title="",
+            form_count="",
+            form_target="",
+            form_start=date.today().strftime("%Y-%m-%d"),
+            form_penalty="",
+            form_description="",
+        )
+
+    @app.route("/calendar/bets/<int:bid>/checkin", methods=["POST"])
+    @active_couple_required
+    def bet_checkin(bid):
+        """오늘의 '달성' 토글(행동하는 사용자 기준). 참여자가 아니면 부드러운 안내.
+        (내기, 나, 오늘) 행이 없으면 생성, 있으면 삭제(오클릭 되돌리기).
+        온 곳(목록/상세)으로 돌아간다."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        couple = u.couple
+        today = date.today()
+
+        # 되돌아갈 곳: next 파라미터 > referrer > 목록
+        nxt = (request.form.get("next") or request.referrer
+               or url_for("calendar_bets"))
+
+        participant_ids = {p.id for p in bet_participants(bet, couple)}
+        if u.id not in participant_ids:
+            flash("이 내기의 대상이 아니야 — 응원만 해줘! 😊", "error")
+            return redirect(nxt)
+        if bet.status != "active":
+            flash("종료된 내기야.", "error")
+            return redirect(nxt)
+
+        existing = BetCheckin.query.filter_by(
+            bet_id=bet.id, user_id=u.id, date=today
+        ).first()
+        if existing is None:
+            db.session.add(
+                BetCheckin(bet_id=bet.id, user_id=u.id, date=today)
+            )
+            try:
+                db.session.commit()
+            except IntegrityError:
+                # 동시 중복(유니크 충돌) — 이미 있는 것으로 간주.
+                db.session.rollback()
+            flash("오늘 달성 체크! 🔥", "ok")
+            # 파트너에게 가벼운 알림(선택·비차단).
+            _safe_notify(
+                u.partner,
+                "answer",
+                f"{u.display_name}님이 '{bet.title}' 내기를 오늘 달성했어! 🔥",
+                url_for("bet_detail", bid=bet.id),
+            )
+        else:
+            db.session.delete(existing)
+            db.session.commit()
+            flash("오늘 달성을 취소했어.", "ok")
+        return redirect(nxt)
+
+    @app.route("/calendar/bets/<int:bid>")
+    @active_couple_required
+    def bet_detail(bid):
+        """내기 상세 — 대상·시작일·벌칙, 이번 주 창의 참여자별 요일 체크, 지난 주
+        요약. 커플 것이 아니면 404."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        couple = u.couple
+        today = date.today()
+        prog = bet_progress(bet, couple, today)
+        week_days = bet_week_days(prog["week_start"])
+        by_user = bet_week_checkins(bet, prog["week_start"], prog["week_end"])
+        # 참여자별 이번 주 요일 셀(체크 여부) 구성
+        week_rows = []
+        for p in prog["participants"]:
+            checks = by_user.get(p["user_id"], set())
+            cells = [{"date": d, "checked": d in checks, "is_today": d == today}
+                     for d in week_days]
+            week_rows.append({"p": p, "cells": cells})
+        past = bet_past_weeks(bet, couple, today, cap=8)
+        mine = next(
+            (p for p in prog["participants"] if p["user_id"] == u.id), None
+        )
+        return render_template(
+            "bet_detail.html",
+            bet=bet,
+            me=u,
+            progress=prog,
+            week_days=week_days,
+            week_rows=week_rows,
+            past=past,
+            is_participant=mine is not None,
+            done_today=bool(mine and mine["done_today"]),
+            target_name=(bet.target_user.display_name if bet.target_user_id else None),
+        )
+
+    @app.route("/calendar/bets/<int:bid>/edit", methods=["GET", "POST"])
+    @active_couple_required
+    def bet_edit(bid):
+        """내기 수정(활동·주 N회·대상·시작일·벌칙·설명). POST 후 상세로."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        partner = u.partner
+        if request.method == "POST":
+            title = (request.form.get("title") or "").strip()[:200]
+            penalty = (request.form.get("penalty") or "").strip() or None
+            description = (request.form.get("description") or "").strip() or None
+            start = _parse_date(request.form.get("start_date")) or bet.start_date
+            target_id, target_ok = _resolve_target(u, request.form.get("target"))
+            try:
+                count_target = int((request.form.get("count_target") or "").strip())
+            except (TypeError, ValueError):
+                count_target = 0
+            errs = []
+            if not title:
+                errs.append("활동")
+            if count_target < 1:
+                errs.append("주 N회(1 이상)")
+            if not target_ok:
+                errs.append("대상")
+            if errs:
+                flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
+                return render_template(
+                    "bet_form.html",
+                    mode="edit",
+                    bet=bet,
+                    me=u,
+                    partner=partner,
+                    form_title=title,
+                    form_count=(request.form.get("count_target") or ""),
+                    form_target=(request.form.get("target") or ""),
+                    form_start=(request.form.get("start_date")
+                                or bet.start_date.strftime("%Y-%m-%d")),
+                    form_penalty=penalty or "",
+                    form_description=description or "",
+                )
+            bet.title = title
+            bet.count_target = count_target
+            bet.target_user_id = target_id
+            bet.start_date = start
+            bet.penalty = penalty
+            bet.description = description
+            bet.updated_at = datetime.utcnow()
+            db.session.commit()
+            flash("내기를 수정했어.", "ok")
+            return redirect(url_for("bet_detail", bid=bet.id))
+
+        # GET — 현재 값으로 프리필. 대상 select 값은 target_user_id(없으면 "").
+        return render_template(
+            "bet_form.html",
+            mode="edit",
+            bet=bet,
+            me=u,
+            partner=partner,
+            form_title=bet.title,
+            form_count=(bet.count_target if bet.count_target else ""),
+            form_target=(str(bet.target_user_id) if bet.target_user_id else ""),
+            form_start=bet.start_date.strftime("%Y-%m-%d"),
+            form_penalty=bet.penalty or "",
+            form_description=bet.description or "",
+        )
+
+    @app.route("/calendar/bets/<int:bid>/end", methods=["POST"])
+    @active_couple_required
+    def bet_end(bid):
+        """내기 종료(status→ended). 삭제 없이 기록은 남긴다."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        bet.status = "ended"
+        bet.updated_at = datetime.utcnow()
+        db.session.commit()
+        flash("내기를 종료했어.", "ok")
+        return redirect(url_for("bet_detail", bid=bet.id))
+
+    @app.route("/calendar/bets/<int:bid>/delete", methods=["POST"])
+    @active_couple_required
+    def bet_delete(bid):
+        """내기 삭제(체크인도 함께 정리). 목록으로 돌아간다."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        db.session.delete(bet)  # cascade로 BetCheckin도 삭제
+        db.session.commit()
+        flash("내기를 삭제했어.", "ok")
+        return redirect(url_for("calendar_bets"))
 
     # ---- 오늘의 질문 대시보드 (예전 '/' 본문 — 온보딩 게이트 이후 부분) ----
     @app.route("/today")
