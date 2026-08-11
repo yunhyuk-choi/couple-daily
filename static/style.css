@@ -1288,3 +1288,71 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   padding: 22px 8px;
   font-size: 0.9rem;
 }
+
+/* 일정 표시 — 셀 우상단 작은 📌 배지(사진 썸네일 위에서도 보이게 그림자). */
+.cal-sched-dot {
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  z-index: 3;
+  font-size: 0.62rem;
+  line-height: 1;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+  pointer-events: none;
+}
+/* 사진 없는 '일정만' 있는 날도 셀이 눌리도록 배경 유지(기본 .cal-cell 배경). */
+
+/* 날짜 패널 헤더 줄 — 날짜 제목 + '+ 일정' 버튼 */
+.cal-panel-headrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.cal-panel-headrow .cal-panel-head { margin: 0; }
+.cal-add-sched { flex: none; white-space: nowrap; }
+
+/* 패널 일정 리스트 — 사진 위에 먼저 렌더 */
+.cal-sched-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cal-sched-list:empty { display: none; }
+.cal-sched-item { margin: 0; }
+.cal-sched-link {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--pink-soft);
+  color: var(--ink, #3a2e33);
+  text-decoration: none;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+.cal-sched-link:active { transform: scale(0.99); }
+.cal-sched-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-sched-mark { flex: none; font-size: 0.85rem; }
+
+/* 확정 데이트의 '날짜 정하기' + '다녀왔어' 액션 나란히 */
+.confirmed-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+.confirmed-actions .went-form { margin: 0; }
+.confirmed-actions-detail { margin-top: 14px; }

@@ -723,3 +723,36 @@ class DateRecommendation(db.Model):
             return v if isinstance(v, list) else []
         except (ValueError, TypeError):
             return []
+
+
+class Schedule(db.Model):
+    """커플 캘린더의 '일정' 한 건 — 특정 날짜에 잡은 계획.
+
+    사진(Photo)이 '지난 날의 기록'이라면 일정은 '앞으로/특정 날의 계획'이다. 한
+    날짜에 사진과 일정이 함께 있을 수 있다. ``event_id``가 채워진 일정은 '데이트
+    뉴스' 확정 행사에서 '날짜 정하기'로 만든 것(선택적 역참조). couple_id로 커플
+    스코프. brand-new 테이블 — db.create_all()가 만들어 ALTER 불필요."""
+    __tablename__ = "calendar_schedules"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    date = db.Column(db.Date, nullable=False, index=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    # '데이트 뉴스' 확정 행사에서 만들었으면 그 행사 id(선택적). 일반 일정은 NULL.
+    event_id = db.Column(
+        db.Integer, db.ForeignKey("event_items.id"), nullable=True, index=True
+    )
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    creator = db.relationship("User")
+    event = db.relationship("EventItem")
