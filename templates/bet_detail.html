@@ -1,7 +1,95 @@
 {% extends "base.html" %}
 {% block title %}{{ bet.title }} · {{ app_name }}{% endblock %}
 {% block content %}
-{# 내기 상세 — 대상·시작일·벌칙 + 이번 주 요일 체크 + 지난 주 요약 + 관리 버튼. #}
+{% if bet.type == 'prediction' %}
+{# ================= 예측 내기 상세 ================= #}
+<div class="page-head">
+  <span class="hero-sm" aria-hidden="true" style="font-size:1.6rem">🔮</span>
+  <h1>예측 내기</h1>
+</div>
+
+<article class="card">
+  <div class="bet-detail-head">
+    <h2 style="margin:0">{{ bet.title }}</h2>
+    {% if bet.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+  </div>
+
+  {# 각자 예측 — 실제 날짜가 있으면 며칠 차이도 함께 #}
+  <div class="bet-pred-guesses" style="margin-top:12px">
+    <div class="bet-pred-row{% if pred.winner == 'a' %} is-winner{% endif %}">
+      <span class="bet-pred-name">{{ pred.a_name }}</span>
+      <span class="bet-pred-date">{{ pred.guess_a.strftime('%Y.%m.%d') if pred.guess_a else '-' }}</span>
+      {% if pred.actual and pred.da is not none %}
+      <span class="bet-prog-pill{% if pred.winner == 'a' %} met{% endif %}">{{ pred.da }}일 차</span>
+      {% endif %}
+      {% if pred.winner == 'a' %}<span class="chip small">🏆 승</span>{% endif %}
+    </div>
+    <div class="bet-pred-row{% if pred.winner == 'b' %} is-winner{% endif %}">
+      <span class="bet-pred-name">{{ pred.b_name }}</span>
+      <span class="bet-pred-date">{{ pred.guess_b.strftime('%Y.%m.%d') if pred.guess_b else '-' }}</span>
+      {% if pred.actual and pred.db is not none %}
+      <span class="bet-prog-pill{% if pred.winner == 'b' %} met{% endif %}">{{ pred.db }}일 차</span>
+      {% endif %}
+      {% if pred.winner == 'b' %}<span class="chip small">🏆 승</span>{% endif %}
+    </div>
+  </div>
+
+  {% if pred.actual %}
+  <p class="muted small" style="margin:12px 0 0">
+    실제 · <strong>{{ pred.actual.strftime('%Y.%m.%d') }}</strong>
+  </p>
+  <div class="bet-pred-verdict" style="margin-top:10px">
+    {% if pred.winner == 'tie' %}
+    <strong>무승부! 🤝</strong> 둘 다 똑같이 가까웠어.
+    {% else %}
+    <strong>🏆 {{ pred.winner_name }}</strong> 승 — 더 가까웠어!
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if bet.description %}
+  <p class="muted small" style="white-space:pre-wrap;margin:12px 0 0">{{ bet.description }}</p>
+  {% endif %}
+  {% if bet.penalty %}
+  <p class="bet-penalty" style="margin:10px 0 0">
+    🎯 벌칙 · {{ bet.penalty }}
+    {% if pred.actual and pred.winner and pred.winner != 'tie' %}
+    <br /><span class="bet-loser">
+      진 사람 · {{ pred.b_name if pred.winner == 'a' else pred.a_name }} 🙈
+    </span>
+    {% endif %}
+  </p>
+  {% endif %}
+</article>
+
+{# 결과 입력(미해결일 때) — 작은 날짜 폼 #}
+{% if not pred.actual %}
+<article class="card">
+  <h3 class="bet-section-title">결과 입력</h3>
+  <p class="muted small" style="margin:0 0 10px">실제로 그 일이 일어난 날짜를 넣으면 더 가까운 사람이 이겨.</p>
+  <form class="stack" method="post" action="{{ url_for('bet_resolve', bid=bet.id) }}">
+    <label for="actual-date">실제 날짜
+      <input id="actual-date" type="date" name="actual_date" required />
+    </label>
+    <button class="btn primary" type="submit">결과 확정</button>
+  </form>
+</article>
+{% endif %}
+
+<div class="card">
+  <div class="pick-btns">
+    <a class="btn sm" href="{{ url_for('bet_edit', bid=bet.id) }}">수정</a>
+    <a class="btn ghost sm" href="{{ url_for('calendar_bets') }}">목록으로</a>
+  </div>
+  <form method="post" action="{{ url_for('bet_delete', bid=bet.id) }}"
+        onsubmit="return confirm('이 내기를 삭제할까? 되돌릴 수 없어.');"
+        style="margin-top:12px">
+    <button class="btn ghost sm" type="submit">삭제</button>
+  </form>
+</div>
+
+{% else %}
+{# ================= 습관 내기 상세(기존 그대로) ================= #}
 <div class="page-head">
   <span class="hero-sm" aria-hidden="true" style="font-size:1.6rem">🔥</span>
   <h1>내기</h1>
@@ -108,4 +196,5 @@
     <button class="btn ghost sm" type="submit">삭제</button>
   </form>
 </div>
+{% endif %}
 {% endblock %}
