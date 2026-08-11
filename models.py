@@ -516,3 +516,38 @@ class CaseStatement(db.Model):
     )
 
     author = db.relationship("User")
+
+
+class EventItem(db.Model):
+    """'데이트 뉴스' 피드 한 건 — 외부 공개 API(서울 문화행사)에서 밤마다 긁어온
+    실제 전시·공연·행사. 커플에 종속되지 않는 전역 카탈로그다(모두가 같은 피드를
+    본다). 명시적 id가 없는 소스라 (source, source_uid)로 dedupe하며, source_uid는
+    페처가 title|start_date|place의 sha1로 계산한 안정적 키다. 만료(end_date < 오늘)
+    행은 크론이 삭제한다. brand-new 테이블 — db.create_all()가 만들어 ALTER 불필요."""
+    __tablename__ = "event_items"
+    __table_args__ = (
+        db.UniqueConstraint("source", "source_uid", name="uq_event_source_uid"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    source = db.Column(db.String(16), nullable=False, default="seoul")
+    # 소스에 명시적 id가 없어 페처가 계산하는 안정적 dedupe 키(sha1 hex)
+    source_uid = db.Column(db.String(200), nullable=False)
+    title = db.Column(db.String(300), nullable=False)
+    category = db.Column(db.String(80), nullable=True)
+    description = db.Column(db.Text, nullable=True)
+    place = db.Column(db.String(200), nullable=True)
+    district = db.Column(db.String(60), nullable=True)
+    image_url = db.Column(db.String(1000), nullable=True)
+    link = db.Column(db.String(1000), nullable=True)
+    fee = db.Column(db.String(200), nullable=True)
+    is_free = db.Column(db.Boolean, nullable=True)
+    start_date = db.Column(db.Date, nullable=True)
+    end_date = db.Column(db.Date, nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
