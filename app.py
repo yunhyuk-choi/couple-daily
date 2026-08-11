@@ -99,6 +99,9 @@ CRON_SECRET = os.environ.get("CRON_SECRET")
 # '데이트 뉴스' 새로고침이 동시에 두 번 돌지 않게 하는 최소 가드(비차단).
 _events_refresh_lock = threading.Lock()
 
+# 팝업 수집(claude 웹검색)이 동시에 두 번 돌지 않게 하는 최소 가드(비차단).
+_popups_refresh_lock = threading.Lock()
+
 
 def push_enabled() -> bool:
     """Web push is only wired up when a full VAPID keypair + subject exist and
@@ -1097,6 +1100,106 @@ def prewarm_scores(app):
                 log.exception("prewarm: 커플 %s 선채점 실패", couple_id)
     except Exception:  # noqa: BLE001 — belt & suspenders
         log.exception("prewarm_scores failed")
+
+
+def refresh_popups_worker(app):
+    """백그라운드 워커: claude 웹검색으로 팝업을 모아 EventItem(source='popup')로
+    upsert하고 만료 팝업을 지운다. cron_refresh_popups가 데몬 스레드로 띄운다.
+
+    캡션·채점과 공유하는 _CAPTION_SEM으로 claude 콜을 직렬화한다(512MB 티어:
+    동시에 claude는 하나만). 서울 upsert와 '똑같이' (source, source_uid)로
+    upsert하고 per-row try/except+rollback로 한 행 실패가 전체를 막지 않게 한다.
+    절대 스레드 밖으로 raise하지 않으며, finally에서 세마포어와 락을 반드시 푼다.
+
+    ⚠️ 중복 안전(dedupe 유지): (source, source_uid) upsert + 기존
+    uq_event_source_uid 제약 덕에 팝업끼리도, 서울 행사와도(source가 달라)
+    복제되지 않는다."""
+    try:
+        with app.app_context():
+            # claude 웹검색 콜을 캡션/채점과 같은 세마포어로 직렬화.
+            _CAPTION_SEM.acquire()
+            try:
+                try:
+                    items = events.fetch_popups()
+                except Exception:  # noqa: BLE001 — claude가 스레드 죽이지 못하게
+                    log.exception("popup fetch raised")
+                    items = []
+            finally:
+                _CAPTION_SEM.release()
+
+            fetched = len(items)
+            upserted = 0
+            for it in items:
+                try:
+                    # 서울 upsert와 동일: (source, source_uid)로 조회→갱신, 없으면 삽입.
+                    row = EventItem.query.filter_by(
+                        source=it["source"], source_uid=it["source_uid"]
+                    ).first()
+                    if row is None:
+                        row = EventItem(source=it["source"], source_uid=it["source_uid"])
+                        db.session.add(row)
+                    row.title = it["title"]
+                    row.category = it.get("category")
+                    row.description = it.get("description")
+                    row.place = it.get("place")
+                    row.district = it.get("district")
+                    row.image_url = it.get("image_url")
+                    row.link = it.get("link")
+                    row.fee = it.get("fee")
+                    row.is_free = it.get("is_free")
+                    row.start_date = it.get("start_date")
+                    row.end_date = it.get("end_date")
+                    db.session.commit()
+                    upserted += 1
+                except Exception:  # noqa: BLE001 — 한 행 실패가 전체를 막지 않게
+                    db.session.rollback()
+                    log.exception("popup upsert failed (uid=%s)", it.get("source_uid"))
+
+            # 만료 팝업 삭제(source='popup' AND end_date 있고 오늘보다 과거).
+            expired_deleted = 0
+            try:
+                today = date.today()
+                expired_deleted = (
+                    EventItem.query.filter(
+                        EventItem.source == "popup",
+                        EventItem.end_date.isnot(None),
+                        EventItem.end_date < today,
+                    ).delete(synchronize_session=False)
+                )
+                db.session.commit()
+            except Exception:  # noqa: BLE001
+                db.session.rollback()
+                log.exception("popup expiry delete failed")
+
+            # 무기한(end_date NULL) 팝업 안전 만료: 종료일을 못 뽑은 팝업은
+            # 21일 넘게 묵으면 지운다(무기한 잔류 방지). dedupe upsert는 그대로.
+            stale_deleted = 0
+            try:
+                cutoff = datetime.utcnow() - timedelta(days=21)
+                stale_deleted = (
+                    EventItem.query.filter(
+                        EventItem.source == "popup",
+                        EventItem.end_date.is_(None),
+                        EventItem.created_at < cutoff,
+                    ).delete(synchronize_session=False)
+                )
+                db.session.commit()
+            except Exception:  # noqa: BLE001
+                db.session.rollback()
+                log.exception("popup stale(undated) expiry delete failed")
+
+            log.info(
+                "popup refresh done: fetched=%s upserted=%s expired=%s stale=%s",
+                fetched, upserted, expired_deleted, stale_deleted,
+            )
+    except Exception:  # noqa: BLE001 — 스레드 밖으로 절대 raise 금지
+        log.exception("refresh_popups_worker failed")
+    finally:
+        # 스폰 측이 잡아둔 모듈 락을 워커 종료 시 반드시 해제(중복 실행 재허용).
+        try:
+            _popups_refresh_lock.release()
+        except RuntimeError:
+            pass  # 이미 풀렸으면 무시
 
 
 # 데이트 뉴스 목록 무한스크롤 배치 크기(초기 렌더·/dates/more 공통).
@@ -3084,6 +3187,35 @@ def _register_routes(app: Flask):
             )
         finally:
             _events_refresh_lock.release()
+
+    @app.route("/internal/cron/refresh-popups", methods=["POST"])
+    def cron_refresh_popups():
+        """팝업 수집을 '백그라운드로' 시작 — claude 웹검색은 ~120s+라 동기로 돌리면
+        gunicorn 워커 타임아웃에 죽는다. 그래서 데몬 스레드를 띄우고 즉시 응답한다.
+
+        cron_refresh_events와 '똑같이' CRON_SECRET(헤더 ``X-Cron-Secret`` 또는
+        ``?token=``)으로 상수시간 비교 보호. 모듈 락을 비차단으로 잡아 두 번째
+        트리거가 이미 도는 중이면 busy를 돌려준다(락은 워커가 finally에서 푼다)."""
+        provided = request.headers.get("X-Cron-Secret") or request.args.get("token") or ""
+        if not CRON_SECRET or not hmac.compare_digest(provided, CRON_SECRET):
+            abort(403)
+
+        # 동시 실행 방지(락 못 잡으면 이미 도는 중 — busy). 잡았으면 워커가 finally
+        # 에서 푼다. 스레드 스폰이 실패하면 여기서 되돌려 락을 즉시 푼다.
+        if not _popups_refresh_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "reason": "busy"})
+        try:
+            threading.Thread(
+                target=refresh_popups_worker,
+                args=(app,),
+                daemon=True,
+            ).start()
+        except Exception:  # noqa: BLE001 — 스폰 실패 시 락 되돌리고 알림
+            _popups_refresh_lock.release()
+            log.exception("failed to spawn popup refresh thread")
+            return jsonify({"ok": False, "reason": "spawn_failed"})
+        # 120s 페치를 기다리지 않고 즉시 응답(백그라운드에서 진행).
+        return jsonify({"ok": True, "started": True})
 
     # ---- PWA plumbing ----
     @app.route("/manifest.json")

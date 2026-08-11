@@ -17,7 +17,15 @@
   </div>
 
   {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+  {% if item.source == 'popup' %}<span class="ai-chip">🛍️ AI 정보</span>{% endif %}
   <h2 class="event-detail-title">{{ item.title }}</h2>
+
+  {# 팝업은 claude 웹검색으로 모은 AI 출처 — 부드러운 안내로 실제 확인을 권한다. #}
+  {% if item.source == 'popup' %}
+  <p class="ai-source-note muted small">
+    AI가 웹에서 모은 정보라 실제와 다를 수 있어 — 예약·안내 링크에서 꼭 확인해줘.
+  </p>
+  {% endif %}
 
   {# 우리 추천 점수 블록 — ready면 링+사유, pending이면 분석 중, 그 외엔 숨김 #}
   {% if score_status == 'ready' and score is not none %}
