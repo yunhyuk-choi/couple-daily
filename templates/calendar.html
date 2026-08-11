@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}캘린더 · {{ app_name }}{% endblock %}
+{% block content %}
+{# 캘린더 홈 — 이번 달(또는 ?month=YYYY-MM) 월 달력. 각 날짜 셀에 그 날 올린
+   사진의 커버 썸네일과 +N 배지를 얹고, 아래 '날짜 패널'은 선택한 날의 사진을
+   클라이언트에서 렌더한다(내비게이션 없이 탭으로 전환). #}
+<div class="cal-nav">
+  <a class="cal-nav-btn" href="{{ url_for('index', month=prev_month) }}" aria-label="이전 달">‹</a>
+  <h1 class="cal-title">{{ month_label }}</h1>
+  <a class="cal-nav-btn" href="{{ url_for('index', month=next_month) }}" aria-label="다음 달">›</a>
+</div>
+
+<div class="cal-weekdays" aria-hidden="true">
+  {% for w in weekday_headers %}<span class="cal-wd">{{ w }}</span>{% endfor %}
+</div>
+
+<div class="cal-grid" id="cal-grid">
+  {% for week in weeks %}
+    {% for day in week %}
+      {% if day is none %}
+        <span class="cal-cell empty" aria-hidden="true"></span>
+      {% else %}
+        {% set info = days_data.get(day|string) %}
+        <button type="button"
+                class="cal-cell{% if info %} has-photo{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
+                data-day="{{ day }}"
+                aria-label="{{ month }}월 {{ day }}일{% if info %} · 사진 {{ info.count }}장{% endif %}">
+          <span class="cal-daynum">{{ day }}</span>
+          {% if info %}
+          <span class="cal-thumb">
+            <img class="cal-thumb-img" loading="lazy" alt=""
+                 src="{{ url_for('memory_thumb', photo_id=info.cover) }}"
+                 onload="this.closest('.cal-thumb').classList.add('is-loaded')"
+                 onerror="this.closest('.cal-thumb').classList.add('is-error')" />
+          </span>
+          {% if info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
+          {% endif %}
+        </button>
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
+</div>
+
+{# 선택한 날의 사진 패널 — 클라이언트가 채운다(기본: 오늘 또는 1일). #}
+<div class="cal-panel">
+  <h2 class="cal-panel-head" id="cal-panel-date"></h2>
+  <div class="photo-grid cal-panel-grid" id="cal-panel-grid"></div>
+  <p class="cal-panel-empty muted" id="cal-panel-empty" hidden>이 날은 아직 기록이 없어 🌱</p>
+</div>
+
+{# 패널 썸네일 확대용 라이트박스(다운로드·닫기). 동적 생성 대비 위임 처리. #}
+<div class="lightbox" id="cal-lightbox" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="사진 크게 보기">
+  <button type="button" class="lb-close" id="cal-lb-close" aria-label="닫기">×</button>
+  <div class="lb-stage">
+    <img class="lb-img" id="cal-lb-img" alt="추억 사진" />
+  </div>
+  <div class="lb-meta">
+    <div class="lb-actions">
+      <a class="btn primary lb-download" id="cal-lb-download" href="#" download>다운로드</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  // 서버가 넘긴 '날짜 -> {count, cover, ids}' 맵. 패널 렌더의 단일 데이터 원천.
+  var DAYS = {{ days_data | tojson }};
+  var YEAR = {{ year }}, MONTH = {{ month }};
+  var selected = {{ selected_day }};
+
+  var grid = document.getElementById('cal-grid');
+  var panelGrid = document.getElementById('cal-panel-grid');
+  var panelEmpty = document.getElementById('cal-panel-empty');
+  var panelDate = document.getElementById('cal-panel-date');
+
+  // 선택한 날의 사진들을 공용 .photo-open 마크업으로 렌더(시머·라이트박스 재사용).
+  function renderPanel(day) {
+    var info = DAYS[String(day)];
+    panelDate.textContent = YEAR + '년 ' + MONTH + '월 ' + day + '일';
+    panelGrid.innerHTML = '';
+    if (!info || !info.ids || !info.ids.length) {
+      panelEmpty.hidden = false;
+      return;
+    }
+    panelEmpty.hidden = true;
+    info.ids.forEach(function (id) {
+      var full = '/memories/' + id + '/image';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'photo-open';
+      btn.setAttribute('data-full', full);
+      btn.setAttribute('data-download', full + '?download=1');
+      var img = document.createElement('img');
+      img.className = 'photo-img';
+      img.loading = 'lazy';
+      img.alt = '추억 사진';
+      img.onload = function () { img.classList.add('loaded'); btn.classList.add('is-loaded'); };
+      img.onerror = function () { btn.classList.add('is-error'); };
+      img.src = '/memories/' + id + '/thumb';
+      btn.appendChild(img);
+      panelGrid.appendChild(btn);
+    });
+  }
+
+  // 날짜 셀 탭 → 선택일 변경(페이지 이동 없이 패널만 갱신).
+  grid.addEventListener('click', function (e) {
+    var cell = e.target.closest('.cal-cell');
+    if (!cell || cell.classList.contains('empty')) return;
+    var day = parseInt(cell.getAttribute('data-day'), 10);
+    if (!day) return;
+    var prev = grid.querySelector('.cal-cell.is-selected');
+    if (prev) prev.classList.remove('is-selected');
+    cell.classList.add('is-selected');
+    selected = day;
+    renderPanel(day);
+  });
+
+  // 라이트박스 — 패널이 동적이라 위임(delegation)으로 연다.
+  var lb = document.getElementById('cal-lightbox');
+  var lbImg = document.getElementById('cal-lb-img');
+  var lbDownload = document.getElementById('cal-lb-download');
+  function openLb(full, dl) {
+    lbImg.src = full;
+    lbDownload.href = dl;
+    lb.hidden = false;
+    lb.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('lb-open');
+  }
+  function closeLb() {
+    lb.hidden = true;
+    lb.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('lb-open');
+    lbImg.removeAttribute('src');
+  }
+  panelGrid.addEventListener('click', function (e) {
+    var btn = e.target.closest('.photo-open');
+    if (!btn) return;
+    openLb(btn.getAttribute('data-full'), btn.getAttribute('data-download'));
+  });
+  document.getElementById('cal-lb-close').addEventListener('click', closeLb);
+  lb.addEventListener('click', function (e) {
+    if (e.target === lb || e.target.classList.contains('lb-stage')) closeLb();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !lb.hidden) closeLb();
+  });
+
+  renderPanel(selected);
+})();
+</script>
+{% endblock %}

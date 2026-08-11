@@ -8,6 +8,7 @@ settings and PWA plumbing on top of that.
 Run locally:   python app.py            (SQLite fallback, debug reloader)
 Run in prod:   gunicorn 'app:create_app()'   (Postgres via DATABASE_URL)
 """
+import calendar
 import functools
 import hmac
 import json
@@ -1684,7 +1685,7 @@ def _register_routes(app: Flask):
             return f"{days}일 전"
         return dt.strftime("%Y.%m.%d")
 
-    # ---- landing / dashboard ----
+    # ---- landing: 캘린더 홈 (질문 대시보드는 /today 로 이동) ----
     @app.route("/")
     def index():
         u = current_user()
@@ -1707,8 +1708,87 @@ def _register_routes(app: Flask):
         if len(couple.approved_members) < 2:
             return render_template("waiting_partner.html", invite_code=couple.invite_code)
 
-        # Full, active couple → today's question.
-        q = get_or_create_today_question(couple)
+        # Full, active couple → 캘린더 홈(이번 달 달력 + 날짜별 사진).
+        return _render_calendar_home(couple)
+
+    def _render_calendar_home(couple):
+        """이번 달(또는 ?month=YYYY-MM) 달력을 렌더한다. 각 날짜에 그 날 올린
+        사진(커버 썸네일·개수)을 얹고, 아래 날짜 패널은 클라이언트가 채운다."""
+        today = date.today()
+        raw = (request.args.get("month") or "").strip()
+        year, month = today.year, today.month
+        if raw:
+            try:
+                year, month = (int(x) for x in raw.split("-", 1))
+                date(year, month, 1)  # 유효성 검증(엉뚱한 값이면 이번 달로 폴백)
+            except (ValueError, TypeError):
+                year, month = today.year, today.month
+
+        month_start = date(year, month, 1)
+        days_in_month = calendar.monthrange(year, month)[1]
+        # 다음 달 1일(반열림 상한). created_at 은 datetime 이라 경계로 쓴다.
+        next_start = date(year, month, days_in_month) + timedelta(days=1)
+
+        # 이번 달 커플 사진을 조회해 '날짜 → 사진들'로 묶는다(커플 스코프).
+        photos = (
+            Photo.query.filter(
+                Photo.couple_id == couple.id,
+                Photo.created_at >= datetime(year, month, 1),
+                Photo.created_at
+                < datetime(next_start.year, next_start.month, next_start.day),
+            )
+            .order_by(Photo.created_at.asc(), Photo.id.asc())
+            .all()
+        )
+        by_day = {}
+        for p in photos:
+            by_day.setdefault(p.created_at.day, []).append(p)
+
+        # 셀/패널이 함께 쓰는 JSON: "day" -> {count, cover, ids}
+        PANEL_CAP = 60  # 하루 패널 썸네일 상한(과다 방지)
+        days_data = {}
+        for d, plist in by_day.items():
+            ids = [p.id for p in plist]
+            days_data[str(d)] = {
+                "count": len(ids),
+                "cover": ids[-1],  # 그 날 가장 최근 사진을 커버로
+                "ids": ids[:PANEL_CAP],
+            }
+
+        # 일요일 시작 그리드 — 앞쪽 빈칸 = (첫날 요일 +1) % 7 (월=0..일=6).
+        lead = (month_start.weekday() + 1) % 7
+        cells = [None] * lead + list(range(1, days_in_month + 1))
+        while len(cells) % 7:
+            cells.append(None)
+        weeks = [cells[i:i + 7] for i in range(0, len(cells), 7)]
+
+        prev_last = month_start - timedelta(days=1)
+        prev_month = f"{prev_last.year:04d}-{prev_last.month:02d}"
+        next_month = f"{next_start.year:04d}-{next_start.month:02d}"
+
+        today_day = today.day if (today.year == year and today.month == month) else None
+        selected_day = today_day or 1  # 기본 선택일: 오늘(이번 달)이면 오늘, 아니면 1일
+
+        return render_template(
+            "calendar.html",
+            year=year,
+            month=month,
+            month_label=f"{year}년 {month}월",
+            weeks=weeks,
+            weekday_headers=["일", "월", "화", "수", "목", "금", "토"],
+            days_data=days_data,
+            today_day=today_day,
+            selected_day=selected_day,
+            prev_month=prev_month,
+            next_month=next_month,
+        )
+
+    # ---- 오늘의 질문 대시보드 (예전 '/' 본문 — 온보딩 게이트 이후 부분) ----
+    @app.route("/today")
+    @active_couple_required
+    def today():
+        u = current_user()
+        q = get_or_create_today_question(u.couple)
         partner = u.partner
         my_ans = q.answer_by(u.id)
         partner_ans = q.answer_by(partner.id) if partner else None
@@ -2062,7 +2142,7 @@ def _register_routes(app: Flask):
         text = (request.form.get("answer") or "").strip()
         if not text:
             flash("답변을 입력해줘.", "error")
-            return redirect(url_for("index"))
+            return redirect(url_for("today"))
         q = get_or_create_today_question(u.couple)
         existing = q.answer_by(u.id)
         is_new = existing is None  # only a first answer notifies (edits stay quiet)
@@ -2081,7 +2161,7 @@ def _register_routes(app: Flask):
                 u.partner,
                 "answer",
                 f"{u.display_name}님이 오늘 답을 남겼어 💌",
-                url_for("index"),
+                url_for("today"),
             )
         # Freshen this month's cached insight in the BACKGROUND (never blocks the
         # response, never runs claude here). Only meaningful once there's a
@@ -2089,7 +2169,7 @@ def _register_routes(app: Flask):
         if u.partner is not None:
             today = date.today()
             _kick_monthly_report(u.couple_id, today.year, today.month)
-        return redirect(url_for("index"))
+        return redirect(url_for("today"))
 
     # ---- comments on a day's revealed answers ----
     @app.route("/question/<int:qid>/comment", methods=["POST"])
@@ -2132,7 +2212,7 @@ def _register_routes(app: Flask):
         # Today's comments live on the dashboard; a past day's live on its
         # detail page (/question/<qid>) — mirror that split in the deep link.
         if q.q_date == date.today():
-            link = url_for("index") + f"#c-q{q.id}"
+            link = url_for("today") + f"#c-q{q.id}"
         else:
             link = url_for("question_detail", qid=q.id) + f"#c-q{q.id}"
         _safe_notify(
@@ -2147,7 +2227,7 @@ def _register_routes(app: Flask):
         # Today is answered/commented on the dashboard; a past day returns to
         # its own detail page so the reader stays on the day they're reading.
         if q.q_date == date.today():
-            return redirect(url_for("index") + f"#c-q{q.id}")
+            return redirect(url_for("today") + f"#c-q{q.id}")
         return redirect(url_for("question_detail", qid=q.id) + f"#c-q{q.id}")
 
     # ---- single day detail ----
@@ -3394,7 +3474,7 @@ def _register_routes(app: Flask):
                         member,
                         "reminder",
                         "오늘의 질문에 아직 답 안 했어! 답해줘 💌",
-                        url_for("index"),
+                        url_for("today"),
                     )
                     db.session.commit()
                 except Exception:  # noqa: BLE001
@@ -3405,7 +3485,7 @@ def _register_routes(app: Flask):
                     member,
                     "오늘의 질문 💌",
                     "오늘의 질문에 아직 답 안 했어! 답해줘",
-                    "/",
+                    "/today",
                 )
                 reminders_sent += 1
         return jsonify(
