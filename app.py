@@ -55,6 +55,7 @@ from models import (
     Couple,
     DailyQuestion,
     EventItem,
+    EventScore,
     MonthlyReport,
     Notification,
     Photo,
@@ -776,6 +777,263 @@ def judge_case(app, case_id):
     finally:
         with _judging_lock:
             _judging.discard(case_id)
+
+
+# --------------------------------------------------------------------------- #
+# 데이트 뉴스 커플 맞춤 추천 점수 (P2) — 취향 프로필(비-AI) + 배치 채점(백그라운드)
+# --------------------------------------------------------------------------- #
+# 채점은 커플 데이터에서 만든 '취향 프로필'을 근거로 한다. 프로필 조립은 순전히
+# 이 커플 자신의 데이터를 뽑아 이어붙이는 값싼 비-AI 작업이고(여기 claude 없음),
+# 느린 claude 배치 채점은 아래 백그라운드 워커에서만 돈다.
+_PROFILE_MAXLEN = 1400  # 프로필 총 길이 상한(프롬프트 폭주 방지)
+
+
+def build_couple_taste_profile(couple) -> str:
+    """이 커플 자신의 데이터로 짧은 한국어 취향 프로필 텍스트를 만든다(비-AI).
+
+    claude를 부르지 않는다 — 최근 오늘의질문 답변·추억 캡션/태그·(옵션)지난 판사
+    사건 상황을 사실 그대로 이어붙여 요약한다. 총 길이를 몇백 자로 제한한다.
+    데이터가 사실상 없으면 ""를 반환한다(그럼 채점은 중립 프로필로도 동작한다).
+    호출부(백그라운드 워커)가 app_context 안에서 부른다.
+    """
+    if couple is None:
+        return ""
+    parts = []
+
+    try:
+        # 1) 최근 오늘의질문 답변(양쪽) — 표현된 관심사·기분.
+        recent_qs = (
+            DailyQuestion.query.filter_by(couple_id=couple.id)
+            .order_by(DailyQuestion.q_date.desc())
+            .limit(10)
+            .all()
+        )
+        ans_lines = []
+        for q in recent_qs:
+            for a in q.answers.all():
+                t = (a.text or "").strip()
+                if t:
+                    ans_lines.append(t[:120])
+        if ans_lines:
+            parts.append("[최근 오늘의질문 답변]\n" + "\n".join(f"- {t}" for t in ans_lines[:16]))
+    except Exception:  # noqa: BLE001 — 프로필은 best-effort, 절대 터지지 않게
+        db.session.rollback()
+        log.debug("taste profile: 답변 수집 실패", exc_info=True)
+
+    try:
+        # 2) 최근 추억 사진 캡션 + 태그(ready) — 뭘 찍고 좋아하는지.
+        photos = (
+            Photo.query.filter_by(couple_id=couple.id, caption_status="ready")
+            .order_by(Photo.created_at.desc(), Photo.id.desc())
+            .limit(20)
+            .all()
+        )
+        cap_lines = []
+        tag_bag = []
+        for p in photos:
+            c = (p.caption or "").strip()
+            if c:
+                cap_lines.append(c[:120])
+            for tg in p.tags_list:
+                tg = str(tg).strip()
+                if tg and tg not in tag_bag:
+                    tag_bag.append(tg)
+        if cap_lines:
+            parts.append("[추억 사진 속 모습]\n" + "\n".join(f"- {c}" for c in cap_lines[:12]))
+        if tag_bag:
+            parts.append("[자주 담는 것들] " + ", ".join(tag_bag[:20]))
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.debug("taste profile: 사진 수집 실패", exc_info=True)
+
+    try:
+        # 3) (옵션) 지난 판사 사건 상황 — 민감할 수 있는 주제(피하기용 참고).
+        cases = (
+            Case.query.filter_by(couple_id=couple.id)
+            .order_by(Case.created_at.desc())
+            .limit(5)
+            .all()
+        )
+        sit_lines = []
+        for c in cases:
+            s = (c.title or c.situation or "").strip()
+            if s:
+                sit_lines.append(s[:80])
+        if sit_lines:
+            parts.append(
+                "[가끔 부딪히는 지점(자극 피하기 참고)]\n"
+                + "\n".join(f"- {s}" for s in sit_lines[:5])
+            )
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.debug("taste profile: 사건 수집 실패", exc_info=True)
+
+    profile = "\n\n".join(parts).strip()
+    if len(profile) > _PROFILE_MAXLEN:
+        profile = profile[:_PROFILE_MAXLEN].rstrip()
+    return profile
+
+
+# 백그라운드 채점 가드 — 같은 커플에 두 패스가 겹치지 않게 하는 in-process 집합
+# (캡션의 _captioning과 같은 패턴). claude 호출은 아래에서 캡션과 '같은'
+# _CAPTION_SEM으로 직렬화해 512MB 티어에서 동시에 claude가 둘 이상 뜨지 않게 한다.
+_scoring_lock = threading.Lock()
+_scoring: set[int] = set()
+_SCORE_BATCH_DEFAULT = 24  # 한 패스당 채점 상한(배치 1콜 크기)
+
+
+def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
+    """백그라운드 워커: 이 커플에 아직 점수 없는 진행 중 행사들을 배치로 채점한다.
+
+    caption_photo와 같은 규율: 자기 app_context(→ 새 스레드로컬 세션)를 열고,
+    캡션과 공유하는 _CAPTION_SEM으로 claude 배치 콜을 직렬화하고, 모든 예외를
+    삼키며 스레드 밖으로 절대 raise 안 하고, finally에서 가드 키를 해제한다.
+
+    선택: 진행 중(end_date NULL 또는 >= 오늘) 행사 중 이 커플에 'ready' 점수가
+    없는(행 없거나 status!='ready') 것들을 마감 임박 순으로 최대 ``limit``개.
+    없으면 그냥 반환. 선택된 것들에 'pending' 행을 만들어(UI가 "분석 중" 표시)
+    두고, 프로필을 한 번 만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번'
+    호출한다. 돌아온 ref → score/reason/status='ready'; 안 돌아온 ref →
+    status='failed'(이 패스에서 무한 재시도 방지; 이후 패스가 재시도 가능).
+    """
+    with _scoring_lock:
+        if couple_id in _scoring:
+            return  # 이미 이 커플 채점 중 — 겹치지 않게
+        _scoring.add(couple_id)
+
+    try:
+        with app.app_context():
+            try:
+                couple = db.session.get(Couple, couple_id)
+                if couple is None:
+                    return
+                today = date.today()
+
+                # 진행 중 행사 중 이 커플에 'ready' 점수가 없는 것 — 마감 임박 순.
+                # LEFT JOIN으로 EventScore가 없거나 ready가 아닌 행만 고른다.
+                rows = (
+                    db.session.query(EventItem, EventScore)
+                    .outerjoin(
+                        EventScore,
+                        db.and_(
+                            EventScore.event_id == EventItem.id,
+                            EventScore.couple_id == couple_id,
+                        ),
+                    )
+                    .filter(
+                        db.or_(
+                            EventItem.end_date.is_(None),
+                            EventItem.end_date >= today,
+                        ),
+                        db.or_(
+                            EventScore.id.is_(None),
+                            EventScore.status != "ready",
+                        ),
+                    )
+                    .order_by(
+                        (EventItem.end_date.is_(None)),
+                        EventItem.end_date.asc(),
+                        EventItem.start_date.asc(),
+                    )
+                    .limit(int(limit) if limit else _SCORE_BATCH_DEFAULT)
+                    .all()
+                )
+                if not rows:
+                    return
+
+                # 선택된 행에 EventScore 행을 'pending'으로 보장(UI "분석 중").
+                selected = []  # (event, score_row)
+                for ev, sc_row in rows:
+                    if sc_row is None:
+                        sc_row = EventScore(
+                            couple_id=couple_id, event_id=ev.id, status="pending"
+                        )
+                        db.session.add(sc_row)
+                    else:
+                        sc_row.status = "pending"
+                    selected.append((ev, sc_row))
+                try:
+                    db.session.commit()
+                except IntegrityError:
+                    # 동시 패스가 행을 먼저 만들었을 수 있음 — 롤백하고 이번 패스는
+                    # 양보(다음 on-view 트리거가 재시도).
+                    db.session.rollback()
+                    return
+
+                # 프로필 1회 + 배치 페이로드.
+                profile_text = build_couple_taste_profile(couple)
+                batch = [
+                    {
+                        "ref": ev.id,
+                        "title": ev.title,
+                        "category": ev.category,
+                        "place": ev.place,
+                        "description": ev.description,
+                    }
+                    for ev, _ in selected
+                ]
+
+                # 캡션과 '같은' 세마포어로 claude 배치 콜을 직렬화(512MB: 동시에
+                # claude 하나만). claude가 터져도 실패로만 취급.
+                _CAPTION_SEM.acquire()
+                try:
+                    try:
+                        results = ai.score_events(profile_text, batch)
+                    except Exception:  # noqa: BLE001 — claude가 스레드 죽이지 못하게
+                        log.exception(
+                            "claude event scoring raised (couple=%s)", couple_id
+                        )
+                        results = []
+                finally:
+                    _CAPTION_SEM.release()
+
+                by_ref = {}
+                for r in results or []:
+                    ref = r.get("ref")
+                    if ref is not None:
+                        by_ref[ref] = r
+
+                # 결과 반영: 받은 ref → ready, 안 받은 ref → failed.
+                now = datetime.utcnow()
+                for ev, sc_row in selected:
+                    r = by_ref.get(ev.id)
+                    if r is not None:
+                        sc_row.score = r.get("score")
+                        sc_row.reason = (r.get("reason") or "")[:1000]
+                        sc_row.status = "ready"
+                    else:
+                        sc_row.status = "failed"
+                    sc_row.updated_at = now
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception(
+                        "commit failed for event scores (couple=%s)", couple_id
+                    )
+            except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
+                db.session.rollback()
+                log.exception("score_events_for_couple failed (couple=%s)", couple_id)
+    finally:
+        with _scoring_lock:
+            _scoring.discard(couple_id)
+
+
+def _spawn_scoring_if_idle(app, couple_id):
+    """이 커플 채점 백그라운드 스레드를 스폰(이미 큐/진행 중이면 no-op).
+
+    dates() 뷰가 반복 조회돼도 스레드가 쌓이지 않도록 score_events_for_couple과
+    같은 _scoring 가드로 중복을 떨군다. best-effort — 절대 raise 안 함.
+    """
+    with _scoring_lock:
+        if couple_id in _scoring:
+            return
+    try:
+        threading.Thread(
+            target=score_events_for_couple, args=(app, couple_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — 채점은 best-effort
+        log.exception("failed to spawn scoring thread for couple %s", couple_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -2121,31 +2379,96 @@ def _register_routes(app: Flask):
     @app.route("/dates")
     @active_couple_required
     def dates():
-        """진행 중인(만료되지 않은) 행사 목록 — 마감 임박 순, 마감 없는 건 뒤로.
+        """진행 중인(만료되지 않은) 행사 목록 — 이 커플 AI 추천 점수순(높은 순).
 
-        end_date가 없거나 오늘 이후인 행만 보인다. 비어 있으면 빈 상태를 보여준다."""
+        end_date가 없거나 오늘 이후인 행만 보인다. 각 행사에 이 커플의 EventScore를
+        붙여 {event, score, reason, score_status}로 넘기고, ready 먼저(점수 높은 순)·
+        그다음 pending·마지막 failed/없음 순으로 정렬한다. 'ready' 점수가 없는 진행
+        중 행사가 있으면 백그라운드 채점 스레드를 스폰한다(요청은 절대 블록 안 함)."""
+        u = current_user()
         today = date.today()
-        # 마감 임박 순(soonest-ending). end_date NULL(상시)은 맨 뒤로.
-        items = (
-            EventItem.query.filter(
-                db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today)
+        # 진행 중 행사 + 이 커플 EventScore를 LEFT JOIN으로 한 번에.
+        rows = (
+            db.session.query(EventItem, EventScore)
+            .outerjoin(
+                EventScore,
+                db.and_(
+                    EventScore.event_id == EventItem.id,
+                    EventScore.couple_id == u.couple_id,
+                ),
             )
-            .order_by(
-                (EventItem.end_date.is_(None)),  # False(0)=날짜있음 먼저, True(1)=NULL 뒤로
-                EventItem.end_date.asc(),
-                EventItem.start_date.asc(),
+            .filter(
+                db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today)
             )
             .all()
         )
-        return render_template("dates.html", items=items)
+
+        items = []
+        any_pending = False
+        for ev, sc in rows:
+            status = sc.status if sc is not None else None
+            if status == "pending":
+                any_pending = True
+            items.append(
+                {
+                    "event": ev,
+                    "score": sc.score if sc is not None else None,
+                    "reason": sc.reason if sc is not None else None,
+                    "score_status": status,
+                }
+            )
+
+        # 정렬: ready 먼저(점수 높은 순, 동점이면 마감 임박 순) → pending → 나머지.
+        # 마감 없는(end_date NULL) 건 날짜 정렬에서 맨 뒤로 가도록 큰 값을 준다.
+        _far = date.max
+
+        def _rank(it):
+            st = it["score_status"]
+            ev = it["event"]
+            end = ev.end_date or _far
+            if st == "ready":
+                # 점수 내림차순 → -score, 동점은 마감 임박 순(end asc), 시작 순.
+                return (0, -(it["score"] or 0), end, ev.start_date or _far)
+            if st == "pending":
+                return (1, 0, end, ev.start_date or _far)
+            return (2, 0, end, ev.start_date or _far)
+
+        items.sort(key=_rank)
+
+        # 셀프힐: 'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점을 스폰.
+        # (뷰를 반복 조회해도 _scoring 가드로 스레드가 쌓이지 않는다. 요청 블록 X.)
+        needs_scoring = any(it["score_status"] != "ready" for it in items)
+        if items and needs_scoring:
+            _spawn_scoring_if_idle(current_app._get_current_object(), u.couple_id)
+
+        # 채점이 진행/대기 중이면(pending 행이 있거나, 방금 스폰돼 곧 채워질 예정)
+        # 완료 점수가 수동 새로고침 없이 뜨도록 템플릿이 부드럽게 자동 새로고침한다.
+        scoring_active = bool(items and (any_pending or needs_scoring))
+
+        return render_template(
+            "dates.html", items=items, scoring_active=scoring_active
+        )
 
     @app.route("/dates/<int:item_id>")
     @active_couple_required
     def date_detail(item_id):
+        u = current_user()
         item = db.session.get(EventItem, item_id)
         if item is None:
             abort(404)
-        return render_template("date_detail.html", item=item)
+        sc = EventScore.query.filter_by(
+            couple_id=u.couple_id, event_id=item.id
+        ).first()
+        score = sc.score if sc is not None else None
+        reason = sc.reason if sc is not None else None
+        score_status = sc.status if sc is not None else None
+        return render_template(
+            "date_detail.html",
+            item=item,
+            score=score,
+            reason=reason,
+            score_status=score_status,
+        )
 
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
