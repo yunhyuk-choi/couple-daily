@@ -403,6 +403,16 @@ a.history-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(
 .insight-row strong { min-width: 92px; color: var(--muted); font-size: 0.85rem; }
 .insight-row.fun strong { color: var(--pink); }
 
+/* 월간 '우리 리포트' — 크로스도메인 회고 카드 (공유용 카드 느낌) */
+.report-card { background: linear-gradient(160deg, var(--pink-soft), var(--card, #fff)); }
+.report-headline { font-size: 1.32rem; font-weight: 800; line-height: 1.45; color: var(--pink); margin: 4px 0 10px; }
+.report-card .insight-summary { font-size: 1.02rem; font-weight: 600; color: var(--text, inherit); }
+.area-note { display: flex; gap: 10px; align-items: flex-start; padding: 11px 0; border-top: 1px solid var(--line); }
+.area-note .area-ico { font-size: 1.2rem; line-height: 1.4; flex: 0 0 auto; }
+.area-note > div { display: flex; flex-direction: column; gap: 2px; }
+.area-note strong { color: var(--pink); font-size: 0.82rem; font-weight: 800; }
+.area-note span { line-height: 1.55; }
+
 code { background: var(--pink-soft); padding: 2px 6px; border-radius: 6px; font-size: 0.9em; }
 
 /* comments */

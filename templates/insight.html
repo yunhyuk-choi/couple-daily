@@ -59,19 +59,58 @@
     </div>
   </div>
 
-  <!-- Qualitative: grounded in real answers via claude -p (DB-cached) -->
-  <div class="card insight-card">
+  <!-- Qualitative: grounded in real activity via claude -p (DB-cached) -->
+  <div class="card insight-card report-card">
     <div class="q-head">
       <img class="emoji" src="{{ url_for('static', filename='emoji/sparkles.svg') }}" alt="" />
-      <span>이번 달, 두 사람의 이야기</span>
-      {% if qualitative and refreshing %}
+      <span>우리 리포트</span>
+      {% if (report or qualitative) and refreshing %}
       {# Content exists AND a background refresh is running: keep showing the
          OLD report (stale-while-revalidate) with a subtle, non-disruptive hint.
          The auto-reload below swaps it to the fresh report when ready. #}
-      <span class="refresh-badge" title="새 답변을 반영해 다시 정리하고 있어. 준비되면 자동으로 바뀔게.">새 내용 반영 중…</span>
+      <span class="refresh-badge" title="새 활동을 반영해 다시 정리하고 있어. 준비되면 자동으로 바뀔게.">새 내용 반영 중…</span>
       {% endif %}
     </div>
-    {% if qualitative %}
+
+    {% if report %}
+      {# 새 크로스도메인 '우리 리포트' — 사진·판결·데이트까지 엮은 회고 #}
+      {% if report.headline %}<p class="report-headline">{{ report.headline }}</p>{% endif %}
+      {% if report.summary %}<p class="insight-summary">{{ report.summary }}</p>{% endif %}
+
+      {% if report.photo_note %}
+      <div class="area-note">
+        <span class="area-ico" aria-hidden="true">📸</span>
+        <div><strong>사진</strong><span>{{ report.photo_note }}</span></div>
+      </div>
+      {% endif %}
+      {% if report.date_note %}
+      <div class="area-note">
+        <span class="area-ico" aria-hidden="true">💘</span>
+        <div><strong>데이트</strong><span>{{ report.date_note }}</span></div>
+      </div>
+      {% endif %}
+      {% if report.harmony_note %}
+      <div class="area-note">
+        <span class="area-ico" aria-hidden="true">🤝</span>
+        <div><strong>화해</strong><span>{{ report.harmony_note }}</span></div>
+      </div>
+      {% endif %}
+
+      {% if report.themes %}
+        <div class="themes">
+          {% for t in report.themes %}<span class="chip">{{ t }}</span>{% endfor %}
+        </div>
+      {% endif %}
+      {% if report.tone %}
+      <div class="insight-row"><strong>분위기</strong><span>{{ report.tone }}</span></div>
+      {% endif %}
+      {% if report.fun %}
+      <div class="insight-row fun"><strong>재미용</strong><span>{{ report.fun }}</span></div>
+      {% endif %}
+      <p class="muted small">이 회고는 두 사람이 실제로 남긴 답변·사진·화해·데이트 기록만을 근거로 claude가 다정하게 엮었어. 점수가 아니라 부드러운 이야기야.</p>
+
+    {% elif qualitative %}
+      {# 폴백: report_json이 없는 과거 캐시 리포트는 기존 필드로 렌더 #}
       {% if qualitative.summary %}<p class="insight-summary">{{ qualitative.summary }}</p>{% endif %}
       {% if qualitative.themes %}
         <div class="themes">
@@ -88,6 +127,7 @@
       <div class="insight-row fun"><strong>재미용</strong><span>{{ qualitative.fun }}</span></div>
       {% endif %}
       <p class="muted small">이 관찰은 두 사람이 실제로 남긴 답변만을 근거로 claude가 정리했어. 점수가 아니라 부드러운 관찰이야.</p>
+
     {% else %}
       <p class="insight-pending muted">
         <span class="pending-dots" aria-hidden="true">•••</span>

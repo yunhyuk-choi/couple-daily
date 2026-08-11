@@ -107,6 +107,27 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding photos.caption_status"
                     )
+
+        # 4) monthly_reports: 월간 '우리 리포트'의 구조화된 전문(JSON) 컬럼.
+        #    monthly_reports 테이블은 프로덕션에 이미 존재하므로 create_all이
+        #    ALTER하지 않는다 — 없을 때만 report_json 컬럼을 추가한다. Postgres·
+        #    SQLite 모두 안전하고 반복 실행에도 멱등하다. 기존 행은 report_json이
+        #    NULL로 남아 UI가 레거시 필드로 폴백한다(하위 호환).
+        if "monthly_reports" in insp.get_table_names():
+            mcols = {c["name"]: c for c in insp.get_columns("monthly_reports")}
+            if "report_json" not in mcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "ALTER TABLE monthly_reports ADD COLUMN report_json TEXT"
+                            )
+                        )
+                    log.info("startup migration: added monthly_reports.report_json")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "startup migration: failed adding monthly_reports.report_json"
+                    )
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -416,6 +437,11 @@ class MonthlyReport(db.Model):
     divergent_question = db.Column(db.Text, nullable=True)
     fun = db.Column(db.Text, nullable=True)
 
+    # ---- 월간 '우리 리포트' 구조화 전문(JSON) — 새 크로스도메인 리포트 전체를
+    #      담는다. 위 레거시 컬럼은 하위 호환/폴백용으로 계속 채운다. 값이 NULL이면
+    #      (과거 캐시된 리포트) UI는 레거시 필드로 렌더한다. ----
+    report_json = db.Column(db.Text, nullable=True)
+
     # ---- lifecycle ----
     status = db.Column(db.String(16), default="generating", nullable=False)
     generated_at = db.Column(db.DateTime, nullable=True)  # last successful build
@@ -436,6 +462,17 @@ class MonthlyReport(db.Model):
             return v if isinstance(v, list) else []
         except (ValueError, TypeError):
             return []
+
+    @property
+    def report(self):
+        """report_json을 구조화 dict로 디코드(없거나 깨졌으면 None)."""
+        if not self.report_json:
+            return None
+        try:
+            v = json.loads(self.report_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
 
 
 class Case(db.Model):

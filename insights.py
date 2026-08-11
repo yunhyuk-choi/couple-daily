@@ -4,9 +4,18 @@ Deliberately NO love score / compatibility percentage — just honest counts and
 trends grounded in real activity.
 """
 from calendar import monthrange
-from datetime import date
+from datetime import date, datetime
 
-from models import DailyQuestion, Answer, User
+from models import (
+    DailyQuestion,
+    Answer,
+    User,
+    Photo,
+    Case,
+    EventItem,
+    EventPick,
+    db,
+)
 
 
 def _month_bounds(year, month):
@@ -184,3 +193,113 @@ def collect_month_qa(couple_id, year, month, user_a, user_b):
             }
         )
     return items
+
+
+def _month_dt_bounds(year, month):
+    """월의 [시작, 다음달 시작) DateTime 경계 — created_at/updated_at 비교용."""
+    start, _end = _month_bounds(year, month)
+    start_dt = datetime(start.year, start.month, start.day)
+    if month == 12:
+        next_start = datetime(year + 1, 1, 1)
+    else:
+        next_start = datetime(year, month + 1, 1)
+    return start_dt, next_start
+
+
+def collect_month_context(couple_id, year, month, user_a, user_b):
+    """한 달치 크로스도메인 컨텍스트를 모은다(비-AI, 전부 저렴/경계 제한).
+
+    반환: {qa, photos, cases, dates}. 각 소스는 독립 try/except로 감싸 하나가
+    실패해도 전체는 깨지지 않고 빈 값으로 떨어진다. 모든 쿼리는 couple 범위.
+    """
+    start_dt, next_start = _month_dt_bounds(year, month)
+
+    # Q&A는 기존 수집기를 재사용(파트너 없으면 [] 반환).
+    qa = collect_month_qa(couple_id, year, month, user_a, user_b)
+
+    # 사진: 이번 달 생성 + 캡션 완료(ready)된 것의 캡션 최대 ~15개.
+    photos = {"count": 0, "captions": []}
+    try:
+        rows = (
+            Photo.query.filter(
+                Photo.couple_id == couple_id,
+                Photo.caption_status == "ready",
+                Photo.created_at >= start_dt,
+                Photo.created_at < next_start,
+            )
+            .order_by(Photo.created_at.asc())
+            .all()
+        )
+        photos["count"] = len(rows)
+        caps = []
+        for r in rows:
+            c = (r.caption or "").strip()
+            if c:
+                caps.append(c)
+        photos["captions"] = caps[:15]
+    except Exception:  # noqa: BLE001 — 소스 하나 실패가 전체를 깨지 않게
+        photos = {"count": 0, "captions": []}
+
+    # 판결(사건): 이번 달 생성된 사건 수/화해 종결 수 + 제목/상황 스니펫 최대 ~5개.
+    cases = {"count": 0, "resolved": 0, "topics": []}
+    try:
+        rows = (
+            Case.query.filter(
+                Case.couple_id == couple_id,
+                Case.created_at >= start_dt,
+                Case.created_at < next_start,
+            )
+            .order_by(Case.created_at.asc())
+            .all()
+        )
+        cases["count"] = len(rows)
+        cases["resolved"] = sum(1 for r in rows if r.status == "resolved")
+        topics = []
+        for r in rows:
+            snip = (r.title or r.situation or "").strip()
+            if snip:
+                topics.append(snip[:40])
+        cases["topics"] = topics[:5]
+    except Exception:  # noqa: BLE001
+        cases = {"count": 0, "resolved": 0, "topics": []}
+
+    # 데이트: 이번 달 '다녀왔어'로 표시한 행사 제목 최대 ~8개(중복 제거) +
+    # 커플이 둘 다 찜해 '확정'된 행사 수(confirmed_count).
+    dates = {"visited": [], "confirmed_count": 0}
+    try:
+        visited_rows = (
+            db.session.query(EventItem.title)
+            .join(EventPick, EventPick.event_id == EventItem.id)
+            .filter(
+                EventPick.couple_id == couple_id,
+                EventPick.status == "visited",
+                EventPick.updated_at >= start_dt,
+                EventPick.updated_at < next_start,
+            )
+            .distinct()
+            .all()
+        )
+        titles = []
+        seen = set()
+        for (t,) in visited_rows:
+            t = (t or "").strip()
+            if t and t not in seen:
+                seen.add(t)
+                titles.append(t)
+        dates["visited"] = titles[:8]
+
+        # confirmed = interested한 서로 다른 사용자가 2명 이상인 행사(기존 로직 재사용).
+        picks = EventPick.query.filter(
+            EventPick.couple_id == couple_id,
+            EventPick.status == "interested",
+        ).all()
+        by_event = {}
+        for p in picks:
+            by_event.setdefault(p.event_id, set()).add(p.user_id)
+        dates["confirmed_count"] = sum(
+            1 for uids in by_event.values() if len(uids) >= 2
+        )
+    except Exception:  # noqa: BLE001
+        dates = {"visited": [], "confirmed_count": 0}
+
+    return {"qa": qa, "photos": photos, "cases": cases, "dates": dates}
