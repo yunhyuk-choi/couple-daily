@@ -1420,6 +1420,40 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .bet-past-row { display: flex; flex-direction: column; gap: 6px; }
 .bet-past-parts { display: flex; flex-wrap: wrap; gap: 6px; }
 
+/* 예측 내기(2b) — 타입 토글 + 각자 예측/판정 표시 */
+.bet-type-toggle { display: flex; gap: 8px; }
+.bet-type-opt {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  font-weight: 700;
+  cursor: pointer;
+}
+.bet-type-opt input { margin: 0; }
+.bet-type-opt:has(input:checked) { border-color: var(--pink); background: var(--pink-soft); color: var(--pink); }
+.bet-fields { display: flex; flex-direction: column; gap: 14px; }
+.bet-pred-guesses { display: flex; flex-direction: column; gap: 8px; }
+.bet-pred-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--pink-soft);
+}
+.bet-pred-row.is-winner { background: var(--ok); color: var(--ok-ink); }
+.bet-pred-name { font-weight: 800; }
+.bet-pred-date { margin-left: auto; font-weight: 700; }
+.bet-pred-verdict { font-size: 1rem; }
+.bet-loser { color: var(--pink); font-weight: 700; }
+
 /* 확정 데이트의 '날짜 정하기' + '다녀왔어' 액션 나란히 */
 .confirmed-actions {
   display: flex;

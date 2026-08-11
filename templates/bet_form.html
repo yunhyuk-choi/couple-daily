@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}{{ '내기 수정' if mode == 'edit' else '내기 추가' }} · {{ app_name }}{% endblock %}
 {% block content %}
-{# 습관 내기 추가/수정 공용 폼. 대상은 같이/나/상대 중 선택(→ NULL/내 id/상대 id). #}
+{# 내기 추가/수정 공용 폼 — 타입 선택(습관/예측). 습관: 활동·주 N회·대상·시작일.
+   예측: 예측 내용·각자 날짜(안정적 a/b). 벌칙·설명은 공통. 수정 시 타입은 잠금. #}
 <div class="page-head">
   <span class="hero-sm" aria-hidden="true" style="font-size:1.6rem">🔥</span>
   <h1>{{ '내기 수정' if mode == 'edit' else '내기 추가' }}</h1>
@@ -10,29 +11,72 @@
 <div class="card">
   <form class="stack" method="post"
         action="{{ url_for('bet_edit', bid=bet.id) if mode == 'edit' else url_for('bet_new') }}">
-    <label for="bet-title">활동 <span class="muted small">(필수)</span>
-      <input id="bet-title" type="text" name="title" maxlength="200" required
-             placeholder="예: 하루 한 편 시 쓰기" value="{{ form_title }}" />
-    </label>
-    <label for="bet-count">일주일에 몇 번? <span class="muted small">(필수)</span>
-      <input id="bet-count" type="number" name="count_target" min="1" max="7" required
-             placeholder="예: 5" value="{{ form_count }}" />
-    </label>
-    <label for="bet-target">대상 <span class="muted small">(누가 하나요)</span>
-      <select id="bet-target" name="target">
-        <option value="" {% if form_target == '' %}selected{% endif %}>같이 (둘 다)</option>
-        <option value="{{ me.id }}" {% if form_target == me.id|string %}selected{% endif %}>{{ me.display_name }}</option>
-        {% if partner %}
-        <option value="{{ partner.id }}" {% if form_target == partner.id|string %}selected{% endif %}>{{ partner.display_name }}</option>
-        {% endif %}
-      </select>
-    </label>
-    <label for="bet-start">시작일 <span class="muted small">(이 날부터 한 주씩)</span>
-      <input id="bet-start" type="date" name="start_date" required value="{{ form_start }}" />
-    </label>
+    {# ---- 타입 선택(신규만 전환 가능; 수정은 현재 타입 고정) ---- #}
+    {% if mode == 'edit' %}
+    <input type="hidden" name="type" value="{{ form_type }}" />
+    <p class="muted small" style="margin:0">
+      종류 · {{ '예측 내기 🔮' if form_type == 'prediction' else '습관 내기 🔥' }}
+    </p>
+    {% else %}
+    <div class="bet-type-toggle" role="radiogroup" aria-label="내기 종류">
+      <label class="bet-type-opt">
+        <input type="radio" name="type" value="habit"
+               {% if form_type != 'prediction' %}checked{% endif %} />
+        <span>습관 🔥</span>
+      </label>
+      <label class="bet-type-opt">
+        <input type="radio" name="type" value="prediction"
+               {% if form_type == 'prediction' %}checked{% endif %} />
+        <span>예측 🔮</span>
+      </label>
+    </div>
+    {% endif %}
+
+    {# ---- 습관 내기 필드 ---- #}
+    <div class="bet-fields" data-bet-fields="habit">
+      <label for="bet-title">활동 <span class="muted small">(필수)</span>
+        <input id="bet-title" type="text" name="title" maxlength="200"
+               placeholder="예: 하루 한 편 시 쓰기"
+               value="{{ form_title if form_type != 'prediction' else '' }}" />
+      </label>
+      <label for="bet-count">일주일에 몇 번? <span class="muted small">(필수)</span>
+        <input id="bet-count" type="number" name="count_target" min="1" max="7"
+               placeholder="예: 5" value="{{ form_count }}" />
+      </label>
+      <label for="bet-target">대상 <span class="muted small">(누가 하나요)</span>
+        <select id="bet-target" name="target">
+          <option value="" {% if form_target == '' %}selected{% endif %}>같이 (둘 다)</option>
+          <option value="{{ me.id }}" {% if form_target == me.id|string %}selected{% endif %}>{{ me.display_name }}</option>
+          {% if partner %}
+          <option value="{{ partner.id }}" {% if form_target == partner.id|string %}selected{% endif %}>{{ partner.display_name }}</option>
+          {% endif %}
+        </select>
+      </label>
+      <label for="bet-start">시작일 <span class="muted small">(이 날부터 한 주씩)</span>
+        <input id="bet-start" type="date" name="start_date" value="{{ form_start }}" />
+      </label>
+    </div>
+
+    {# ---- 예측 내기 필드 ---- #}
+    <div class="bet-fields" data-bet-fields="prediction">
+      <label for="bet-ptitle">무엇을 예측할까? <span class="muted small">(필수)</span>
+        <input id="bet-ptitle" type="text" name="ptitle" maxlength="200"
+               placeholder="예: 이사 언제 갈까"
+               value="{{ form_title if form_type == 'prediction' else '' }}" />
+      </label>
+      <p class="muted small" style="margin:0">각자 언제일지 날짜를 찍어봐 — 실제 날짜에 더 가까운 사람이 이겨!</p>
+      <label for="bet-guess-a">{{ member_a.display_name if member_a else 'A' }}의 예측 <span class="muted small">(필수)</span>
+        <input id="bet-guess-a" type="date" name="guess_a_date" value="{{ form_guess_a }}" />
+      </label>
+      <label for="bet-guess-b">{{ member_b.display_name if member_b else 'B' }}의 예측 <span class="muted small">(필수)</span>
+        <input id="bet-guess-b" type="date" name="guess_b_date" value="{{ form_guess_b }}" />
+      </label>
+    </div>
+
+    {# ---- 공통 필드 ---- #}
     <label for="bet-penalty">벌칙 <span class="muted small">(선택)</span>
       <input id="bet-penalty" type="text" name="penalty" maxlength="500"
-             placeholder="예: 못 지키면 커피 사기 ☕" value="{{ form_penalty }}" />
+             placeholder="예: 진 사람이 커피 사기 ☕" value="{{ form_penalty }}" />
     </label>
     <label for="bet-desc">설명 <span class="muted small">(선택)</span>
       <textarea id="bet-desc" name="description" rows="3"
@@ -43,4 +87,30 @@
        href="{{ url_for('bet_detail', bid=bet.id) if mode == 'edit' else url_for('calendar_bets') }}">취소</a>
   </form>
 </div>
+
+{# 의존성 없는 순수 JS 토글 — 선택된 타입의 필드 묶음만 보인다. 서버는 name이
+   분리돼(습관 title / 예측 ptitle·guess_*) 있어 JS 없이도 정확히 읽는다. #}
+<script>
+(function () {
+  var form = document.querySelector('.stack');
+  if (!form) return;
+  var groups = form.querySelectorAll('[data-bet-fields]');
+  function currentType() {
+    var checked = form.querySelector('input[name="type"]:checked');
+    if (checked) return checked.value;
+    var hidden = form.querySelector('input[name="type"][type="hidden"]');
+    return hidden ? hidden.value : 'habit';
+  }
+  function apply() {
+    var t = currentType();
+    groups.forEach(function (g) {
+      g.style.display = (g.getAttribute('data-bet-fields') === t) ? '' : 'none';
+    });
+  }
+  form.querySelectorAll('input[name="type"]').forEach(function (r) {
+    r.addEventListener('change', apply);
+  });
+  apply();
+})();
+</script>
 {% endblock %}

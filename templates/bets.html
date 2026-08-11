@@ -17,6 +17,38 @@
 <ul class="bet-list">
   {% for r in rows %}
   {% set b = r.bet %}
+  {% if r.type == 'prediction' %}
+  {# ---- 예측 내기 카드 ---- #}
+  {% set pr = r.prediction %}
+  <li class="bet-card{% if b.status == 'ended' %} is-ended{% endif %}">
+    <a class="bet-card-main" href="{{ url_for('bet_detail', bid=b.id) }}">
+      <div class="bet-card-head">
+        <span class="bet-title">🔮 {{ b.title }}</span>
+        {% if b.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+      </div>
+      <div class="bet-progress">
+        <span class="bet-prog-pill">{{ pr.a_name }} · {{ pr.guess_a.strftime('%m.%d') if pr.guess_a else '-' }}</span>
+        <span class="bet-prog-pill">{{ pr.b_name }} · {{ pr.guess_b.strftime('%m.%d') if pr.guess_b else '-' }}</span>
+      </div>
+      {% if pr.actual %}
+      <div class="bet-progress">
+        {% if pr.winner == 'tie' %}
+        <span class="bet-prog-pill met">무승부 🤝 (각 {{ pr.da }}일 차)</span>
+        {% else %}
+        <span class="bet-prog-pill met">🏆 {{ pr.winner_name }} 승 · {{ pr.da if pr.winner == 'a' else pr.db }}일 차</span>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="bet-progress"><span class="muted small">진행중 · 결과 대기</span></div>
+      {% endif %}
+      {% if b.penalty %}<div class="bet-penalty muted small">벌칙 · {{ b.penalty }}</div>{% endif %}
+    </a>
+    {% if not pr.actual %}
+    <a class="btn primary sm" href="{{ url_for('bet_detail', bid=b.id) }}">결과 입력</a>
+    {% endif %}
+  </li>
+  {% else %}
+  {# ---- 습관 내기 카드 ---- #}
   <li class="bet-card{% if b.status == 'ended' %} is-ended{% endif %}">
     <a class="bet-card-main" href="{{ url_for('bet_detail', bid=b.id) }}">
       <div class="bet-card-head">
@@ -53,6 +85,7 @@
     </form>
     {% endif %}
   </li>
+  {% endif %}
   {% endfor %}
 </ul>
 {% endif %}
