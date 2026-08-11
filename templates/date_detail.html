@@ -36,6 +36,27 @@
   </div>
   {% endif %}
 
+  {# 찜/방문함/관심없음 컨트롤 — fetch로 JSON 엔드포인트를 치고 제자리 갱신 #}
+  <div class="pick-controls" id="pick-controls" data-id="{{ item.id }}"
+       data-picked="{{ 'true' if my_status == 'interested' else 'false' }}">
+    <div class="pick-status-row">
+      <span class="confirm-badge" id="pick-confirm"{% if not confirmed %} hidden{% endif %}>💘 확정</span>
+      <span class="pick-partner muted small" id="pick-partner">
+        {%- if confirmed %}상대도 찜했어 💘
+        {%- elif partner_status == 'interested' %}상대가 이미 찜했어 — 너도 찜하면 확정 💘
+        {%- else %}상대가 아직 안 봤어{% endif -%}
+      </span>
+    </div>
+    <div class="pick-btns">
+      <button type="button" class="btn sm pick-toggle" id="pick-toggle">
+        {{ '찜 취소' if my_status == 'interested' else '찜하기' }}
+      </button>
+      <button type="button" class="btn ghost sm" id="pick-visited">방문함</button>
+      <button type="button" class="btn ghost sm" id="pick-dismiss">관심없음</button>
+    </div>
+    <p class="pick-hidden-note muted small" id="pick-hidden-note" hidden></p>
+  </div>
+
   <dl class="event-facts">
     {% if item.start_date or item.end_date %}
     <div class="event-fact">
@@ -73,6 +94,90 @@
      target="_blank" rel="noopener noreferrer">예약·안내 보기</a>
   {% endif %}
 </article>
+
+{# 찜 컨트롤 배선 — 모두 JSON 엔드포인트를 fetch로 치고 제자리 갱신 #}
+<script>
+(function () {
+  var wrap = document.getElementById('pick-controls');
+  if (!wrap) return;
+  var id = wrap.getAttribute('data-id');
+  var toggle = document.getElementById('pick-toggle');
+  var visitedBtn = document.getElementById('pick-visited');
+  var dismissBtn = document.getElementById('pick-dismiss');
+  var confirmBadge = document.getElementById('pick-confirm');
+  var partnerEl = document.getElementById('pick-partner');
+  var note = document.getElementById('pick-hidden-note');
+  var browseUrl = "{{ url_for('dates') }}";
+
+  function partnerText(confirmed, interestedCount, myStatus) {
+    if (confirmed) return '상대도 찜했어 💘';
+    var partnerInterested =
+      (interestedCount - (myStatus === 'interested' ? 1 : 0)) >= 1;
+    if (partnerInterested) return '상대가 이미 찜했어 — 너도 찜하면 확정 💘';
+    return '상대가 아직 안 봤어';
+  }
+
+  function apply(d) {
+    if (!d || !d.ok) return;
+    var mine = d.my_status === 'interested';
+    wrap.setAttribute('data-picked', mine ? 'true' : 'false');
+    toggle.textContent = mine ? '찜 취소' : '찜하기';
+    if (confirmBadge) confirmBadge.hidden = !d.confirmed;
+    if (partnerEl) {
+      partnerEl.textContent = partnerText(d.confirmed, d.interested_count || 0, d.my_status);
+    }
+  }
+
+  function post(url, after) {
+    var btns = [toggle, visitedBtn, dismissBtn];
+    btns.forEach(function (b) { if (b) b.disabled = true; });
+    fetch(url, { method: 'POST', credentials: 'same-origin',
+                 headers: { 'X-Requested-With': 'fetch' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        btns.forEach(function (b) { if (b) b.disabled = false; });
+        apply(d);
+        if (after) after(d);
+      })
+      .catch(function () {
+        btns.forEach(function (b) { if (b) b.disabled = false; });
+      });
+  }
+
+  function hiddenNote(msg) {
+    if (!note) return;
+    note.innerHTML = '';
+    note.appendChild(document.createTextNode(msg + ' '));
+    var a = document.createElement('a');
+    a.href = browseUrl; a.textContent = '둘러보기로 가기 →'; a.className = 'pick-note-link';
+    note.appendChild(a);
+    note.hidden = false;
+  }
+
+  if (toggle) {
+    toggle.addEventListener('click', function () {
+      var picked = wrap.getAttribute('data-picked') === 'true';
+      post('/dates/' + id + (picked ? '/unpick' : '/pick'), function () {
+        if (note) note.hidden = true;  // 다시 찜하면 숨김 안내 치운다
+      });
+    });
+  }
+  if (visitedBtn) {
+    visitedBtn.addEventListener('click', function () {
+      post('/dates/' + id + '/visited', function () {
+        hiddenNote('다녀온 데이트로 표시했어 — 목록에서 숨길게.');
+      });
+    });
+  }
+  if (dismissBtn) {
+    dismissBtn.addEventListener('click', function () {
+      post('/dates/' + id + '/dismiss', function () {
+        hiddenNote('관심없음으로 표시했어 — 목록에서 숨길게.');
+      });
+    });
+  }
+})();
+</script>
 
 {% if score_status == 'pending' %}
 {# 추천 점수 분석 중 — 완료되면 수동 새로고침 없이 뜨도록 부드럽게 자동 새로고침.

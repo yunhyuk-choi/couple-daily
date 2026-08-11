@@ -291,6 +291,42 @@
     });
   }
 
+  // ---- 찜 하트 토글(이벤트 위임 — 무한스크롤로 붙은 카드도 자동 동작) ----
+  function setHeart(btn, on) {
+    btn.setAttribute('data-picked', on ? 'true' : 'false');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.classList.toggle('on', on);
+    btn.textContent = on ? '❤️' : '🤍';
+  }
+  function setConfirm(card, on) {
+    var badge = card.querySelector('.confirm-badge');
+    if (badge) badge.hidden = !on;
+  }
+  grid.addEventListener('click', function (e) {
+    var btn = e.target.closest('.pick-heart');
+    if (!btn || !grid.contains(btn)) return;
+    // 카드는 <a>라 기본 이동을 막고 버블링도 끊는다(하트만 눌린다).
+    e.preventDefault();
+    e.stopPropagation();
+    if (btn.disabled) return;
+    var card = btn.closest('.event-item');
+    if (!card) return;
+    var id = card.getAttribute('data-id');
+    var picked = btn.getAttribute('data-picked') === 'true';
+    var url = '/dates/' + id + (picked ? '/unpick' : '/pick');
+    btn.disabled = true;
+    fetch(url, { method: 'POST', credentials: 'same-origin',
+                 headers: { 'X-Requested-With': 'fetch' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        btn.disabled = false;
+        if (!d || !d.ok) return;
+        setHeart(btn, d.my_status === 'interested');
+        setConfirm(card, !!d.confirmed);
+      })
+      .catch(function () { btn.disabled = false; });
+  });
+
   // 초기 로드: 서버가 그린 첫 배치가 이미 있다. 폴링만 시작하고, 센티넬이
   // 이미 보이면 이어 당긴다.
   startPolling();

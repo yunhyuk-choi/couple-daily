@@ -594,3 +594,47 @@ class EventScore(db.Model):
 
     # 편의용 관계(행사 → 점수 조회).
     event = db.relationship("EventItem")
+
+
+class EventPick(db.Model):
+    """'데이트 뉴스' 행사에 대한 한 사용자의 찜/방문함/관심없음 상태 (P3).
+
+    EventItem은 전역 카탈로그, EventScore는 커플별 점수인 것과 달리, 이 행은
+    *사용자별* 반응이다. (event_id, user_id) 유니크로 사용자·행사당 한 행(상태
+    변경은 upsert). couple_id도 들고 있어 커플 단위 조회(공유 찜 목록·확정 판정)를
+    한 방에 한다.
+
+    ``status``:
+      * 'interested' — 찜(가고 싶음). 두 파트너가 모두 interested면 '확정'(파생, 별도
+        컬럼 없음 — interested 서로 다른 user 수 == 2).
+      * 'visited'    — 다녀옴(그 사용자 피드에서 숨김).
+      * 'dismissed'  — 관심없음(그 사용자 피드에서 숨김).
+
+    brand-new 테이블 — db.create_all()가 만들어 ALTER 불필요."""
+    __tablename__ = "event_picks"
+    __table_args__ = (
+        db.UniqueConstraint("event_id", "user_id", name="uq_eventpick_event_user"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    event_id = db.Column(
+        db.Integer, db.ForeignKey("event_items.id"), nullable=False, index=True
+    )
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    status = db.Column(db.String(16), default="interested", nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    # 편의용 관계(찜 → 사용자·행사 조회).
+    user = db.relationship("User")
+    event = db.relationship("EventItem")

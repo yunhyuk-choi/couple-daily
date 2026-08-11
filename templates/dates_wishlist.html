@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}찜 · 데이트 뉴스 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>찜한 데이트</h1>
+</div>
+
+{% if not confirmed_items and not wish_items %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+    <p class="muted">아직 찜한 데이트가 없어. 둘러보기에서 하트를 눌러봐 💖</p>
+    <a class="btn ghost sm" href="{{ url_for('dates') }}">둘러보기로 가기 →</a>
+  </div>
+{% else %}
+  {% if confirmed_items %}
+  <h2 class="wishlist-section">💘 확정 <span class="muted small">둘 다 찜했어</span></h2>
+  <div class="event-list wishlist-grid">
+    {% with items = confirmed_items %}{% include "_date_cards.html" %}{% endwith %}
+  </div>
+  {% endif %}
+  {% if wish_items %}
+  <h2 class="wishlist-section">💖 찜 <span class="muted small">한 명이 찜했어</span></h2>
+  <div class="event-list wishlist-grid">
+    {% with items = wish_items %}{% include "_date_cards.html" %}{% endwith %}
+  </div>
+  {% endif %}
+{% endif %}
+
+{# 하트 토글 — 카드는 <a>라 링크 이동을 막고, 찜을 다 풀어 아무도 안 남으면
+   카드를 목록에서 뺀다(문서 위임: 두 섹션 모두 커버). #}
+<script>
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('.pick-heart');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (btn.disabled) return;
+    var card = btn.closest('.event-item');
+    if (!card) return;
+    var id = card.getAttribute('data-id');
+    var picked = btn.getAttribute('data-picked') === 'true';
+    var url = '/dates/' + id + (picked ? '/unpick' : '/pick');
+    btn.disabled = true;
+    fetch(url, { method: 'POST', credentials: 'same-origin',
+                 headers: { 'X-Requested-With': 'fetch' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        btn.disabled = false;
+        if (!d || !d.ok) return;
+        if ((d.interested_count || 0) === 0) { card.remove(); return; }
+        var on = d.my_status === 'interested';
+        btn.setAttribute('data-picked', on ? 'true' : 'false');
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btn.classList.toggle('on', on);
+        btn.textContent = on ? '❤️' : '🤍';
+        var badge = card.querySelector('.confirm-badge');
+        if (badge) badge.hidden = !d.confirmed;
+      })
+      .catch(function () { btn.disabled = false; });
+  });
+})();
+</script>
+{% endblock %}
