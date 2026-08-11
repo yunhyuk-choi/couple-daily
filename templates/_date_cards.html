@@ -12,6 +12,12 @@
            onload="this.classList.add('loaded'); this.closest('.event-thumb').classList.add('is-loaded')"
            onerror="this.closest('.event-thumb').classList.add('is-error')" />
       {% endif %}
+      {# 찜 하트 토글 — 카드가 <a>라서 버튼으로 두고 JS가 링크 이동을 막는다. #}
+      <button type="button" class="pick-heart{% if it.my_status == 'interested' %} on{% endif %}"
+              data-id="{{ item.id }}"
+              data-picked="{{ 'true' if it.my_status == 'interested' else 'false' }}"
+              aria-pressed="{{ 'true' if it.my_status == 'interested' else 'false' }}"
+              aria-label="찜">{{ '❤️' if it.my_status == 'interested' else '🤍' }}</button>
     </div>
     <div class="event-body">
       <div class="event-chips">
@@ -21,6 +27,7 @@
         {% elif it.score_status == 'pending' %}
           <span class="rec-chip pending">추천 분석 중…</span>
         {% endif %}
+        <span class="confirm-badge"{% if not it.confirmed %} hidden{% endif %}>💘 확정</span>
       </div>
       <h2 class="event-title">{{ item.title }}</h2>
       <div class="event-meta muted small">
@@ -40,6 +47,9 @@
       </div>
       {% if it.score_status == 'ready' and it.reason %}
         <p class="rec-reason muted small">{{ it.reason }}</p>
+      {% endif %}
+      {% if it.wishlist_who %}
+        <p class="pick-who small">{{ it.wishlist_who }}</p>
       {% endif %}
     </div>
     <span class="meta-arrow" aria-hidden="true">›</span>
