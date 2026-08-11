@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}데이트 뉴스 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>데이트 뉴스</h1>
+</div>
+
+{% if not items %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+    <p class="muted">아직 모아온 행사가 없어 — 매일 밤 자동으로 새 전시·행사를 담아올게 💫</p>
+  </div>
+{% else %}
+  <div class="event-list">
+  {% for item in items %}
+    <a class="card event-item" href="{{ url_for('date_detail', item_id=item.id) }}">
+      <div class="event-thumb{% if not item.image_url %} is-error{% endif %}">
+        {% if item.image_url %}
+        <img class="event-img" src="{{ item.image_url }}"
+             loading="lazy" alt="{{ item.title }}"
+             onload="this.classList.add('loaded'); this.closest('.event-thumb').classList.add('is-loaded')"
+             onerror="this.closest('.event-thumb').classList.add('is-error')" />
+        {% endif %}
+      </div>
+      <div class="event-body">
+        {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+        <h2 class="event-title">{{ item.title }}</h2>
+        <div class="event-meta muted small">
+          {% if item.start_date or item.end_date %}
+            <span class="event-period">
+              {%- if item.start_date %}{{ item.start_date.strftime('%m.%d') }}{% endif -%}
+              {%- if item.start_date and item.end_date %} ~ {% endif -%}
+              {%- if item.end_date %}{{ item.end_date.strftime('%m.%d') }}{% endif -%}
+            </span>
+          {% endif %}
+          {% if item.place or item.district %}
+            <span class="event-place">📍
+              {{- ' ' }}{{ item.place or item.district }}
+              {%- if item.place and item.district %} · {{ item.district }}{% endif -%}
+            </span>
+          {% endif %}
+        </div>
+      </div>
+      <span class="meta-arrow" aria-hidden="true">›</span>
+    </a>
+  {% endfor %}
+  </div>
+{% endif %}
+
+{# 브라우저 캐시로 이미 로드된 썸네일 보정 — onload가 핸들러 부착 전 발화했을 수 있어
+   complete 상태를 훑어 로드/실패 클래스를 보정한다(이미지 없으면 no-op). #}
+<script>
+(function () {
+  var imgs = document.querySelectorAll('.event-img');
+  if (!imgs.length) return;
+  imgs.forEach(function (img) {
+    if (!img.complete) return;
+    var cell = img.closest('.event-thumb');
+    if (img.naturalWidth > 0) {
+      img.classList.add('loaded');
+      if (cell) cell.classList.add('is-loaded');
+    } else if (cell) {
+      cell.classList.add('is-error');
+    }
+  });
+})();
+</script>
+{% endblock %}
