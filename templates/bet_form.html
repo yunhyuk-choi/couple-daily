@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ '내기 수정' if mode == 'edit' else '내기 추가' }} · {{ app_name }}{% endblock %}
+{% block content %}
+{# 습관 내기 추가/수정 공용 폼. 대상은 같이/나/상대 중 선택(→ NULL/내 id/상대 id). #}
+<div class="page-head">
+  <span class="hero-sm" aria-hidden="true" style="font-size:1.6rem">🔥</span>
+  <h1>{{ '내기 수정' if mode == 'edit' else '내기 추가' }}</h1>
+</div>
+
+<div class="card">
+  <form class="stack" method="post"
+        action="{{ url_for('bet_edit', bid=bet.id) if mode == 'edit' else url_for('bet_new') }}">
+    <label for="bet-title">활동 <span class="muted small">(필수)</span>
+      <input id="bet-title" type="text" name="title" maxlength="200" required
+             placeholder="예: 하루 한 편 시 쓰기" value="{{ form_title }}" />
+    </label>
+    <label for="bet-count">일주일에 몇 번? <span class="muted small">(필수)</span>
+      <input id="bet-count" type="number" name="count_target" min="1" max="7" required
+             placeholder="예: 5" value="{{ form_count }}" />
+    </label>
+    <label for="bet-target">대상 <span class="muted small">(누가 하나요)</span>
+      <select id="bet-target" name="target">
+        <option value="" {% if form_target == '' %}selected{% endif %}>같이 (둘 다)</option>
+        <option value="{{ me.id }}" {% if form_target == me.id|string %}selected{% endif %}>{{ me.display_name }}</option>
+        {% if partner %}
+        <option value="{{ partner.id }}" {% if form_target == partner.id|string %}selected{% endif %}>{{ partner.display_name }}</option>
+        {% endif %}
+      </select>
+    </label>
+    <label for="bet-start">시작일 <span class="muted small">(이 날부터 한 주씩)</span>
+      <input id="bet-start" type="date" name="start_date" required value="{{ form_start }}" />
+    </label>
+    <label for="bet-penalty">벌칙 <span class="muted small">(선택)</span>
+      <input id="bet-penalty" type="text" name="penalty" maxlength="500"
+             placeholder="예: 못 지키면 커피 사기 ☕" value="{{ form_penalty }}" />
+    </label>
+    <label for="bet-desc">설명 <span class="muted small">(선택)</span>
+      <textarea id="bet-desc" name="description" rows="3"
+                placeholder="규칙·메모 자유롭게.">{{ form_description }}</textarea>
+    </label>
+    <button class="btn primary" type="submit">{{ '수정 저장' if mode == 'edit' else '내기 만들기' }}</button>
+    <a class="btn ghost"
+       href="{{ url_for('bet_detail', bid=bet.id) if mode == 'edit' else url_for('calendar_bets') }}">취소</a>
+  </form>
+</div>
+{% endblock %}
