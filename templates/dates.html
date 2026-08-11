@@ -12,84 +12,151 @@
     <p class="muted">아직 모아온 행사가 없어 — 매일 밤 자동으로 새 전시·행사를 담아올게 💫</p>
   </div>
 {% else %}
-  <div class="event-list">
-  {% for it in items %}
-    {% set item = it.event %}
-    <a class="card event-item" href="{{ url_for('date_detail', item_id=item.id) }}">
-      <div class="event-thumb{% if not item.image_url %} is-error{% endif %}">
-        {% if item.image_url %}
-        <img class="event-img" src="{{ item.image_url }}"
-             loading="lazy" alt="{{ item.title }}"
-             onload="this.classList.add('loaded'); this.closest('.event-thumb').classList.add('is-loaded')"
-             onerror="this.closest('.event-thumb').classList.add('is-error')" />
-        {% endif %}
-      </div>
-      <div class="event-body">
-        <div class="event-chips">
-          {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
-          {% if it.score_status == 'ready' and it.score is not none %}
-            <span class="rec-chip">❤️ {{ it.score }}</span>
-          {% elif it.score_status == 'pending' %}
-            <span class="rec-chip pending">추천 분석 중…</span>
-          {% endif %}
-        </div>
-        <h2 class="event-title">{{ item.title }}</h2>
-        <div class="event-meta muted small">
-          {% if item.start_date or item.end_date %}
-            <span class="event-period">
-              {%- if item.start_date %}{{ item.start_date.strftime('%m.%d') }}{% endif -%}
-              {%- if item.start_date and item.end_date %} ~ {% endif -%}
-              {%- if item.end_date %}{{ item.end_date.strftime('%m.%d') }}{% endif -%}
-            </span>
-          {% endif %}
-          {% if item.place or item.district %}
-            <span class="event-place">📍
-              {{- ' ' }}{{ item.place or item.district }}
-              {%- if item.place and item.district %} · {{ item.district }}{% endif -%}
-            </span>
-          {% endif %}
-        </div>
-        {% if it.score_status == 'ready' and it.reason %}
-          <p class="rec-reason muted small">{{ it.reason }}</p>
-        {% endif %}
-      </div>
-      <span class="meta-arrow" aria-hidden="true">›</span>
-    </a>
-  {% endfor %}
+  <div class="event-list" id="dates-list">
+  {% include "_date_cards.html" %}
   </div>
+  {# 더 있으면 관찰용 센티넬 — 뷰포트에 닿으면 다음 배치를 /dates/more로 당겨온다.
+     페이지네이션 UI는 두지 않는다(하단 내비 알약이 이미 하단을 무겁게 함). #}
+  {% if has_more %}<div id="dates-sentinel" aria-hidden="true"></div>{% endif %}
 {% endif %}
 
-{# 브라우저 캐시로 이미 로드된 썸네일 보정 — onload가 핸들러 부착 전 발화했을 수 있어
-   complete 상태를 훑어 로드/실패 클래스를 보정한다(이미지 없으면 no-op). #}
 <script>
 (function () {
-  var imgs = document.querySelectorAll('.event-img');
-  if (!imgs.length) return;
-  imgs.forEach(function (img) {
-    if (!img.complete) return;
-    var cell = img.closest('.event-thumb');
-    if (img.naturalWidth > 0) {
-      img.classList.add('loaded');
-      if (cell) cell.classList.add('is-loaded');
-    } else if (cell) {
-      cell.classList.add('is-error');
-    }
-  });
-})();
-</script>
+  var grid = document.getElementById('dates-list');
 
-{% if scoring_active %}
-{# 아직 추천 점수를 분석 중 — 완료된 점수가 수동 새로고침 없이 뜨도록 부드럽게
-   자동 새로고침한다. 최대 시도(20회 ≈ 5분) 뒤엔 멈춘다(무한 새로고침 방지). #}
-<script>
-(function () {
-  var tries = 0, MAX = 20;
-  function tick() {
-    if (tries++ >= MAX) return;
-    window.location.reload();
+  // 썸네일 스켈레톤 보정 — onload가 핸들러 부착 전 발화(브라우저 캐시)했을 수 있어
+  // complete 상태를 훑어 로드/실패 클래스를 보정한다. 초기·추가 로드 모두 재사용.
+  function initEventImages(root) {
+    var imgs = (root || document).querySelectorAll('.event-img');
+    imgs.forEach(function (img) {
+      if (!img.complete) return;
+      var cell = img.closest('.event-thumb');
+      if (img.naturalWidth > 0) {
+        img.classList.add('loaded');
+        if (cell) cell.classList.add('is-loaded');
+      } else if (cell) {
+        cell.classList.add('is-error');
+      }
+    });
   }
-  setTimeout(tick, 15000);
+  initEventImages(document);
+
+  if (!grid) return;
+
+  // ---- 무한 스크롤: 센티넬이 보이면 다음 배치를 붙인다(페이지네이션 X) ----
+  var sentinel = document.getElementById('dates-sentinel');
+  // 이미 그려진 카드 수 = 다음 요청 offset. dedupe로 실제 붙은 수만 증가시킨다.
+  var rendered = grid.querySelectorAll('.event-item').length;
+  var loading = false, done = false;
+
+  function seenIds() {
+    var set = {};
+    grid.querySelectorAll('.event-item').forEach(function (c) {
+      set[c.getAttribute('data-id')] = true;
+    });
+    return set;
+  }
+
+  function loadMore() {
+    if (loading || done || !sentinel) return;
+    loading = true;
+    fetch('/dates/more?offset=' + rendered, { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (html) {
+        var tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        var cards = tmp.querySelectorAll('.event-item');
+        if (!cards.length) {  // 빈 조각 → 더 없음
+          done = true;
+          if (sentinel) { observer.disconnect(); sentinel.remove(); }
+          return;
+        }
+        var seen = seenIds();
+        var appended = 0;
+        cards.forEach(function (card) {
+          var id = card.getAttribute('data-id');
+          if (seen[id]) return;   // 정렬이 살짝 밀려 겹쳐도 id로 중복 제거
+          seen[id] = true;
+          grid.appendChild(card);
+          appended++;
+        });
+        initEventImages(grid);  // 새로 붙은 이미지 스켈레톤 재배선
+        rendered += appended;
+        loading = false;
+        // 센티넬이 여전히 보이면(짧은 배치) 곧바로 다음 배치를 이어 당긴다.
+        if (sentinel && observer && isVisible(sentinel)) loadMore();
+      })
+      .catch(function () { loading = false; });  // 방어적 — 조용히 무시
+  }
+
+  function isVisible(el) {
+    var r = el.getBoundingClientRect();
+    return r.top < (window.innerHeight || document.documentElement.clientHeight);
+  }
+
+  var observer = null;
+  if (sentinel && 'IntersectionObserver' in window) {
+    observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) loadMore(); });
+    }, { rootMargin: '600px 0px' });
+    observer.observe(sentinel);
+  }
+
+  // ---- 점수 칩 제자리 갱신: pending/none 카드가 있으면 폴링(전체 새로고침 X) ----
+  var pollTries = 0, POLL_MAX = 20;
+
+  function pendingIds() {
+    var ids = [];
+    grid.querySelectorAll('.event-item').forEach(function (c) {
+      var st = c.getAttribute('data-status');
+      if ((st === 'pending' || st === 'none') && ids.length < 60) {
+        ids.push(c.getAttribute('data-id'));
+      }
+    });
+    return ids;
+  }
+
+  function applyScore(card, info) {
+    if (!info || info.status !== 'ready') return;
+    card.setAttribute('data-status', 'ready');
+    var chips = card.querySelector('.event-chips');
+    if (chips) {
+      var old = chips.querySelector('.rec-chip');
+      if (old) old.remove();
+      if (info.score !== null && info.score !== undefined) {
+        var chip = document.createElement('span');
+        chip.className = 'rec-chip';
+        chip.textContent = '❤️ ' + info.score;
+        chips.appendChild(chip);
+      }
+    }
+    if (info.reason) {
+      var body = card.querySelector('.event-body');
+      if (body && !body.querySelector('.rec-reason')) {
+        var p = document.createElement('p');
+        p.className = 'rec-reason muted small';
+        p.textContent = info.reason;
+        body.appendChild(p);
+      }
+    }
+  }
+
+  function pollScores() {
+    if (pollTries++ >= POLL_MAX) return;
+    var ids = pendingIds();
+    if (!ids.length) return;  // 다 채워짐 — 폴링 종료
+    fetch('/dates/scores?ids=' + ids.join(','), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : {}; })
+      .then(function (data) {
+        Object.keys(data).forEach(function (id) {
+          var card = grid.querySelector('.event-item[data-id="' + id + '"]');
+          if (card) applyScore(card, data[id]);
+        });
+        if (pendingIds().length) setTimeout(pollScores, 6000);  // 남았으면 계속
+      })
+      .catch(function () { setTimeout(pollScores, 6000); });  // 방어적 — 재시도
+  }
+  if (pendingIds().length) setTimeout(pollScores, 6000);
 })();
 </script>
-{% endif %}
 {% endblock %}

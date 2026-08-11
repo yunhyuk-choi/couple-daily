@@ -1036,6 +1036,63 @@ def _spawn_scoring_if_idle(app, couple_id):
         log.exception("failed to spawn scoring thread for couple %s", couple_id)
 
 
+# 데이트 뉴스 목록 무한스크롤 배치 크기(초기 렌더·/dates/more 공통).
+_DATES_BATCH = 18
+
+
+def _ordered_date_items(couple_id):
+    """진행 중(만료 안 된) 행사 전체를 이 커플 EventScore와 LEFT JOIN해
+    {event, score, reason, score_status} 리스트로 만들고 정렬해 반환한다.
+
+    정렬: ready 먼저(점수 높은 순, 동점이면 마감 임박 순·시작 순) → pending →
+    나머지(failed/없음). end_date NULL은 날짜 정렬에서 맨 뒤로 간다. ~300행 기준
+    저렴하다. dates()·dates_more()가 이 단일 원천을 공유해 정렬이 일관된다."""
+    today = date.today()
+    rows = (
+        db.session.query(EventItem, EventScore)
+        .outerjoin(
+            EventScore,
+            db.and_(
+                EventScore.event_id == EventItem.id,
+                EventScore.couple_id == couple_id,
+            ),
+        )
+        .filter(
+            db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today)
+        )
+        .all()
+    )
+
+    items = []
+    for ev, sc in rows:
+        status = sc.status if sc is not None else None
+        items.append(
+            {
+                "event": ev,
+                "score": sc.score if sc is not None else None,
+                "reason": sc.reason if sc is not None else None,
+                "score_status": status,
+            }
+        )
+
+    # 마감 없는(end_date NULL) 건 날짜 정렬에서 맨 뒤로 가도록 큰 값을 준다.
+    _far = date.max
+
+    def _rank(it):
+        st = it["score_status"]
+        ev = it["event"]
+        end = ev.end_date or _far
+        if st == "ready":
+            # 점수 내림차순 → -score, 동점은 마감 임박 순(end asc), 시작 순.
+            return (0, -(it["score"] or 0), end, ev.start_date or _far)
+        if st == "pending":
+            return (1, 0, end, ev.start_date or _far)
+        return (2, 0, end, ev.start_date or _far)
+
+    items.sort(key=_rank)
+    return items
+
+
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
@@ -2381,59 +2438,12 @@ def _register_routes(app: Flask):
     def dates():
         """진행 중인(만료되지 않은) 행사 목록 — 이 커플 AI 추천 점수순(높은 순).
 
-        end_date가 없거나 오늘 이후인 행만 보인다. 각 행사에 이 커플의 EventScore를
-        붙여 {event, score, reason, score_status}로 넘기고, ready 먼저(점수 높은 순)·
-        그다음 pending·마지막 failed/없음 순으로 정렬한다. 'ready' 점수가 없는 진행
-        중 행사가 있으면 백그라운드 채점 스레드를 스폰한다(요청은 절대 블록 안 함)."""
+        전체 정렬 목록(_ordered_date_items)의 첫 배치(BATCH)만 렌더하고, 나머지는
+        스크롤에 맞춰 /dates/more가 배치로 붙인다(무한 스크롤·페이지네이션 UI 없음).
+        'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점 스레드를 스폰한다
+        (요청은 절대 블록 안 함)."""
         u = current_user()
-        today = date.today()
-        # 진행 중 행사 + 이 커플 EventScore를 LEFT JOIN으로 한 번에.
-        rows = (
-            db.session.query(EventItem, EventScore)
-            .outerjoin(
-                EventScore,
-                db.and_(
-                    EventScore.event_id == EventItem.id,
-                    EventScore.couple_id == u.couple_id,
-                ),
-            )
-            .filter(
-                db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today)
-            )
-            .all()
-        )
-
-        items = []
-        any_pending = False
-        for ev, sc in rows:
-            status = sc.status if sc is not None else None
-            if status == "pending":
-                any_pending = True
-            items.append(
-                {
-                    "event": ev,
-                    "score": sc.score if sc is not None else None,
-                    "reason": sc.reason if sc is not None else None,
-                    "score_status": status,
-                }
-            )
-
-        # 정렬: ready 먼저(점수 높은 순, 동점이면 마감 임박 순) → pending → 나머지.
-        # 마감 없는(end_date NULL) 건 날짜 정렬에서 맨 뒤로 가도록 큰 값을 준다.
-        _far = date.max
-
-        def _rank(it):
-            st = it["score_status"]
-            ev = it["event"]
-            end = ev.end_date or _far
-            if st == "ready":
-                # 점수 내림차순 → -score, 동점은 마감 임박 순(end asc), 시작 순.
-                return (0, -(it["score"] or 0), end, ev.start_date or _far)
-            if st == "pending":
-                return (1, 0, end, ev.start_date or _far)
-            return (2, 0, end, ev.start_date or _far)
-
-        items.sort(key=_rank)
+        items = _ordered_date_items(u.couple_id)
 
         # 셀프힐: 'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점을 스폰.
         # (뷰를 반복 조회해도 _scoring 가드로 스레드가 쌓이지 않는다. 요청 블록 X.)
@@ -2441,13 +2451,72 @@ def _register_routes(app: Flask):
         if items and needs_scoring:
             _spawn_scoring_if_idle(current_app._get_current_object(), u.couple_id)
 
-        # 채점이 진행/대기 중이면(pending 행이 있거나, 방금 스폰돼 곧 채워질 예정)
-        # 완료 점수가 수동 새로고침 없이 뜨도록 템플릿이 부드럽게 자동 새로고침한다.
-        scoring_active = bool(items and (any_pending or needs_scoring))
+        # 첫 배치만 그리고, 더 있으면 센티넬을 띄운다(클라가 이어서 당겨온다).
+        first = items[:_DATES_BATCH]
+        has_more = len(items) > _DATES_BATCH
+        return render_template("dates.html", items=first, has_more=has_more)
 
-        return render_template(
-            "dates.html", items=items, scoring_active=scoring_active
-        )
+    @app.route("/dates/more")
+    @active_couple_required
+    def dates_more():
+        """무한스크롤 다음 배치 — offset부터 BATCH개 카드 HTML 조각.
+
+        범위를 벗어나면 카드 없는 빈 조각을 돌려주고, 클라이언트는 빈 조각을
+        받으면 로딩을 멈춘다. 초기 렌더와 같은 _date_cards.html을 쓴다."""
+        u = current_user()
+        try:
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        if offset < 0:
+            offset = 0
+        items = _ordered_date_items(u.couple_id)
+        batch = items[offset:offset + _DATES_BATCH]
+        return render_template("_date_cards.html", items=batch)
+
+    @app.route("/dates/scores")
+    @active_couple_required
+    def dates_scores():
+        """지정 행사 id들의 이 커플 채점 상태 JSON — 제자리 칩 갱신용.
+
+        ids: 콤마 구분 정수(최대 60개). 각 id에 {status, score, reason}을 준다.
+        EventScore 행이 없거나 존재하지 않는 id는 status 'none'으로 채운다."""
+        u = current_user()
+        raw = request.args.get("ids", "") or ""
+        ids = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ids.append(int(tok))
+            except ValueError:
+                continue
+            if len(ids) >= 60:
+                break
+
+        out = {}
+        if ids:
+            scores = (
+                EventScore.query.filter(
+                    EventScore.couple_id == u.couple_id,
+                    EventScore.event_id.in_(ids),
+                ).all()
+            )
+            by_event = {s.event_id: s for s in scores}
+            for eid in ids:
+                s = by_event.get(eid)
+                if s is None:
+                    out[str(eid)] = {
+                        "status": "none", "score": None, "reason": None
+                    }
+                else:
+                    out[str(eid)] = {
+                        "status": s.status,
+                        "score": s.score,
+                        "reason": s.reason,
+                    }
+        return jsonify(out)
 
     @app.route("/dates/<int:item_id>")
     @active_couple_required

@@ -1,0 +1,47 @@
+{# 데이트 뉴스 카드 목록 조각 — 초기 렌더(dates.html include)와 무한스크롤
+   추가 로드(/dates/more)가 같은 카드 마크업을 공유한다. `items`만 받는다. #}
+{% for it in items %}
+  {% set item = it.event %}
+  <a class="card event-item" data-id="{{ item.id }}"
+     data-status="{{ it.score_status or 'none' }}"
+     href="{{ url_for('date_detail', item_id=item.id) }}">
+    <div class="event-thumb{% if not item.image_url %} is-error{% endif %}">
+      {% if item.image_url %}
+      <img class="event-img" src="{{ item.image_url }}"
+           loading="lazy" alt="{{ item.title }}"
+           onload="this.classList.add('loaded'); this.closest('.event-thumb').classList.add('is-loaded')"
+           onerror="this.closest('.event-thumb').classList.add('is-error')" />
+      {% endif %}
+    </div>
+    <div class="event-body">
+      <div class="event-chips">
+        {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+        {% if it.score_status == 'ready' and it.score is not none %}
+          <span class="rec-chip">❤️ {{ it.score }}</span>
+        {% elif it.score_status == 'pending' %}
+          <span class="rec-chip pending">추천 분석 중…</span>
+        {% endif %}
+      </div>
+      <h2 class="event-title">{{ item.title }}</h2>
+      <div class="event-meta muted small">
+        {% if item.start_date or item.end_date %}
+          <span class="event-period">
+            {%- if item.start_date %}{{ item.start_date.strftime('%m.%d') }}{% endif -%}
+            {%- if item.start_date and item.end_date %} ~ {% endif -%}
+            {%- if item.end_date %}{{ item.end_date.strftime('%m.%d') }}{% endif -%}
+          </span>
+        {% endif %}
+        {% if item.place or item.district %}
+          <span class="event-place">📍
+            {{- ' ' }}{{ item.place or item.district }}
+            {%- if item.place and item.district %} · {{ item.district }}{% endif -%}
+          </span>
+        {% endif %}
+      </div>
+      {% if it.score_status == 'ready' and it.reason %}
+        <p class="rec-reason muted small">{{ it.reason }}</p>
+      {% endif %}
+    </div>
+    <span class="meta-arrow" aria-hidden="true">›</span>
+  </a>
+{% endfor %}
