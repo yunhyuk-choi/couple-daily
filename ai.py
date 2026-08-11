@@ -210,6 +210,129 @@ def generate_monthly_qualitative(month_label, name_a, name_b, qa_items):
 
 
 # ---------------------------------------------------------------------------
+# Monthly cross-domain report — warm "우리의 N월" recap (Q&A + 사진 + 판결 + 데이트)
+# ---------------------------------------------------------------------------
+def generate_monthly_report(month_label, name_a, name_b, context):
+    """여러 영역(오늘의질문·사진·판결·다녀온 데이트)을 엮은 따뜻한 월간 리포트.
+
+    context: insights.collect_month_context(...)의 반환 dict
+      {qa: [...], photos: {count, captions}, cases: {count, resolved, topics},
+       dates: {visited, confirmed_count}}.
+
+    STRICT JSON을 유도해 파싱하고 각 필드를 정규화한 dict를 반환한다. 데이터가
+    없는 영역의 note는 빈 문자열로 유지한다. 실패 시 None(절대 raise 안 함).
+    파트너가 없으면(name_b falsy) 요약할 두 사람 대화가 없으므로 None.
+    """
+    if not name_a or not name_b:
+        return None
+
+    ctx = context or {}
+    qa = ctx.get("qa") or []
+    photos = ctx.get("photos") or {}
+    cases = ctx.get("cases") or {}
+    dates = ctx.get("dates") or {}
+
+    # ---- Q&A 블록 ----
+    if qa:
+        qa_lines = []
+        for it in qa:
+            qa_lines.append(
+                f"[{it.get('date')}] Q: {it.get('question')}\n"
+                f"   {name_a}: {it.get('a') or '(무응답)'}\n"
+                f"   {name_b}: {it.get('b') or '(무응답)'}"
+            )
+        qa_block = "\n".join(qa_lines)
+    else:
+        qa_block = "(이번 달 오늘의 질문 답변 기록 없음)"
+
+    # ---- 사진 블록 ----
+    photo_count = photos.get("count") or 0
+    captions = photos.get("captions") or []
+    if photo_count or captions:
+        cap_lines = "\n".join(f"- {c}" for c in captions) or "(캡션 없음)"
+        photo_block = f"총 {photo_count}장. 캡션 예시:\n{cap_lines}"
+    else:
+        photo_block = "(이번 달 추가된 사진 없음)"
+
+    # ---- 판결(사건) 블록 ----
+    case_count = cases.get("count") or 0
+    resolved = cases.get("resolved") or 0
+    topics = cases.get("topics") or []
+    if case_count:
+        topic_lines = "\n".join(f"- {t}" for t in topics) or "(제목 없음)"
+        case_block = (
+            f"총 {case_count}건 중 {resolved}건 화해로 종결. 사건 주제:\n{topic_lines}"
+        )
+    else:
+        case_block = "(이번 달 판결(사건) 없음)"
+
+    # ---- 데이트 블록 ----
+    visited = dates.get("visited") or []
+    confirmed_count = dates.get("confirmed_count") or 0
+    if visited:
+        visited_lines = "\n".join(f"- {t}" for t in visited)
+        date_block = (
+            f"이번 달 다녀온 데이트:\n{visited_lines}\n"
+            f"(둘 다 찜해 확정된 데이트 후보 누적 {confirmed_count}건)"
+        )
+    else:
+        date_block = (
+            f"(이번 달 '다녀왔어'로 표시한 데이트 없음; 둘 다 찜한 확정 후보 "
+            f"{confirmed_count}건)"
+        )
+
+    prompt = (
+        f"너는 연인 두 사람({name_a}, {name_b})의 한 달을 여러 영역의 실제 기록으로 "
+        "따뜻하게 돌아봐주는 도우미야.\n"
+        f"대상 기간: {month_label}\n\n"
+        "아래는 이번 달 실제 데이터야(오늘의 질문 답변·함께 남긴 사진 캡션·화해 "
+        "사건·다녀온 데이트). 오직 이 실제 데이터에만 근거해 지어내지 말고, 여러 "
+        "영역을 자연스럽게 엮어 '우리의 이번 달' 회고를 만들어줘.\n"
+        "절대 하지 말 것: 사랑 점수·궁합 퍼센트 같은 가짜 수치화. 대신 다정하고 "
+        "구체적인 관찰. 데이터가 없는 영역의 note는 반드시 빈 문자열(\"\")로 둬.\n\n"
+        f"[오늘의 질문 답변]\n{qa_block}\n\n"
+        f"[함께 남긴 사진]\n{photo_block}\n\n"
+        f"[화해 사건]\n{case_block}\n\n"
+        f"[데이트]\n{date_block}\n\n"
+        "다음 JSON 객체 하나만 출력해 (다른 텍스트/코드펜스 없이):\n"
+        "{\n"
+        '  "headline": "우리의 이번 달을 한 문장으로 (다정하게)",\n'
+        '  "summary": "여러 영역을 자연스럽게 엮은 2~3문장 요약",\n'
+        '  "themes": ["Q&A에서 반복된 주제 2~4개"],\n'
+        '  "tone": "이번 달 감정 분위기와 변화 (1~2문장)",\n'
+        '  "photo_note": "사진들에서 느껴진 것 (사진 있을 때만, 없으면 \\"\\")",\n'
+        '  "date_note": "함께 다녀온 데이트 이야기 (있을 때만, 없으면 \\"\\")",\n'
+        '  "harmony_note": "다툼→화해 흐름을 긍정적으로 (사건 있을 때만, 없으면 \\"\\")",\n'
+        '  "fun": "재미로 보는 가벼운 한마디 (점수/퍼센트 아님)"\n'
+        "}"
+    )
+
+    def _s(v):
+        return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
+
+    try:
+        raw = _run_claude(prompt)
+        data = _extract_json(raw)
+        themes = data.get("themes")
+        if not isinstance(themes, list):
+            themes = []
+        themes = [str(t).strip() for t in themes if str(t).strip()]
+        return {
+            "headline": _s(data.get("headline")),
+            "summary": _s(data.get("summary")),
+            "themes": themes,
+            "tone": _s(data.get("tone")),
+            "photo_note": _s(data.get("photo_note")),
+            "date_note": _s(data.get("date_note")),
+            "harmony_note": _s(data.get("harmony_note")),
+            "fun": _s(data.get("fun")),
+        }
+    except Exception as e:  # noqa: BLE001 — degrade gracefully
+        print(f"[ai] monthly report generation failed: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Photo captioning via claude vision (reads an image file off disk)
 # ---------------------------------------------------------------------------
 def caption_image(image_path):
