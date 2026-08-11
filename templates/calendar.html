@@ -23,10 +23,11 @@
         {% set info = days_data.get(day|string) %}
         {% set has_photo = info and info.count %}
         {% set has_sched = info and info.schedules %}
+        {% set has_bet = info and info.bet %}
         <button type="button"
-                class="cal-cell{% if has_photo %} has-photo{% endif %}{% if has_sched %} has-sched{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
+                class="cal-cell{% if has_photo %} has-photo{% endif %}{% if has_sched %} has-sched{% endif %}{% if has_bet %} has-bet{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
                 data-day="{{ day }}"
-                aria-label="{{ month }}월 {{ day }}일{% if has_photo %} · 사진 {{ info.count }}장{% endif %}{% if has_sched %} · 일정 {{ info.schedules|length }}건{% endif %}">
+                aria-label="{{ month }}월 {{ day }}일{% if has_photo %} · 사진 {{ info.count }}장{% endif %}{% if has_sched %} · 일정 {{ info.schedules|length }}건{% endif %}{% if has_bet %} · 내기 달성{% endif %}">
           <span class="cal-daynum">{{ day }}</span>
           {% if has_photo %}
           <span class="cal-thumb">
@@ -38,6 +39,7 @@
           {% if info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
           {% endif %}
           {% if has_sched %}<span class="cal-sched-dot" aria-hidden="true">📌</span>{% endif %}
+          {% if has_bet %}<span class="cal-bet-dot" aria-hidden="true">🔥</span>{% endif %}
         </button>
       {% endif %}
     {% endfor %}
