@@ -464,3 +464,106 @@ def judge_fight(name_a, name_b, situation, statements):
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] fight judgment failed: {e}", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------------------
+# 데이트 뉴스 커플 맞춤 추천 점수 (배치 채점, 1콜) — P2
+# ---------------------------------------------------------------------------
+def score_events(profile_text, events):
+    """커플 취향 프로필로 후보 행사들을 한 번에(배치 1콜) 채점한다.
+
+    효율이 핵심이다: 행사 하나당 claude 호출을 하지 않는다 — 호출부가 넘긴
+    유한한 배치(예: ≤24)를 번호 매긴 목록으로 만들어 프롬프트 '하나'로 채점하고,
+    JSON 배열을 돌려받는다. 느린 서브프로세스라 호출부가 반드시 백그라운드에서
+    돌려야 한다.
+
+    ``events``: ``{"ref": <event_id>, "title", "category", "place",
+    "description"}`` dict의 리스트(호출부가 배치 크기를 제한해 넘긴다).
+
+    반환: 받은 ref에 대해서만 ``{"ref", "score", "reason"}`` 리스트.
+      * score → int 강제, 0..100 클램프(없으면 60),
+      * reason → .strip()(없으면 ""),
+      * ref로 다시 매칭. 출력에 없는 ref는 생략(호출부가 실패 처리/재시도).
+    실패 시 ``[]``(또는 부분) 반환, 절대 raise 안 함(다른 ai.py 함수와 동일).
+    """
+    if not events:
+        return []
+
+    # 번호 매긴 후보 목록. ref는 정수 event_id를 그대로 쓴다(모델이 되돌려줌).
+    lines = []
+    for ev in events:
+        ref = ev.get("ref")
+        title = (ev.get("title") or "").strip() or "(제목 없음)"
+        parts = [f"[ref {ref}] {title}"]
+        cat = (ev.get("category") or "").strip()
+        place = (ev.get("place") or "").strip()
+        desc = (ev.get("description") or "").strip()
+        if cat:
+            parts.append(f"분류: {cat}")
+        if place:
+            parts.append(f"장소: {place}")
+        if desc:
+            parts.append(f"설명: {desc[:200]}")  # 프롬프트 폭주 방지로 잘라 붙임
+        lines.append(" / ".join(parts))
+    catalog = "\n".join(lines)
+
+    profile = (profile_text or "").strip()
+    has_profile = bool(profile)
+    profile_block = profile if has_profile else "(아직 이 커플에 대한 정보가 거의 없어)"
+
+    prompt = (
+        "[페르소나]\n"
+        "너는 연인 두 사람에게 딱 맞는 데이트를 골라주는, 밝고 다정한 '커플 데이트 "
+        "큐레이터'야.\n\n"
+        "[할 일]\n"
+        "아래 '커플 취향 프로필'을 참고해서, 이어지는 '후보 행사' 각각이 이 두 "
+        "사람에게 얼마나 좋은 데이트가 될지 0~100점으로 매겨줘. 점수가 높을수록 "
+        "이 커플에게 더 잘 맞는다는 뜻이야. 각 행사마다 따뜻하고 짧은 한국어 사유를 "
+        "'딱 한 문장'으로 붙여줘.\n\n"
+        "[규칙 — 중요]\n"
+        "- 말투는 앱 전체와 같은 결로 가볍고 다정하게. 훈계·비난·평가절하 금지.\n"
+        "- 점수는 0~100 사이 정수 하나로.\n"
+        + (
+            "- 프로필에 드러난 두 사람의 관심사·취향·분위기에 잘 맞을수록 높게 줘.\n"
+            if has_profile
+            else "- 지금은 이 커플에 대한 정보가 거의 없어. 그러니 데이트로서의 "
+            "일반적인 매력(접근성·분위기·함께 즐기기 좋은 정도)으로 점수를 매기고, "
+            "사유에 '아직 두 사람을 잘 몰라서 일반적인 기준으로 골랐어' 같은 뉘앙스를 "
+            "부드럽게 한 번 녹여줘.\n"
+        )
+        + "- 사유는 각 행사마다 서로 다르게, 그 행사에 맞춰 구체적으로.\n\n"
+        f"[커플 취향 프로필]\n{profile_block}\n\n"
+        f"[후보 행사]\n{catalog}\n\n"
+        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이. ref는 위에 "
+        "주어진 값을 '그대로' 되돌려줘:\n"
+        '{"scores": [{"ref": <ref>, "score": <0~100 정수>, "reason": "<한 문장>"}, ...]}'
+    )
+    try:
+        raw = _run_claude(prompt)
+        data = _extract_json(raw)
+        raw_scores = data.get("scores") if isinstance(data, dict) else None
+        if not isinstance(raw_scores, list):
+            raise ValueError("no scores array")
+
+        out = []
+        seen = set()
+        for entry in raw_scores:
+            if not isinstance(entry, dict):
+                continue
+            ref = entry.get("ref")
+            if ref is None or ref in seen:
+                continue
+            # score → int 강제, 0..100 클램프, 없으면 60.
+            try:
+                sc = int(round(float(entry.get("score"))))
+            except (TypeError, ValueError):
+                sc = 60
+            sc = max(0, min(100, sc))
+            reason = entry.get("reason")
+            reason = reason.strip() if isinstance(reason, str) else ""
+            out.append({"ref": ref, "score": sc, "reason": reason})
+            seen.add(ref)
+        return out
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] event scoring failed: {e}", file=sys.stderr)
+        return []

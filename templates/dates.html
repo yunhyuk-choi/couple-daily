@@ -13,7 +13,8 @@
   </div>
 {% else %}
   <div class="event-list">
-  {% for item in items %}
+  {% for it in items %}
+    {% set item = it.event %}
     <a class="card event-item" href="{{ url_for('date_detail', item_id=item.id) }}">
       <div class="event-thumb{% if not item.image_url %} is-error{% endif %}">
         {% if item.image_url %}
@@ -24,7 +25,14 @@
         {% endif %}
       </div>
       <div class="event-body">
-        {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+        <div class="event-chips">
+          {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
+          {% if it.score_status == 'ready' and it.score is not none %}
+            <span class="rec-chip">❤️ {{ it.score }}</span>
+          {% elif it.score_status == 'pending' %}
+            <span class="rec-chip pending">추천 분석 중…</span>
+          {% endif %}
+        </div>
         <h2 class="event-title">{{ item.title }}</h2>
         <div class="event-meta muted small">
           {% if item.start_date or item.end_date %}
@@ -41,6 +49,9 @@
             </span>
           {% endif %}
         </div>
+        {% if it.score_status == 'ready' and it.reason %}
+          <p class="rec-reason muted small">{{ it.reason }}</p>
+        {% endif %}
       </div>
       <span class="meta-arrow" aria-hidden="true">›</span>
     </a>
@@ -66,4 +77,19 @@
   });
 })();
 </script>
+
+{% if scoring_active %}
+{# 아직 추천 점수를 분석 중 — 완료된 점수가 수동 새로고침 없이 뜨도록 부드럽게
+   자동 새로고침한다. 최대 시도(20회 ≈ 5분) 뒤엔 멈춘다(무한 새로고침 방지). #}
+<script>
+(function () {
+  var tries = 0, MAX = 20;
+  function tick() {
+    if (tries++ >= MAX) return;
+    window.location.reload();
+  }
+  setTimeout(tick, 15000);
+})();
+</script>
+{% endif %}
 {% endblock %}
