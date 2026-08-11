@@ -55,6 +55,7 @@ from models import (
     Couple,
     DailyQuestion,
     EventItem,
+    EventPick,
     EventScore,
     MonthlyReport,
     Notification,
@@ -1101,8 +1102,86 @@ def prewarm_scores(app):
 # 데이트 뉴스 목록 무한스크롤 배치 크기(초기 렌더·/dates/more 공통).
 _DATES_BATCH = 18
 
+# 찜 상태 값(EventPick.status). interested만 확정/공유목록에 든다.
+_PICK_STATUSES = ("interested", "visited", "dismissed")
 
-def _ordered_date_items(couple_id, cat=None, sort="score", direction="desc"):
+
+def _event_pick(u, event_id):
+    """현재 사용자의 이 행사 EventPick(없으면 None)."""
+    if u is None:
+        return None
+    return EventPick.query.filter_by(event_id=event_id, user_id=u.id).first()
+
+
+def _pick_states(couple_id, user_id, event_ids):
+    """행사 여러 건의 이 커플 찜 상태를 한 번의 쿼리로 모아
+    event_id -> {my_status, partner_status, confirmed, interested_count}로 준다.
+
+    N+1을 피하려 (couple, 대상 event들)의 EventPick을 한 번에 읽고 파이썬에서
+    묶는다. confirmed = interested한 서로 다른 사용자가 2명(둘 다 찜)."""
+    states = {}
+    ids = list(event_ids)
+    if not ids:
+        return states
+    picks = EventPick.query.filter(
+        EventPick.couple_id == couple_id,
+        EventPick.event_id.in_(ids),
+    ).all()
+    by_event = {}
+    for p in picks:
+        by_event.setdefault(p.event_id, []).append(p)
+    for eid in ids:
+        my = None
+        partner_status = None
+        interested_users = set()
+        for p in by_event.get(eid, []):
+            if p.user_id == user_id:
+                my = p.status
+            else:
+                partner_status = p.status
+            if p.status == "interested":
+                interested_users.add(p.user_id)
+        states[eid] = {
+            "my_status": my,
+            "partner_status": partner_status,
+            "confirmed": len(interested_users) >= 2,
+            "interested_count": len(interested_users),
+        }
+    return states
+
+
+def _upsert_pick(u, event_id, status):
+    """현재 사용자의 이 행사 찜 상태를 status로 upsert(유니크 충돌은 재조회 갱신)."""
+    pick = EventPick.query.filter_by(event_id=event_id, user_id=u.id).first()
+    if pick is None:
+        pick = EventPick(
+            couple_id=u.couple_id, event_id=event_id, user_id=u.id, status=status
+        )
+        db.session.add(pick)
+    else:
+        pick.couple_id = u.couple_id
+        pick.status = status
+        pick.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # 동시 삽입이 내 행을 먼저 만든 경우 — 재조회해 상태만 갱신.
+        db.session.rollback()
+        pick = EventPick.query.filter_by(event_id=event_id, user_id=u.id).first()
+        if pick is not None:
+            pick.status = status
+            pick.updated_at = datetime.utcnow()
+            db.session.commit()
+    return pick
+
+
+def _pick_msg(prefix, title, suffix=""):
+    """알림 메시지 조립 — 제목이 길면 잘라 Notification.message(255) 상한을 넘기지 않게."""
+    t = (title or "")[:60]
+    return f"{prefix}{t}{suffix}"
+
+
+def _ordered_date_items(couple_id, user_id, cat=None, sort="score", direction="desc"):
     """진행 중(만료 안 된) 행사를 이 커플 EventScore와 LEFT JOIN해
     {event, score, reason, score_status, bucket} 리스트로 만들고, 카테고리
     버킷(cat)으로 거르고 정렬해 반환한다.
@@ -1154,6 +1233,20 @@ def _ordered_date_items(couple_id, cat=None, sort="score", direction="desc"):
                 "bucket": bucket,
             }
         )
+
+    # 사용자별 찜 상태 부착 + 피드 정리: 현재 사용자가 방문함/관심없음 한 행사는
+    # 그 사용자 피드에서 제외한다(커플 스코프, 한 번의 쿼리로 배치 조회).
+    states = _pick_states(couple_id, user_id, [it["event"].id for it in items])
+    kept = []
+    for it in items:
+        st = states.get(it["event"].id, {})
+        if st.get("my_status") in ("visited", "dismissed"):
+            continue
+        it["my_status"] = st.get("my_status")
+        it["confirmed"] = st.get("confirmed", False)
+        it["interested_count"] = st.get("interested_count", 0)
+        kept.append(it)
+    items = kept
 
     # 마감 없는(end_date NULL) 건 날짜 정렬에서 맨 뒤로 가도록 큰 값을 준다.
     _far = date.max
@@ -2549,7 +2642,7 @@ def _register_routes(app: Flask):
         sort = request.args.get("sort") or "score"
         direction = request.args.get("dir") or "desc"
         items = _ordered_date_items(
-            u.couple_id, cat=cat, sort=sort, direction=direction
+            u.couple_id, u.id, cat=cat, sort=sort, direction=direction
         )
 
         # 셀프힐: 'ready' 점수가 없는 진행 중 행사가 있으면 백그라운드 채점을 스폰.
@@ -2588,7 +2681,7 @@ def _register_routes(app: Flask):
         sort = request.args.get("sort") or "score"
         direction = request.args.get("dir") or "desc"
         items = _ordered_date_items(
-            u.couple_id, cat=cat, sort=sort, direction=direction
+            u.couple_id, u.id, cat=cat, sort=sort, direction=direction
         )
         batch = items[offset:offset + _DATES_BATCH]
         return render_template("_date_cards.html", items=batch)
@@ -2650,12 +2743,157 @@ def _register_routes(app: Flask):
         score = sc.score if sc is not None else None
         reason = sc.reason if sc is not None else None
         score_status = sc.status if sc is not None else None
+        pk = _pick_states(u.couple_id, u.id, [item.id]).get(item.id, {})
         return render_template(
             "date_detail.html",
             item=item,
             score=score,
             reason=reason,
             score_status=score_status,
+            my_status=pk.get("my_status"),
+            partner_status=pk.get("partner_status"),
+            confirmed=pk.get("confirmed", False),
+        )
+
+    # ---- 데이트 찜/방문함/관심없음 액션(AJAX JSON) ----
+    def _pick_json(u, event_id):
+        """공통 응답 상태 — 이 (커플,사용자,행사)의 최신 찜 상태 JSON dict."""
+        st = _pick_states(u.couple_id, u.id, [event_id]).get(event_id, {})
+        return {
+            "ok": True,
+            "my_status": st.get("my_status"),
+            "confirmed": st.get("confirmed", False),
+            "interested_count": st.get("interested_count", 0),
+        }
+
+    @app.route("/dates/<int:event_id>/pick", methods=["POST"])
+    @active_couple_required
+    def date_pick(event_id):
+        """내 찜(interested) upsert + 상대 알림. 이번 찜으로 '확정'이 새로 성립하면
+        (직전엔 미확정) 두 사람 모두에게 확정 알림을 *한 번만* 보낸다."""
+        u = current_user()
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            return jsonify({"ok": False}), 404
+        # 확정 전이(not-confirmed → confirmed) 감지를 위해 직전 상태를 먼저 읽는다.
+        before = _pick_states(u.couple_id, u.id, [event_id]).get(event_id, {})
+        was_confirmed = before.get("confirmed", False)
+
+        _upsert_pick(u, event_id, "interested")
+
+        after = _pick_states(u.couple_id, u.id, [event_id]).get(event_id, {})
+        now_confirmed = after.get("confirmed", False)
+
+        partner = u.partner
+        link = url_for("date_detail", item_id=event_id)
+        # 상대에게 찜 알림(행위자 본인에겐 절대 보내지 않음).
+        _safe_notify(
+            partner, "date_pick",
+            _pick_msg("상대가 데이트를 찜했어! 💖 ", item.title), link,
+        )
+        # 새로 확정됐으면(전이 순간에만) 두 사람 모두에게 확정 알림 — 재찜엔 안 울림.
+        if now_confirmed and not was_confirmed:
+            msg = _pick_msg("데이트 확정! 💘 ", item.title, " 둘 다 찜했어")
+            _safe_notify(u, "date_confirm", msg, link)
+            _safe_notify(partner, "date_confirm", msg, link)
+
+        return jsonify(_pick_json(u, event_id))
+
+    @app.route("/dates/<int:event_id>/unpick", methods=["POST"])
+    @active_couple_required
+    def date_unpick(event_id):
+        """내 찜 취소 — 내 EventPick 행을 삭제(토글 오프). 알림 없음."""
+        u = current_user()
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            return jsonify({"ok": False}), 404
+        EventPick.query.filter_by(event_id=event_id, user_id=u.id).delete()
+        db.session.commit()
+        return jsonify(_pick_json(u, event_id))
+
+    @app.route("/dates/<int:event_id>/visited", methods=["POST"])
+    @active_couple_required
+    def date_visited(event_id):
+        """내 상태를 '다녀옴'으로 — 내 피드에서 숨김. 알림 없음."""
+        u = current_user()
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            return jsonify({"ok": False}), 404
+        _upsert_pick(u, event_id, "visited")
+        return jsonify(_pick_json(u, event_id))
+
+    @app.route("/dates/<int:event_id>/dismiss", methods=["POST"])
+    @active_couple_required
+    def date_dismiss(event_id):
+        """내 상태를 '관심없음'으로 — 내 피드에서 숨김. 알림 없음."""
+        u = current_user()
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            return jsonify({"ok": False}), 404
+        _upsert_pick(u, event_id, "dismissed")
+        return jsonify(_pick_json(u, event_id))
+
+    @app.route("/dates/wishlist")
+    @active_couple_required
+    def dates_wishlist():
+        """커플 공유 찜 목록 — interested가 1개 이상인(만료 안 된) 행사.
+        확정(둘 다 찜)을 위에, 찜(한 명만)을 아래에 나눠 보여준다."""
+        u = current_user()
+        today = date.today()
+        rows = (
+            db.session.query(EventPick, EventItem)
+            .join(EventItem, EventItem.id == EventPick.event_id)
+            .filter(
+                EventPick.couple_id == u.couple_id,
+                EventPick.status == "interested",
+                db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today),
+            )
+            .all()
+        )
+        # 행사별로 누가 찜했는지 모은다.
+        by_event = {}
+        for p, ev in rows:
+            entry = by_event.setdefault(ev.id, {"event": ev, "uids": set()})
+            entry["uids"].add(p.user_id)
+
+        confirmed_items, wish_items = [], []
+        for entry in by_event.values():
+            ev = entry["event"]
+            uids = entry["uids"]
+            me = u.id in uids
+            partner = any(x != u.id for x in uids)
+            confirmed = len(uids) >= 2
+            if confirmed:
+                who = "나 · 상대 둘 다 찜"
+            elif me:
+                who = "내가 찜"
+            else:
+                who = "상대가 찜"
+            it = {
+                "event": ev,
+                "score_status": None,
+                "my_status": "interested" if me else None,
+                "confirmed": confirmed,
+                "interested_count": len(uids),
+                "picked_by_me": me,
+                "picked_by_partner": partner,
+                "wishlist_who": who,
+            }
+            (confirmed_items if confirmed else wish_items).append(it)
+
+        # 마감 임박 순(마감 없는 건 뒤로), 다음 시작 순으로 정렬.
+        _far = date.max
+
+        def _wkey(it):
+            ev = it["event"]
+            return (ev.end_date or _far, ev.start_date or _far)
+
+        confirmed_items.sort(key=_wkey)
+        wish_items.sort(key=_wkey)
+        return render_template(
+            "dates_wishlist.html",
+            confirmed_items=confirmed_items,
+            wish_items=wish_items,
         )
 
     # ---- Web Push subscription management ----
