@@ -926,10 +926,11 @@ body.lb-open { overflow: hidden; }
 }
 .dates-dir-btn:hover { background: var(--pink); color: #fff; }
 
-.event-list { display: flex; flex-direction: column; gap: 12px; }
+.event-list { display: flex; flex-direction: column; gap: 10px; }
 a.event-item {
   display: flex; align-items: center; gap: 14px; padding: 12px;
   text-decoration: none; color: inherit;
+  margin-bottom: 0;  /* 카드 기본 margin-bottom(16px)을 0으로 — flex gap만으로 간격 */
   transition: transform 0.08s, box-shadow 0.15s;
 }
 a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,0.09); }
@@ -1014,6 +1015,44 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   margin: 6px 0 0; line-height: 1.45;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
+
+/* 찜(P3) — 하트 토글 / 확정 배지 / 공유목록 who / 상세 컨트롤 */
+.pick-heart {
+  position: absolute; top: 5px; right: 5px; z-index: 3;
+  width: 30px; height: 30px; padding: 0; border: none; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9); box-shadow: 0 1px 5px rgba(0, 0, 0, 0.18);
+  font-size: 0.95rem; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform 0.08s;
+}
+.pick-heart:hover { transform: scale(1.08); }
+.pick-heart:active { transform: scale(0.9); }
+.pick-heart[disabled] { opacity: 0.6; cursor: default; }
+.confirm-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: linear-gradient(135deg, #ff6b9d, #ff3d7f); color: #fff;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 0.74rem; font-weight: 800; white-space: nowrap;
+}
+.pick-who { margin: 4px 0 0; color: var(--pink); font-weight: 700; }
+
+.pick-controls { margin: 0 0 16px; }
+.pick-status-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.pick-partner { margin: 0; }
+.pick-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.pick-btns .btn { flex: 0 0 auto; }
+.pick-toggle[disabled], .pick-btns .btn[disabled] { opacity: 0.6; }
+.pick-hidden-note { margin: 10px 0 0; }
+.pick-note-link { font-weight: 700; white-space: nowrap; }
+
+.wishlist-section {
+  font-size: 1.05rem; font-weight: 800; margin: 18px 0 10px;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.wishlist-section:first-of-type { margin-top: 4px; }
+.wishlist-grid { margin-bottom: 8px; }
 
 /* 상세 화면 추천 블록 */
 .rec-block {
