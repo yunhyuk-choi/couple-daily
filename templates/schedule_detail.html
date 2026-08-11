@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}{{ schedule.title }} · {{ app_name }}{% endblock %}
+{% block content %}
+{# 일정 상세 — 날짜·제목·설명, 데이트 뉴스에서 만든 일정이면 그 행사로 링크. #}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>일정</h1>
+</div>
+
+<article class="card">
+  <div class="date muted">
+    {{ schedule.date.strftime('%Y년 %m월 %d일') }}
+    {% if schedule.creator %} · {{ schedule.creator.display_name }}님이 추가{% endif %}
+  </div>
+  <h2 class="event-detail-title" style="margin:8px 0 0">{{ schedule.title }}</h2>
+
+  {% if event %}
+  <a class="ai-chip" style="display:inline-block;margin-top:8px;text-decoration:none"
+     href="{{ url_for('date_detail', item_id=event.id) }}">📅 데이트 뉴스 · {{ event.title }} →</a>
+  {% endif %}
+
+  {% if schedule.description %}
+  <p class="event-desc" style="white-space:pre-wrap; word-break:break-word">{{ schedule.description }}</p>
+  {% endif %}
+
+  <div class="pick-btns" style="margin-top:16px">
+    <a class="btn sm" href="{{ url_for('schedule_edit', sid=schedule.id) }}">수정</a>
+    <a class="btn ghost sm" href="{{ url_for('index', month=schedule.date.strftime('%Y-%m')) }}">캘린더로</a>
+  </div>
+
+  <form method="post" action="{{ url_for('schedule_delete', sid=schedule.id) }}"
+        onsubmit="return confirm('이 일정을 삭제할까? 되돌릴 수 없어.');" style="margin-top:12px">
+    <button class="btn ghost sm" type="submit">삭제</button>
+  </form>
+</article>
+{% endblock %}

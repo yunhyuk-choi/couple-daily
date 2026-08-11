@@ -63,6 +63,7 @@ from models import (
     Notification,
     Photo,
     PushSubscription,
+    Schedule,
     Setting,
     User,
     db,
@@ -1744,7 +1745,7 @@ def _register_routes(app: Flask):
         for p in photos:
             by_day.setdefault(p.created_at.day, []).append(p)
 
-        # 셀/패널이 함께 쓰는 JSON: "day" -> {count, cover, ids}
+        # 셀/패널이 함께 쓰는 JSON: "day" -> {count, cover, ids, schedules}
         PANEL_CAP = 60  # 하루 패널 썸네일 상한(과다 방지)
         days_data = {}
         for d, plist in by_day.items():
@@ -1753,7 +1754,30 @@ def _register_routes(app: Flask):
                 "count": len(ids),
                 "cover": ids[-1],  # 그 날 가장 최근 사진을 커버로
                 "ids": ids[:PANEL_CAP],
+                "schedules": [],
             }
+
+        # 이번 달 일정(Schedule)을 조회해 같은 days_data에 병합한다(커플 스코프).
+        # 사진만 있는 날·일정만 있는 날·둘 다 있는 날 모두 한 엔트리에 담긴다.
+        schedules = (
+            Schedule.query.filter(
+                Schedule.couple_id == couple.id,
+                Schedule.date >= month_start,
+                Schedule.date < next_start,
+            )
+            .order_by(Schedule.date.asc(), Schedule.id.asc())
+            .all()
+        )
+        for s in schedules:
+            key = str(s.date.day)
+            entry = days_data.get(key)
+            if entry is None:
+                # 사진 없는 '일정만' 있는 날 — 사진 필드는 비워 둔다.
+                entry = {"count": 0, "cover": None, "ids": [], "schedules": []}
+                days_data[key] = entry
+            entry["schedules"].append(
+                {"id": s.id, "title": s.title, "event_id": s.event_id}
+            )
 
         # 일요일 시작 그리드 — 앞쪽 빈칸 = (첫날 요일 +1) % 7 (월=0..일=6).
         lead = (month_start.weekday() + 1) % 7
@@ -1782,6 +1806,154 @@ def _register_routes(app: Flask):
             prev_month=prev_month,
             next_month=next_month,
         )
+
+    # ---- 캘린더 일정(Schedule) CRUD ----
+    def _get_schedule_or_404(u, sid):
+        """일정을 로드하되, 요청자 커플의 것이 아니면 404 — 커플 간 접근 차단."""
+        s = db.session.get(Schedule, sid)
+        if s is None or s.couple_id != u.couple_id:
+            abort(404)
+        return s
+
+    def _parse_date(raw):
+        """'YYYY-MM-DD' → date. 형식이 틀리면 None(폴백 판단은 호출부가)."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            y, m, d = (int(x) for x in raw.split("-", 2))
+            return date(y, m, d)
+        except (ValueError, TypeError):
+            return None
+
+    @app.route("/calendar/schedule/new", methods=["GET", "POST"])
+    @active_couple_required
+    def schedule_new():
+        """일정 추가. GET은 폼(날짜·제목·설명; ?date=·?event_id= 프리필), POST는
+        검증 후 생성하고 그 달 캘린더로 리다이렉트한다. ?event_id=가 이 커플 피드의
+        유효한 행사면 event_id를 걸고 제목/설명을 프리필한다(무효면 무시)."""
+        u = current_user()
+
+        # 확정→'날짜 정하기' 연동: event_id가 이 커플 피드의 행사면 프리필/링크.
+        def _load_event(raw):
+            try:
+                eid = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return db.session.get(EventItem, eid)
+
+        if request.method == "POST":
+            d = _parse_date(request.form.get("date"))
+            title = (request.form.get("title") or "").strip()[:200]
+            description = (request.form.get("description") or "").strip() or None
+            event = _load_event(request.form.get("event_id"))
+            if not title or d is None:
+                flash("날짜와 제목을 모두 입력해줘.", "error")
+                # 입력값을 살려 폼을 다시 보여준다.
+                return render_template(
+                    "schedule_form.html",
+                    mode="new",
+                    schedule=None,
+                    form_date=(request.form.get("date") or ""),
+                    form_title=title,
+                    form_description=description or "",
+                    event=event,
+                )
+            sched = Schedule(
+                couple_id=u.couple_id,
+                date=d,
+                title=title,
+                description=description,
+                created_by=u.id,
+                event_id=event.id if event is not None else None,
+            )
+            db.session.add(sched)
+            db.session.commit()
+            flash("일정을 추가했어. 📌", "ok")
+            return redirect(url_for("index", month=d.strftime("%Y-%m")))
+
+        # GET — ?date= / ?event_id= 프리필.
+        prefill_date = _parse_date(request.args.get("date")) or date.today()
+        event = _load_event(request.args.get("event_id"))
+        form_title = event.title if event is not None else ""
+        # 설명 프리필: 장소·링크 힌트를 부드럽게 채운다(있을 때만).
+        form_description = ""
+        if event is not None:
+            bits = []
+            if event.place:
+                bits.append(event.place)
+            if event.link:
+                bits.append(event.link)
+            form_description = "\n".join(bits)
+        return render_template(
+            "schedule_form.html",
+            mode="new",
+            schedule=None,
+            form_date=prefill_date.strftime("%Y-%m-%d"),
+            form_title=form_title,
+            form_description=form_description,
+            event=event,
+        )
+
+    @app.route("/calendar/schedule/<int:sid>")
+    @active_couple_required
+    def schedule_detail(sid):
+        """일정 상세 — 날짜·제목·설명, event_id가 있으면 데이트 뉴스로 링크.
+        이 커플의 일정이 아니면 404."""
+        u = current_user()
+        sched = _get_schedule_or_404(u, sid)
+        return render_template("schedule_detail.html", schedule=sched, event=sched.event)
+
+    @app.route("/calendar/schedule/<int:sid>/edit", methods=["GET", "POST"])
+    @active_couple_required
+    def schedule_edit(sid):
+        """일정 수정(날짜·제목·설명). 커플 구성원 누구나 수정 가능.
+        POST 후 상세로 리다이렉트."""
+        u = current_user()
+        sched = _get_schedule_or_404(u, sid)
+        if request.method == "POST":
+            d = _parse_date(request.form.get("date"))
+            title = (request.form.get("title") or "").strip()[:200]
+            description = (request.form.get("description") or "").strip() or None
+            if not title or d is None:
+                flash("날짜와 제목을 모두 입력해줘.", "error")
+                return render_template(
+                    "schedule_form.html",
+                    mode="edit",
+                    schedule=sched,
+                    form_date=(request.form.get("date") or ""),
+                    form_title=title,
+                    form_description=description or "",
+                    event=sched.event,
+                )
+            sched.date = d
+            sched.title = title
+            sched.description = description
+            sched.updated_at = datetime.utcnow()
+            db.session.commit()
+            flash("일정을 수정했어.", "ok")
+            return redirect(url_for("schedule_detail", sid=sched.id))
+        return render_template(
+            "schedule_form.html",
+            mode="edit",
+            schedule=sched,
+            form_date=sched.date.strftime("%Y-%m-%d"),
+            form_title=sched.title,
+            form_description=sched.description or "",
+            event=sched.event,
+        )
+
+    @app.route("/calendar/schedule/<int:sid>/delete", methods=["POST"])
+    @active_couple_required
+    def schedule_delete(sid):
+        """일정 삭제 후 그 달 캘린더로 리다이렉트."""
+        u = current_user()
+        sched = _get_schedule_or_404(u, sid)
+        month = sched.date.strftime("%Y-%m")
+        db.session.delete(sched)
+        db.session.commit()
+        flash("일정을 삭제했어.", "ok")
+        return redirect(url_for("index", month=month))
 
     # ---- 오늘의 질문 대시보드 (예전 '/' 본문 — 온보딩 게이트 이후 부분) ----
     @app.route("/today")
