@@ -474,6 +474,57 @@ def bet_past_weeks(bet, couple, on=None, cap=8):
     return weeks
 
 
+# --------------------------------------------------------------------------- #
+# 내기(Bet) — 예측 내기(2b) 헬퍼 (순수/테스트 가능; HTTP·요청 컨텍스트 불필요)
+# --------------------------------------------------------------------------- #
+def prediction_members(couple):
+    """예측 내기의 '안정적 a/b → 구성원' 매핑을 돌려준다.
+
+    a = 승인 구성원 중 id가 작은 사람(첫째), b = 둘째. 모든 곳에서 *같은* id 오름차순
+    정렬을 써서 'a'/'b'가 항상 같은 사람을 가리키게 한다(별도 컬럼 없이 렌더 시 파생).
+    승인 구성원이 2명 미만이면 부족분은 None."""
+    members = sorted(couple.approved_members, key=lambda u: u.id) if couple else []
+    a = members[0] if len(members) >= 1 else None
+    b = members[1] if len(members) >= 2 else None
+    return a, b
+
+
+def prediction_result(bet, couple):
+    """예측 내기 렌더용 결과 dict(순수). habit 내기면 None.
+
+    반환: ``a_name``·``b_name``(안정적 a/b 순서의 표시 이름), ``guess_a``·``guess_b``
+    (각자 예측 날짜), ``actual``(실제 날짜 또는 None), ``winner``('a'|'b'|'tie'|None),
+    ``winner_name``(승자 이름, 무승부/미해결이면 None), ``da``·``db``(실제 날짜와의
+    |차이| 일수 — 실제 날짜가 없으면 None). 목록·상세·결과 flash에서 공용으로 쓴다."""
+    if bet.type != "prediction":
+        return None
+    a, b = prediction_members(couple)
+    a_name = a.display_name if a else "A"
+    b_name = b.display_name if b else "B"
+    da = dist_b = None
+    if bet.actual_date is not None:
+        if bet.guess_a_date is not None:
+            da = abs((bet.guess_a_date - bet.actual_date).days)
+        if bet.guess_b_date is not None:
+            dist_b = abs((bet.guess_b_date - bet.actual_date).days)
+    winner_name = None
+    if bet.winner == "a":
+        winner_name = a_name
+    elif bet.winner == "b":
+        winner_name = b_name
+    return {
+        "a_name": a_name,
+        "b_name": b_name,
+        "guess_a": bet.guess_a_date,
+        "guess_b": bet.guess_b_date,
+        "actual": bet.actual_date,
+        "winner": bet.winner,  # 'a' | 'b' | 'tie' | None
+        "winner_name": winner_name,  # 무승부/미해결이면 None
+        "da": da,
+        "db": dist_b,
+    }
+
+
 def get_or_create_today_question(couple: Couple) -> DailyQuestion:
     today = date.today()
     q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
@@ -2173,6 +2224,16 @@ def _register_routes(app: Flask):
         today = date.today()
         rows = []
         for b in bets:
+            if b.type == "prediction":
+                # 예측 내기 — 습관 헬퍼(주 진행) 대신 판정 결과를 붙인다.
+                rows.append(
+                    {
+                        "bet": b,
+                        "type": "prediction",
+                        "prediction": prediction_result(b, couple),
+                    }
+                )
+                continue
             prog = bet_progress(b, couple, today)
             # 지금 사용자가 이 내기 참여자인지 + 오늘 이미 달성했는지
             mine = next(
@@ -2181,6 +2242,7 @@ def _register_routes(app: Flask):
             rows.append(
                 {
                     "bet": b,
+                    "type": "habit",
                     "progress": prog,
                     "is_participant": mine is not None,
                     "done_today": bool(mine and mine["done_today"]),
@@ -2190,17 +2252,86 @@ def _register_routes(app: Flask):
             )
         return render_template("bets.html", rows=rows, me=u)
 
+    def _bet_form_ctx(u, mode, bet, **overrides):
+        """bet_form.html 렌더용 공용 컨텍스트(습관+예측 필드 전부 프리필 가능).
+        overrides로 폼 값(form_*)을 덮어쓴다."""
+        member_a, member_b = prediction_members(u.couple)
+        ctx = dict(
+            mode=mode,
+            bet=bet,
+            me=u,
+            partner=u.partner,
+            member_a=member_a,
+            member_b=member_b,
+            form_type="habit",
+            form_title="",
+            form_count="",
+            form_target="",
+            form_start=date.today().strftime("%Y-%m-%d"),
+            form_penalty="",
+            form_description="",
+            form_guess_a="",
+            form_guess_b="",
+        )
+        ctx.update(overrides)
+        return ctx
+
     @app.route("/calendar/bets/new", methods=["GET", "POST"])
     @active_couple_required
     def bet_new():
-        """습관 내기 추가. 활동·주 N회·대상·시작일·벌칙·설명. 대상 select는
-        같이/나/상대 중 선택하며 각각 NULL/내 id/상대 id로 매핑한다."""
+        """내기 추가 — 타입 선택(습관/예측). 습관은 활동·주 N회·대상·시작일, 예측은
+        각자 날짜(안정적 a/b)로 갈린다. 벌칙·설명은 공통. 서버가 type을 읽어 분기."""
         u = current_user()
-        partner = u.partner
         if request.method == "POST":
-            title = (request.form.get("title") or "").strip()[:200]
+            bet_type = (request.form.get("type") or "habit").strip()
             penalty = (request.form.get("penalty") or "").strip() or None
             description = (request.form.get("description") or "").strip() or None
+
+            if bet_type == "prediction":
+                # 예측 제목은 ptitle로 받는다(JS 없이도 정확히 서버가 읽게 필드 분리).
+                title = (request.form.get("ptitle") or "").strip()[:200]
+                member_a, member_b = prediction_members(u.couple)
+                a_name = member_a.display_name if member_a else "A"
+                b_name = member_b.display_name if member_b else "B"
+                guess_a = _parse_date(request.form.get("guess_a_date"))
+                guess_b = _parse_date(request.form.get("guess_b_date"))
+                errs = []
+                if not title:
+                    errs.append("예측 내용")
+                if guess_a is None:
+                    errs.append(f"{a_name} 날짜")
+                if guess_b is None:
+                    errs.append(f"{b_name} 날짜")
+                if errs:
+                    flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
+                    return render_template("bet_form.html", **_bet_form_ctx(
+                        u, "new", None,
+                        form_type="prediction",
+                        form_title=title,
+                        form_penalty=penalty or "",
+                        form_description=description or "",
+                        form_guess_a=(request.form.get("guess_a_date") or ""),
+                        form_guess_b=(request.form.get("guess_b_date") or ""),
+                    ))
+                bet = Bet(
+                    couple_id=u.couple_id,
+                    type="prediction",
+                    title=title,
+                    description=description,
+                    start_date=date.today(),  # 예측은 롤링 주 미사용 — 생성 마커
+                    guess_a_date=guess_a,
+                    guess_b_date=guess_b,
+                    penalty=penalty,
+                    status="active",
+                    created_by=u.id,
+                )
+                db.session.add(bet)
+                db.session.commit()
+                flash("예측 내기를 만들었어. 누가 더 가까울까? 🔮", "ok")
+                return redirect(url_for("bet_detail", bid=bet.id))
+
+            # ---- 습관 내기(기존 경로 — 동작 불변) ----
+            title = (request.form.get("title") or "").strip()[:200]
             start = _parse_date(request.form.get("start_date")) or date.today()
             target_id, target_ok = _resolve_target(u, request.form.get("target"))
             try:
@@ -2216,12 +2347,9 @@ def _register_routes(app: Flask):
                 errs.append("대상")
             if errs:
                 flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
-                return render_template(
-                    "bet_form.html",
-                    mode="new",
-                    bet=None,
-                    me=u,
-                    partner=partner,
+                return render_template("bet_form.html", **_bet_form_ctx(
+                    u, "new", None,
+                    form_type="habit",
                     form_title=title,
                     form_count=(request.form.get("count_target") or ""),
                     form_target=(request.form.get("target") or ""),
@@ -2229,7 +2357,7 @@ def _register_routes(app: Flask):
                                 or date.today().strftime("%Y-%m-%d")),
                     form_penalty=penalty or "",
                     form_description=description or "",
-                )
+                ))
             bet = Bet(
                 couple_id=u.couple_id,
                 type="habit",
@@ -2247,19 +2375,7 @@ def _register_routes(app: Flask):
             flash("내기를 만들었어. 화이팅! 🔥", "ok")
             return redirect(url_for("bet_detail", bid=bet.id))
 
-        return render_template(
-            "bet_form.html",
-            mode="new",
-            bet=None,
-            me=u,
-            partner=partner,
-            form_title="",
-            form_count="",
-            form_target="",
-            form_start=date.today().strftime("%Y-%m-%d"),
-            form_penalty="",
-            form_description="",
-        )
+        return render_template("bet_form.html", **_bet_form_ctx(u, "new", None))
 
     @app.route("/calendar/bets/<int:bid>/checkin", methods=["POST"])
     @active_couple_required
@@ -2313,12 +2429,21 @@ def _register_routes(app: Flask):
     @app.route("/calendar/bets/<int:bid>")
     @active_couple_required
     def bet_detail(bid):
-        """내기 상세 — 대상·시작일·벌칙, 이번 주 창의 참여자별 요일 체크, 지난 주
-        요약. 커플 것이 아니면 404."""
+        """내기 상세 — 타입별. 습관은 이번 주 요일 체크·지난 주 요약, 예측은 각자
+        예측·실제 날짜·판정(더 가까운 사람)·벌칙. 커플 것이 아니면 404."""
         u = current_user()
         bet = _get_bet_or_404(u, bid)
         couple = u.couple
         today = date.today()
+
+        if bet.type == "prediction":
+            return render_template(
+                "bet_detail.html",
+                bet=bet,
+                me=u,
+                pred=prediction_result(bet, couple),
+            )
+
         prog = bet_progress(bet, couple, today)
         week_days = bet_week_days(prog["week_start"])
         by_user = bet_week_checkins(bet, prog["week_start"], prog["week_end"])
@@ -2349,14 +2474,51 @@ def _register_routes(app: Flask):
     @app.route("/calendar/bets/<int:bid>/edit", methods=["GET", "POST"])
     @active_couple_required
     def bet_edit(bid):
-        """내기 수정(활동·주 N회·대상·시작일·벌칙·설명). POST 후 상세로."""
+        """내기 수정 — 타입별 분기. 습관은 활동·주 N회·대상·시작일, 예측은 예측
+        내용·각자 날짜. 벌칙·설명은 공통. 내기의 type은 바꾸지 않는다."""
         u = current_user()
         bet = _get_bet_or_404(u, bid)
-        partner = u.partner
         if request.method == "POST":
-            title = (request.form.get("title") or "").strip()[:200]
             penalty = (request.form.get("penalty") or "").strip() or None
             description = (request.form.get("description") or "").strip() or None
+
+            if bet.type == "prediction":
+                title = (request.form.get("ptitle") or "").strip()[:200]
+                member_a, member_b = prediction_members(u.couple)
+                a_name = member_a.display_name if member_a else "A"
+                b_name = member_b.display_name if member_b else "B"
+                guess_a = _parse_date(request.form.get("guess_a_date"))
+                guess_b = _parse_date(request.form.get("guess_b_date"))
+                errs = []
+                if not title:
+                    errs.append("예측 내용")
+                if guess_a is None:
+                    errs.append(f"{a_name} 날짜")
+                if guess_b is None:
+                    errs.append(f"{b_name} 날짜")
+                if errs:
+                    flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
+                    return render_template("bet_form.html", **_bet_form_ctx(
+                        u, "edit", bet,
+                        form_type="prediction",
+                        form_title=title,
+                        form_penalty=penalty or "",
+                        form_description=description or "",
+                        form_guess_a=(request.form.get("guess_a_date") or ""),
+                        form_guess_b=(request.form.get("guess_b_date") or ""),
+                    ))
+                bet.title = title
+                bet.guess_a_date = guess_a
+                bet.guess_b_date = guess_b
+                bet.penalty = penalty
+                bet.description = description
+                bet.updated_at = datetime.utcnow()
+                db.session.commit()
+                flash("내기를 수정했어.", "ok")
+                return redirect(url_for("bet_detail", bid=bet.id))
+
+            # ---- 습관 내기(기존 경로 — 동작 불변) ----
+            title = (request.form.get("title") or "").strip()[:200]
             start = _parse_date(request.form.get("start_date")) or bet.start_date
             target_id, target_ok = _resolve_target(u, request.form.get("target"))
             try:
@@ -2372,12 +2534,9 @@ def _register_routes(app: Flask):
                 errs.append("대상")
             if errs:
                 flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
-                return render_template(
-                    "bet_form.html",
-                    mode="edit",
-                    bet=bet,
-                    me=u,
-                    partner=partner,
+                return render_template("bet_form.html", **_bet_form_ctx(
+                    u, "edit", bet,
+                    form_type="habit",
                     form_title=title,
                     form_count=(request.form.get("count_target") or ""),
                     form_target=(request.form.get("target") or ""),
@@ -2385,7 +2544,7 @@ def _register_routes(app: Flask):
                                 or bet.start_date.strftime("%Y-%m-%d")),
                     form_penalty=penalty or "",
                     form_description=description or "",
-                )
+                ))
             bet.title = title
             bet.count_target = count_target
             bet.target_user_id = target_id
@@ -2397,20 +2556,62 @@ def _register_routes(app: Flask):
             flash("내기를 수정했어.", "ok")
             return redirect(url_for("bet_detail", bid=bet.id))
 
-        # GET — 현재 값으로 프리필. 대상 select 값은 target_user_id(없으면 "").
-        return render_template(
-            "bet_form.html",
-            mode="edit",
-            bet=bet,
-            me=u,
-            partner=partner,
+        # GET — 현재 값으로 프리필(타입별).
+        if bet.type == "prediction":
+            return render_template("bet_form.html", **_bet_form_ctx(
+                u, "edit", bet,
+                form_type="prediction",
+                form_title=bet.title,
+                form_penalty=bet.penalty or "",
+                form_description=bet.description or "",
+                form_guess_a=(bet.guess_a_date.strftime("%Y-%m-%d")
+                              if bet.guess_a_date else ""),
+                form_guess_b=(bet.guess_b_date.strftime("%Y-%m-%d")
+                              if bet.guess_b_date else ""),
+            ))
+        return render_template("bet_form.html", **_bet_form_ctx(
+            u, "edit", bet,
+            form_type="habit",
             form_title=bet.title,
             form_count=(bet.count_target if bet.count_target else ""),
             form_target=(str(bet.target_user_id) if bet.target_user_id else ""),
             form_start=bet.start_date.strftime("%Y-%m-%d"),
             form_penalty=bet.penalty or "",
             form_description=bet.description or "",
-        )
+        ))
+
+    @app.route("/calendar/bets/<int:bid>/resolve", methods=["POST"])
+    @active_couple_required
+    def bet_resolve(bid):
+        """예측 내기 결과 입력 — 실제 날짜를 받아 더 가까운 예측을 승자로 판정한다.
+        da=|guess_a-actual|, db=|guess_b-actual| → da<db면 a, db<da면 b, 같으면 무승부.
+        status를 ended로. 예측 내기만·커플 스코프."""
+        u = current_user()
+        bet = _get_bet_or_404(u, bid)
+        couple = u.couple
+        if bet.type != "prediction":
+            flash("예측 내기만 결과를 입력할 수 있어.", "error")
+            return redirect(url_for("bet_detail", bid=bet.id))
+        if bet.guess_a_date is None or bet.guess_b_date is None:
+            flash("두 사람의 예측 날짜가 있어야 결과를 낼 수 있어.", "error")
+            return redirect(url_for("bet_detail", bid=bet.id))
+        actual = _parse_date(request.form.get("actual_date"))
+        if actual is None:
+            flash("실제 날짜를 올바르게 입력해줘.", "error")
+            return redirect(url_for("bet_detail", bid=bet.id))
+        da = abs((bet.guess_a_date - actual).days)
+        dist_b = abs((bet.guess_b_date - actual).days)
+        bet.actual_date = actual
+        bet.winner = "a" if da < dist_b else "b" if dist_b < da else "tie"
+        bet.status = "ended"
+        bet.updated_at = datetime.utcnow()
+        db.session.commit()
+        res = prediction_result(bet, couple)
+        if bet.winner == "tie":
+            flash("무승부! 둘 다 똑같이 가까웠어. 🤝", "ok")
+        else:
+            flash(f"{res['winner_name']}님이 더 가까웠어! 🎉", "ok")
+        return redirect(url_for("bet_detail", bid=bet.id))
 
     @app.route("/calendar/bets/<int:bid>/end", methods=["POST"])
     @active_couple_required
