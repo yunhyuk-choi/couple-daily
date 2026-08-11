@@ -469,12 +469,19 @@
 
   if (fab) fab.addEventListener('click', requestReco);
 
-  // 페이지 로드 시 이미 ready 추천이 있으면 즉시 패널을 그린다.
+  // 페이지 로드 시: ready면 즉시 그리고, pending이면 '뽑는 중' 상태·폴링을 재개한다.
+  // (이탈 후 복귀해도 서버 백그라운드 작업은 계속되므로 결과를 이어받는다.)
   var initEl = document.getElementById('reco-initial');
   if (initEl) {
     try {
       var initial = JSON.parse(initEl.textContent || 'null');
-      if (initial && initial.status === 'ready') render(initial);
+      if (initial && initial.status === 'ready') {
+        render(initial);
+      } else if (initial && initial.status === 'pending' && !polling) {
+        polling = true;
+        showLoading();
+        poll(0);
+      }
     } catch (e) { /* 무시 — 패널은 숨김 상태 유지 */ }
   }
 })();
