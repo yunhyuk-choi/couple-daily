@@ -44,6 +44,7 @@ from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
+import events
 import insights
 import onedrive
 from models import (
@@ -53,6 +54,7 @@ from models import (
     Comment,
     Couple,
     DailyQuestion,
+    EventItem,
     MonthlyReport,
     Notification,
     Photo,
@@ -91,6 +93,9 @@ VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT")  # e.g. mailto:you@example.com
 
 # Shared secret guarding the daily-reminder cron endpoint.
 CRON_SECRET = os.environ.get("CRON_SECRET")
+
+# '데이트 뉴스' 새로고침이 동시에 두 번 돌지 않게 하는 최소 가드(비차단).
+_events_refresh_lock = threading.Lock()
 
 
 def push_enabled() -> bool:
@@ -2112,6 +2117,36 @@ def _register_routes(app: Flask):
             db.session.commit()
         return render_template("notifications.html", items=items, fresh_ids=fresh_ids)
 
+    # ---- 데이트 뉴스 (서울 문화행사 피드) ----
+    @app.route("/dates")
+    @active_couple_required
+    def dates():
+        """진행 중인(만료되지 않은) 행사 목록 — 마감 임박 순, 마감 없는 건 뒤로.
+
+        end_date가 없거나 오늘 이후인 행만 보인다. 비어 있으면 빈 상태를 보여준다."""
+        today = date.today()
+        # 마감 임박 순(soonest-ending). end_date NULL(상시)은 맨 뒤로.
+        items = (
+            EventItem.query.filter(
+                db.or_(EventItem.end_date.is_(None), EventItem.end_date >= today)
+            )
+            .order_by(
+                (EventItem.end_date.is_(None)),  # False(0)=날짜있음 먼저, True(1)=NULL 뒤로
+                EventItem.end_date.asc(),
+                EventItem.start_date.asc(),
+            )
+            .all()
+        )
+        return render_template("dates.html", items=items)
+
+    @app.route("/dates/<int:item_id>")
+    @active_couple_required
+    def date_detail(item_id):
+        item = db.session.get(EventItem, item_id)
+        if item is None:
+            abort(404)
+        return render_template("date_detail.html", item=item)
+
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
     def push_public_key():
@@ -2214,6 +2249,80 @@ def _register_routes(app: Flask):
                 "reminders_sent": reminders_sent,
             }
         )
+
+    @app.route("/internal/cron/refresh-events", methods=["POST"])
+    def cron_refresh_events():
+        """'데이트 뉴스' 피드를 밤마다 갱신 — 서울 문화행사 upsert + 만료 삭제.
+
+        cron_daily_reminder와 동일하게 CRON_SECRET(헤더 ``X-Cron-Secret`` 또는
+        ``?token=``)으로 상수시간 비교 보호. 키가 없으면 500이 아니라 no_key로
+        우아하게 빠진다. 동시 중복 실행은 모듈 락으로 막는다(비차단)."""
+        provided = request.headers.get("X-Cron-Secret") or request.args.get("token") or ""
+        if not CRON_SECRET or not hmac.compare_digest(provided, CRON_SECRET):
+            abort(403)
+
+        # 인증키가 없으면 피드는 빈 상태 — 크래시 대신 no_key로 알린다.
+        if not events.events_enabled():
+            return jsonify({"ok": False, "reason": "no_key"})
+
+        # 동시 실행 방지(락 못 잡으면 이미 도는 중 — 조용히 skip).
+        if not _events_refresh_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "reason": "busy"})
+        try:
+            items = events.fetch_seoul_events()
+            fetched = len(items)
+            upserted = 0
+            for it in items:
+                try:
+                    row = EventItem.query.filter_by(
+                        source=it["source"], source_uid=it["source_uid"]
+                    ).first()
+                    if row is None:
+                        row = EventItem(source=it["source"], source_uid=it["source_uid"])
+                        db.session.add(row)
+                    # 존재하면 필드 갱신, 없으면 새 행에 채움.
+                    row.title = it["title"]
+                    row.category = it.get("category")
+                    row.description = it.get("description")
+                    row.place = it.get("place")
+                    row.district = it.get("district")
+                    row.image_url = it.get("image_url")
+                    row.link = it.get("link")
+                    row.fee = it.get("fee")
+                    row.is_free = it.get("is_free")
+                    row.start_date = it.get("start_date")
+                    row.end_date = it.get("end_date")
+                    db.session.commit()
+                    upserted += 1
+                except Exception:  # noqa: BLE001 — 한 행 실패가 전체를 막지 않게
+                    db.session.rollback()
+                    log.exception("event upsert failed (uid=%s)", it.get("source_uid"))
+
+            # 만료 행 삭제(end_date가 있고 오늘보다 과거).
+            expired_deleted = 0
+            try:
+                today = date.today()
+                expired_deleted = (
+                    EventItem.query.filter(
+                        EventItem.end_date.isnot(None),
+                        EventItem.end_date < today,
+                    ).delete(synchronize_session=False)
+                )
+                db.session.commit()
+            except Exception:  # noqa: BLE001
+                db.session.rollback()
+                log.exception("event expiry delete failed")
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "fetched": fetched,
+                    "upserted": upserted,
+                    "expired_deleted": expired_deleted,
+                }
+            )
+        finally:
+            _events_refresh_lock.release()
 
     # ---- PWA plumbing ----
     @app.route("/manifest.json")
