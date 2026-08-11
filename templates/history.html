@@ -9,7 +9,7 @@
 {% if not items %}
   <div class="card center-card">
     <p class="muted">아직 기록이 없어. 오늘의 질문에 답해보자!</p>
-    <a class="btn primary" href="{{ url_for('index') }}">오늘의 질문으로</a>
+    <a class="btn primary" href="{{ url_for('today') }}">오늘의 질문으로</a>
   </div>
 {% else %}
   <div class="history-list">

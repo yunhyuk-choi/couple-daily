@@ -26,9 +26,13 @@
         * 알림 / 설정 live in the header (top-right), outside this structure.
     #}
     {% set nav = [
-      {'label': '질문', 'icon': 'speech_balloon.svg', 'default': 'index',
+      {'label': '캘린더', 'icon': 'calendar_home.svg', 'default': 'index',
        'children': [
-         {'label': '오늘',    'endpoint': 'index'},
+         {'label': '이번 달', 'endpoint': 'index'},
+       ]},
+      {'label': '질문', 'icon': 'speech_balloon.svg', 'default': 'today',
+       'children': [
+         {'label': '오늘',    'endpoint': 'today'},
          {'label': '지난',    'endpoint': 'history'},
          {'label': '인사이트', 'endpoint': 'insight'},
        ]},
