@@ -38,6 +38,39 @@ def events_enabled() -> bool:
     return bool(SEOUL_KEY)
 
 
+# 서울 CODENAME → 칩 필터용 굵은 버킷 매핑에 쓰는 '공연'류 집합.
+_PERF_CODENAMES = {
+    "연극", "뮤지컬/오페라", "클래식", "콘서트", "무용", "국악", "독주/독창회", "영화",
+}
+
+
+def event_category_bucket(category) -> str:
+    """서울 CODENAME(행사 category)을 데이트 뉴스 칩 필터용 굵은 버킷으로 매핑.
+
+    규칙(순서 중요):
+      * '축제' 포함 → "축제"
+      * 공연류 집합(_PERF_CODENAMES) → "공연"
+      * "전시/미술" → "전시"
+      * "교육/체험" → "체험"
+      * '팝업' 포함 → "팝업"(현재 소스에 데이터 없음 — 빈 상태로 우아히 처리)
+      * 그 외/없음 → "기타"(전체 필터에서만 노출)
+    """
+    cat = (category or "").strip()
+    if not cat:
+        return "기타"
+    if "축제" in cat:
+        return "축제"
+    if cat in _PERF_CODENAMES:
+        return "공연"
+    if cat == "전시/미술":
+        return "전시"
+    if cat == "교육/체험":
+        return "체험"
+    if "팝업" in cat:
+        return "팝업"
+    return "기타"
+
+
 def _first(row, *keys):
     """row에서 keys를 순서대로 찾아 비어있지 않은 첫 문자열 값을 반환(없으면 None)."""
     for k in keys:
