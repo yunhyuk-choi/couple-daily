@@ -551,3 +551,46 @@ class EventItem(db.Model):
         onupdate=datetime.utcnow,
         nullable=False,
     )
+
+
+class EventScore(db.Model):
+    """커플별 '데이트 뉴스' 행사 AI 추천 점수+사유 (P2).
+
+    EventItem은 전역 카탈로그지만, 점수는 커플마다 다르다 — 각자의 오늘의질문
+    답변·추억 캡션·판사 사건에서 만든 취향 프로필로 배치 채점한다. 요청 경로가
+    아니라 백그라운드 스레드에서 `claude`를 한 번(배치 1콜) 돌려 채운다. (couple_id,
+    event_id) 유니크로 커플·행사당 한 행. brand-new 테이블 — db.create_all()가
+    만들어 ALTER 불필요.
+
+    ``status`` 라이프사이클:
+      * 'pending' — 채점 대기/진행 중(UI는 "추천 분석 중").
+      * 'ready'   — score+reason 채워짐(렌더 가능).
+      * 'failed'  — 이번 패스에서 못 받음(무한 재시도 방지; 이후 패스가 재시도 가능).
+    """
+    __tablename__ = "event_scores"
+    __table_args__ = (
+        db.UniqueConstraint(
+            "couple_id", "event_id", name="uq_eventscore_couple_event"
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    event_id = db.Column(
+        db.Integer, db.ForeignKey("event_items.id"), nullable=False, index=True
+    )
+    score = db.Column(db.Integer, nullable=True)   # 0~100
+    reason = db.Column(db.Text, nullable=True)     # 한 문장 사유
+    status = db.Column(db.String(16), default="pending", nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    # 편의용 관계(행사 → 점수 조회).
+    event = db.relationship("EventItem")
