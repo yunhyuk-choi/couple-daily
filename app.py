@@ -2988,9 +2988,9 @@ def _register_routes(app: Flask):
         if items and needs_scoring:
             _spawn_scoring_if_idle(current_app._get_current_object(), u.couple_id)
 
-        # 이미 준비된(ready) 추천이 있으면 첫 로드에서 패널을 바로 그린다.
+        # ready 추천은 첫 로드에서 바로 그리고, pending이면 클라가 '뽑는 중' 상태·폴링을 재개한다.
         rec_payload = _date_recommendation_payload(u.couple_id)
-        recommendation = rec_payload if rec_payload["status"] == "ready" else None
+        recommendation = rec_payload if rec_payload["status"] in ("ready", "pending") else None
 
         # 첫 배치만 그리고, 더 있으면 센티넬을 띄운다(클라가 이어서 당겨온다).
         first = items[:_DATES_BATCH]
