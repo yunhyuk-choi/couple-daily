@@ -19,6 +19,23 @@
   {% if item.category %}<span class="chip small">{{ item.category }}</span>{% endif %}
   <h2 class="event-detail-title">{{ item.title }}</h2>
 
+  {# 우리 추천 점수 블록 — ready면 링+사유, pending이면 분석 중, 그 외엔 숨김 #}
+  {% if score_status == 'ready' and score is not none %}
+  <div class="rec-block">
+    <div class="empathy-ring" style="--score: {{ score }}">
+      <span class="empathy-num">{{ score }}</span>
+    </div>
+    <div class="rec-body">
+      <h3 class="small rec-label">우리 추천 점수</h3>
+      {% if reason %}<p class="rec-detail-reason">{{ reason }}</p>{% endif %}
+    </div>
+  </div>
+  {% elif score_status == 'pending' %}
+  <div class="rec-block pending">
+    <p class="muted small rec-analyzing">추천 분석 중이에요…</p>
+  </div>
+  {% endif %}
+
   <dl class="event-facts">
     {% if item.start_date or item.end_date %}
     <div class="event-fact">
@@ -56,4 +73,19 @@
      target="_blank" rel="noopener noreferrer">예약·안내 보기</a>
   {% endif %}
 </article>
+
+{% if score_status == 'pending' %}
+{# 추천 점수 분석 중 — 완료되면 수동 새로고침 없이 뜨도록 부드럽게 자동 새로고침.
+   최대 시도(20회 ≈ 5분) 뒤엔 멈춘다(무한 새로고침 방지). #}
+<script>
+(function () {
+  var tries = 0, MAX = 20;
+  function tick() {
+    if (tries++ >= MAX) return;
+    window.location.reload();
+  }
+  setTimeout(tick, 15000);
+})();
+</script>
+{% endif %}
 {% endblock %}
