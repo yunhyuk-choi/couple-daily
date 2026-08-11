@@ -180,8 +180,9 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 3px;
-  padding: 9px 4px 8px;
+  gap: 2px;
+  /* 5탭이 좁은 뷰포트(360~375px)에서도 넘치지 않도록 좌우 패딩을 줄임 */
+  padding: 8px 2px 7px;
   text-decoration: none;
   color: var(--muted);
   font-weight: 700;
@@ -199,14 +200,15 @@ body {
   background: rgba(255, 107, 157, 0.14);
 }
 .tab-icon {
-  width: 26px;
-  height: 26px;
+  width: 23px;
+  height: 23px;
   display: block;
   opacity: 0.5;
   filter: grayscale(0.55);
   transition: opacity 0.15s, filter 0.15s;
 }
-.tab-label { font-size: 0.68rem; line-height: 1; }
+/* 5탭 — 라벨이 줄바꿈/클리핑되지 않도록 폰트 축소 + nowrap */
+.tab-label { font-size: 0.66rem; line-height: 1; white-space: nowrap; }
 .tab.active { color: var(--pink); }
 .tab.active .tab-icon { opacity: 1; filter: none; }
 .tab-icon-wrap { position: relative; display: inline-flex; }
@@ -1144,3 +1146,145 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .went-form { margin: 6px 0 0; text-align: center; }
 .went-form.went-detail { margin: 0 0 16px; }
 .went-btn { white-space: nowrap; }
+
+/* ===== 캘린더 홈 (월 달력 + 날짜별 사진) ===== */
+/* 월 이동 헤더 */
+.cal-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+.cal-title { font-size: 1.15rem; margin: 0; text-align: center; flex: 1; }
+.cal-nav-btn {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--pink);
+  text-decoration: none;
+  border-radius: 50%;
+  background: var(--pink-soft);
+}
+.cal-nav-btn:active { transform: scale(0.94); }
+
+/* 요일 머리글 (일~토) */
+.cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.cal-wd {
+  text-align: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+  padding: 2px 0;
+}
+.cal-weekdays .cal-wd:first-child { color: #ff6b6b; }   /* 일 */
+.cal-weekdays .cal-wd:last-child { color: #6b9bff; }     /* 토 */
+
+/* 날짜 그리드 — 7열, 가로 오버플로 없이 균등 분할 */
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  width: 100%;
+}
+.cal-cell {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  min-width: 0;
+  padding: 0;
+  border: 1.5px solid transparent;
+  border-radius: 12px;
+  background: var(--pink-soft);
+  overflow: hidden;
+  cursor: pointer;
+  color: var(--ink, #3a2e33);
+  transition: transform 0.08s;
+}
+.cal-cell.empty {
+  background: transparent;
+  border: none;
+  cursor: default;
+}
+.cal-cell:not(.empty):active { transform: scale(0.96); }
+.cal-daynum {
+  position: absolute;
+  top: 3px;
+  left: 5px;
+  z-index: 2;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+}
+/* 사진이 있는 셀 — 커버 썸네일이 셀을 채우고 날짜는 위에 흰 글씨로 */
+.cal-cell.has-photo .cal-daynum {
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+.cal-thumb {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+}
+/* 로딩 시머(썸네일 그리드와 동일 패턴) */
+.cal-thumb::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: linear-gradient(100deg, var(--pink-soft) 30%, #fff6fa 50%, var(--pink-soft) 70%);
+  background-size: 200% 100%;
+  animation: thumb-shimmer 1.2s ease-in-out infinite;
+}
+.cal-thumb.is-loaded::before { display: none; }
+.cal-thumb.is-error::before { animation: none; background: var(--pink-soft); }
+.cal-thumb-img {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* +N 배지 (하루 사진이 2장 이상) */
+.cal-badge {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  z-index: 2;
+  font-size: 0.6rem;
+  font-weight: 800;
+  line-height: 1;
+  color: #fff;
+  background: rgba(255, 77, 121, 0.9);
+  border-radius: 8px;
+  padding: 2px 4px;
+}
+/* 오늘 / 선택된 날 */
+.cal-cell.is-today { border-color: var(--pink); }
+.cal-cell.is-selected {
+  border-color: var(--pink);
+  box-shadow: 0 0 0 2px rgba(255, 107, 157, 0.35);
+}
+
+/* 아래 날짜 패널 */
+.cal-panel { margin-top: 18px; }
+.cal-panel-head {
+  font-size: 1rem;
+  margin: 0 0 10px;
+}
+.cal-panel-empty {
+  text-align: center;
+  padding: 22px 8px;
+  font-size: 0.9rem;
+}
