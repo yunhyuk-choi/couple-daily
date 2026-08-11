@@ -21,12 +21,14 @@
         <span class="cal-cell empty" aria-hidden="true"></span>
       {% else %}
         {% set info = days_data.get(day|string) %}
+        {% set has_photo = info and info.count %}
+        {% set has_sched = info and info.schedules %}
         <button type="button"
-                class="cal-cell{% if info %} has-photo{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
+                class="cal-cell{% if has_photo %} has-photo{% endif %}{% if has_sched %} has-sched{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
                 data-day="{{ day }}"
-                aria-label="{{ month }}월 {{ day }}일{% if info %} · 사진 {{ info.count }}장{% endif %}">
+                aria-label="{{ month }}월 {{ day }}일{% if has_photo %} · 사진 {{ info.count }}장{% endif %}{% if has_sched %} · 일정 {{ info.schedules|length }}건{% endif %}">
           <span class="cal-daynum">{{ day }}</span>
-          {% if info %}
+          {% if has_photo %}
           <span class="cal-thumb">
             <img class="cal-thumb-img" loading="lazy" alt=""
                  src="{{ url_for('memory_thumb', photo_id=info.cover) }}"
@@ -35,15 +37,23 @@
           </span>
           {% if info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
           {% endif %}
+          {% if has_sched %}<span class="cal-sched-dot" aria-hidden="true">📌</span>{% endif %}
         </button>
       {% endif %}
     {% endfor %}
   {% endfor %}
 </div>
 
-{# 선택한 날의 사진 패널 — 클라이언트가 채운다(기본: 오늘 또는 1일). #}
+{# 선택한 날의 일정+사진 패널 — 클라이언트가 채운다(기본: 오늘 또는 1일).
+   일정을 위에(리스트, 탭하면 상세로), 사진을 아래에 렌더한다. #}
 <div class="cal-panel">
-  <h2 class="cal-panel-head" id="cal-panel-date"></h2>
+  <div class="cal-panel-headrow">
+    <h2 class="cal-panel-head" id="cal-panel-date"></h2>
+    {# 선택한 날짜로 일정 추가 — 링크의 date는 선택 변경 시 갱신한다. #}
+    <a class="btn ghost sm cal-add-sched" id="cal-add-sched"
+       href="{{ url_for('schedule_new') }}">+ 일정</a>
+  </div>
+  <ul class="cal-sched-list" id="cal-sched-list"></ul>
   <div class="photo-grid cal-panel-grid" id="cal-panel-grid"></div>
   <p class="cal-panel-empty muted" id="cal-panel-empty" hidden>이 날은 아직 기록이 없어 🌱</p>
 </div>
@@ -65,27 +75,62 @@
 {% block scripts %}
 <script>
 (function () {
-  // 서버가 넘긴 '날짜 -> {count, cover, ids}' 맵. 패널 렌더의 단일 데이터 원천.
+  // 서버가 넘긴 '날짜 -> {count, cover, ids, schedules}' 맵. 패널 렌더의 단일 원천.
   var DAYS = {{ days_data | tojson }};
   var YEAR = {{ year }}, MONTH = {{ month }};
   var selected = {{ selected_day }};
+  var SCHED_NEW = "{{ url_for('schedule_new') }}";
 
   var grid = document.getElementById('cal-grid');
   var panelGrid = document.getElementById('cal-panel-grid');
   var panelEmpty = document.getElementById('cal-panel-empty');
   var panelDate = document.getElementById('cal-panel-date');
+  var schedList = document.getElementById('cal-sched-list');
+  var addSched = document.getElementById('cal-add-sched');
 
-  // 선택한 날의 사진들을 공용 .photo-open 마크업으로 렌더(시머·라이트박스 재사용).
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function isoDate(day) { return YEAR + '-' + pad2(MONTH) + '-' + pad2(day); }
+
+  // 선택한 날의 일정+사진을 렌더. 일정은 리스트(탭→상세), 사진은 .photo-open 그리드.
   function renderPanel(day) {
     var info = DAYS[String(day)];
     panelDate.textContent = YEAR + '년 ' + MONTH + '월 ' + day + '일';
+    // '+ 일정' 링크는 늘 선택한 날짜를 가리킨다.
+    if (addSched) addSched.href = SCHED_NEW + '?date=' + isoDate(day);
+
+    // ---- 일정 리스트 ----
+    schedList.innerHTML = '';
+    var scheds = (info && info.schedules) || [];
+    scheds.forEach(function (s) {
+      var li = document.createElement('li');
+      li.className = 'cal-sched-item';
+      var a = document.createElement('a');
+      a.className = 'cal-sched-link';
+      a.href = '/calendar/schedule/' + s.id;
+      var t = document.createElement('span');
+      t.className = 'cal-sched-title';
+      t.textContent = s.title;
+      a.appendChild(t);
+      if (s.event_id) {
+        var m = document.createElement('span');
+        m.className = 'cal-sched-mark';
+        m.title = '데이트 뉴스 연결';
+        m.textContent = '📅';
+        a.appendChild(m);
+      }
+      li.appendChild(a);
+      schedList.appendChild(li);
+    });
+
+    // ---- 사진 그리드 ----
     panelGrid.innerHTML = '';
-    if (!info || !info.ids || !info.ids.length) {
+    var ids = (info && info.ids) || [];
+    if (!scheds.length && !ids.length) {
       panelEmpty.hidden = false;
       return;
     }
     panelEmpty.hidden = true;
-    info.ids.forEach(function (id) {
+    ids.forEach(function (id) {
       var full = '/memories/' + id + '/image';
       var btn = document.createElement('button');
       btn.type = 'button';

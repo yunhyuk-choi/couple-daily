@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}{{ '일정 수정' if mode == 'edit' else '일정 추가' }} · {{ app_name }}{% endblock %}
+{% block content %}
+{# 일정 추가/수정 공용 폼. 데이트 뉴스 확정 행사에서 넘어오면(event) 제목·설명을
+   프리필하고 hidden event_id로 연결을 잇는다. #}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>{{ '일정 수정' if mode == 'edit' else '일정 추가' }}</h1>
+</div>
+
+<div class="card">
+  {% if event %}
+  <p class="muted small" style="margin-top:0">
+    📅 데이트 뉴스 <strong>{{ event.title }}</strong> 의 날짜를 정하는 일정이야.
+  </p>
+  {% endif %}
+  <form class="stack" method="post"
+        action="{{ url_for('schedule_edit', sid=schedule.id) if mode == 'edit' else url_for('schedule_new') }}">
+    {% if mode == 'new' and event %}
+    <input type="hidden" name="event_id" value="{{ event.id }}" />
+    {% endif %}
+    <label for="sched-date">날짜 <span class="muted small">(필수)</span>
+      <input id="sched-date" type="date" name="date" required value="{{ form_date }}" />
+    </label>
+    <label for="sched-title">제목 <span class="muted small">(필수)</span>
+      <input id="sched-title" type="text" name="title" maxlength="200" required
+             placeholder="예: 벚꽃 데이트 🌸" value="{{ form_title }}" />
+    </label>
+    <label for="sched-desc">설명 <span class="muted small">(선택)</span>
+      <textarea id="sched-desc" name="description" rows="4"
+                placeholder="장소·메모·링크 등 자유롭게 적어줘.">{{ form_description }}</textarea>
+    </label>
+    <button class="btn primary" type="submit">{{ '수정 저장' if mode == 'edit' else '일정 추가' }}</button>
+    <a class="btn ghost"
+       href="{{ url_for('schedule_detail', sid=schedule.id) if mode == 'edit' else url_for('index') }}">취소</a>
+  </form>
+</div>
+{% endblock %}
