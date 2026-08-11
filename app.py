@@ -415,20 +415,26 @@ def regenerate_monthly_report(app, couple_id, year, month):
                     return  # solo space — nothing two-person to summarize
                 user_a, user_b = members[0], members[1]
 
-                qa_items = insights.collect_month_qa(
+                # 크로스도메인 컨텍스트(Q&A + 사진 + 판결 + 다녀온 데이트)를 모아
+                # 하나의 따뜻한 '우리의 N월' 회고를 생성한다. 전부 저렴한 DB 쿼리로
+                # 모으고, 느린 claude 호출은 이 백그라운드 스레드에서만 돈다.
+                context = insights.collect_month_context(
                     couple_id, year, month, user_a, user_b
                 )
                 month_label = f"{year}년 {month}월"
                 try:
-                    qualitative = ai.generate_monthly_qualitative(
-                        month_label, user_a.display_name, user_b.display_name, qa_items
+                    result = ai.generate_monthly_report(
+                        month_label,
+                        user_a.display_name,
+                        user_b.display_name,
+                        context,
                     )
                 except Exception:  # noqa: BLE001 — claude must never crash the thread
                     log.exception(
-                        "claude monthly insight raised (couple=%s %s-%s)",
+                        "claude monthly report raised (couple=%s %s-%s)",
                         couple_id, year, month,
                     )
-                    qualitative = None
+                    result = None
 
                 report = MonthlyReport.query.filter_by(
                     couple_id=couple_id, year=year, month=month
@@ -440,14 +446,16 @@ def regenerate_monthly_report(app, couple_id, year, month):
                     db.session.add(report)
 
                 now = datetime.utcnow()
-                if qualitative:
-                    report.summary = qualitative.get("summary") or ""
+                if result:
+                    # 새 구조화 리포트 전문을 저장 + 레거시 필드도 계속 채워
+                    # 하위 호환(과거 캐시/폴백)을 유지한다.
+                    report.report_json = json.dumps(result, ensure_ascii=False)
+                    report.summary = result.get("summary") or ""
                     report.themes = json.dumps(
-                        qualitative.get("themes") or [], ensure_ascii=False
+                        result.get("themes") or [], ensure_ascii=False
                     )
-                    report.tone = qualitative.get("tone") or ""
-                    report.divergent_question = qualitative.get("divergent_question") or ""
-                    report.fun = qualitative.get("fun") or ""
+                    report.tone = result.get("tone") or ""
+                    report.fun = result.get("fun") or ""
                     report.status = "ready"
                     report.generated_at = now
                 elif report.generated_at is not None:
@@ -2877,6 +2885,9 @@ def _register_routes(app: Flask):
         ).first()
         has_content = report is not None and report.generated_at is not None
         qualitative = None
+        # 새 구조화 리포트(report_json)가 있으면 그걸로 리치 카드를 렌더한다.
+        # 없으면(과거 캐시된 리포트) 아래 레거시 qualitative로 폴백한다.
+        report_data = report.report if has_content else None
         if has_content:
             qualitative = {
                 "summary": report.summary or "",
@@ -2914,6 +2925,7 @@ def _register_routes(app: Flask):
             "insight.html",
             stats=stats,
             qualitative=qualitative,
+            report=report_data,
             has_data=has_data,
             pending=pending,
             refreshing=refreshing,
