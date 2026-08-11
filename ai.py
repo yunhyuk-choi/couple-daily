@@ -22,7 +22,7 @@ CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
 # the 0.1-CPU free tier — give it generous headroom so it isn't killed mid-read.
 CAPTION_TIMEOUT = 180
 # 팝업 수집은 웹 검색(WebSearch/WebFetch)을 돌리므로 훨씬 느리다(~120s+).
-POPUP_TIMEOUT = 240
+POPUP_TIMEOUT = 300
 
 # Gentle fallbacks used only if the CLI is unavailable / errors out.
 FALLBACK_QUESTIONS = [
