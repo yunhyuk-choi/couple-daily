@@ -9,7 +9,11 @@
 
 <article class="card">
   <div class="date muted">
+    {% if schedule.end_date and schedule.end_date != schedule.date %}
+    {{ schedule.date.strftime('%Y년 %m월 %d일') }} ~ {{ schedule.end_date.strftime('%m월 %d일') }}
+    {% else %}
     {{ schedule.date.strftime('%Y년 %m월 %d일') }}
+    {% endif %}
     {% if schedule.creator %} · {{ schedule.creator.display_name }}님이 추가{% endif %}
   </div>
   <h2 class="event-detail-title" style="margin:8px 0 0">{{ schedule.title }}</h2>
