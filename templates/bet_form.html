@@ -74,6 +74,9 @@
     </div>
 
     {# ---- 공통 필드 ---- #}
+    <label for="bet-end">마감일 <span class="muted small">(선택 · 지나면 마감)</span>
+      <input id="bet-end" type="date" name="end_date" value="{{ form_end }}" />
+    </label>
     <label for="bet-penalty">벌칙 <span class="muted small">(선택)</span>
       <input id="bet-penalty" type="text" name="penalty" maxlength="500"
              placeholder="예: 진 사람이 커피 사기 ☕" value="{{ form_penalty }}" />

@@ -12,7 +12,19 @@
   <div class="bet-detail-head">
     <h2 style="margin:0">{{ bet.title }}</h2>
     {% if bet.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+    {% if end.has_end %}
+      {% if end.closed %}
+      <span class="chip small bet-ended-chip">마감</span>
+      {% else %}
+      <span class="chip small bet-dday-chip">{% if end.days_left == 0 %}D-day{% else %}D-{{ end.days_left }}{% endif %}</span>
+      {% endif %}
+    {% endif %}
   </div>
+  {% if end.has_end %}
+  <p class="muted small" style="margin:6px 0 0">
+    종료일 · {{ end.end_date.strftime('%Y.%m.%d') }}{% if end.closed %} (마감){% endif %}
+  </p>
+  {% endif %}
 
   {# 각자 예측 — 실제 날짜가 있으면 며칠 차이도 함께 #}
   <div class="bet-pred-guesses" style="margin-top:12px">
@@ -99,11 +111,19 @@
   <div class="bet-detail-head">
     <h2 style="margin:0">{{ bet.title }}</h2>
     {% if bet.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+    {% if end.has_end %}
+      {% if end.closed %}
+      <span class="chip small bet-ended-chip">마감</span>
+      {% else %}
+      <span class="chip small bet-dday-chip">{% if end.days_left == 0 %}D-day{% else %}D-{{ end.days_left }}{% endif %}</span>
+      {% endif %}
+    {% endif %}
   </div>
   <div class="bet-meta" style="margin-top:8px">
     <span class="chip small">주 {{ bet.count_target }}회</span>
     <span class="chip small">{% if target_name %}{{ target_name }}{% else %}같이{% endif %}</span>
     <span class="chip small">시작 {{ bet.start_date.strftime('%Y.%m.%d') }}</span>
+    {% if end.has_end %}<span class="chip small">종료 {{ end.end_date.strftime('%Y.%m.%d') }}</span>{% endif %}
   </div>
   {% if bet.description %}
   <p class="muted small" style="white-space:pre-wrap;margin:12px 0 0">{{ bet.description }}</p>
@@ -112,7 +132,7 @@
   <p class="bet-penalty" style="margin:10px 0 0">🎯 벌칙 · {{ bet.penalty }}</p>
   {% endif %}
 
-  {% if bet.status == 'active' and is_participant %}
+  {% if bet.status == 'active' and is_participant and not end.closed %}
   <form class="bet-checkin-form" method="post" style="margin-top:14px"
         action="{{ url_for('bet_checkin', bid=bet.id) }}">
     <input type="hidden" name="next" value="{{ url_for('bet_detail', bid=bet.id) }}" />
@@ -122,6 +142,8 @@
     <button class="btn primary" type="submit">오늘 달성 🔥</button>
     {% endif %}
   </form>
+  {% elif end.closed and bet.status == 'active' and is_participant %}
+  <p class="muted small" style="margin-top:14px">이 내기는 마감됐어 — 종료일이 지났어. 🏁</p>
   {% endif %}
 </article>
 
