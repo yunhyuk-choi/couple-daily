@@ -25,6 +25,13 @@
       <div class="bet-card-head">
         <span class="bet-title">🔮 {{ b.title }}</span>
         {% if b.status == 'ended' %}<span class="chip small">종료</span>{% endif %}
+        {% if r.end.has_end %}
+          {% if r.end.closed %}
+          <span class="chip small bet-ended-chip">마감 · {{ r.end.end_date.strftime('%m월 %d일') }}</span>
+          {% else %}
+          <span class="chip small bet-dday-chip">{% if r.end.days_left == 0 %}D-day{% else %}D-{{ r.end.days_left }}{% endif %} · ~{{ r.end.end_date.strftime('%m월 %d일') }}</span>
+          {% endif %}
+        {% endif %}
       </div>
       <div class="bet-progress">
         <span class="bet-prog-pill">{{ pr.a_name }} · {{ pr.guess_a.strftime('%m.%d') if pr.guess_a else '-' }}</span>
@@ -58,6 +65,13 @@
       <div class="bet-meta">
         <span class="chip small">주 {{ b.count_target }}회</span>
         <span class="chip small">{% if r.target_name %}{{ r.target_name }}{% else %}같이{% endif %}</span>
+        {% if r.end.has_end %}
+          {% if r.end.closed %}
+          <span class="chip small bet-ended-chip">마감 · {{ r.end.end_date.strftime('%m월 %d일') }}</span>
+          {% else %}
+          <span class="chip small bet-dday-chip">{% if r.end.days_left == 0 %}D-day{% else %}D-{{ r.end.days_left }}{% endif %} · ~{{ r.end.end_date.strftime('%m월 %d일') }}</span>
+          {% endif %}
+        {% endif %}
       </div>
       {% if r.progress.started %}
       <div class="bet-progress">
@@ -73,7 +87,7 @@
       {% endif %}
       {% if b.penalty %}<div class="bet-penalty muted small">벌칙 · {{ b.penalty }}</div>{% endif %}
     </a>
-    {% if b.status == 'active' and r.is_participant %}
+    {% if b.status == 'active' and r.is_participant and not r.end.closed %}
     <form class="bet-checkin-form" method="post"
           action="{{ url_for('bet_checkin', bid=b.id) }}">
       <input type="hidden" name="next" value="{{ url_for('calendar_bets') }}" />
@@ -83,6 +97,8 @@
       <button class="btn primary sm" type="submit">오늘 달성</button>
       {% endif %}
     </form>
+    {% elif r.end.closed and b.status == 'active' %}
+    <button class="btn ghost sm" type="button" disabled>마감됨</button>
     {% endif %}
   </li>
   {% endif %}
