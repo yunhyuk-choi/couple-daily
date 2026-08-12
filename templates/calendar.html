@@ -36,10 +36,23 @@
                  onload="this.closest('.cal-thumb').classList.add('is-loaded')"
                  onerror="this.closest('.cal-thumb').classList.add('is-error')" />
           </span>
-          {% if info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
           {% endif %}
-          {% if has_sched %}<span class="cal-sched-dot" aria-hidden="true">📌</span>{% endif %}
-          {% if has_bet %}<span class="cal-bet-dot" aria-hidden="true">🔥</span>{% endif %}
+          {# 우상단 코너: 내기 🔥 + 사진 +N 배지(제목 바와 겹치지 않게 위쪽에). #}
+          {% if has_bet or (has_photo and info.count > 1) %}
+          <span class="cal-corner">
+            {% if has_bet %}<span class="cal-bet-dot" aria-hidden="true">🔥</span>{% endif %}
+            {% if has_photo and info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
+          </span>
+          {% endif %}
+          {# 하단: 일정 제목 라벨(최대 2줄, 넘치면 +N). 썸네일 위에서도 읽히게 반투명 배경. #}
+          {% if has_sched %}
+          <span class="cal-sched-labels">
+            {% for s in info.schedules[:2] %}
+            <span class="cal-sched-label">{{ s.title }}</span>
+            {% endfor %}
+            {% if info.schedules|length > 2 %}<span class="cal-sched-more">+{{ info.schedules|length - 2 }}</span>{% endif %}
+          </span>
+          {% endif %}
         </button>
       {% endif %}
     {% endfor %}

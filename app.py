@@ -474,6 +474,33 @@ def bet_past_weeks(bet, couple, on=None, cap=8):
     return weeks
 
 
+def bet_end_info(bet, on=None):
+    """내기의 '종료일(마감)' 표시 정보(순수). 목록·상세·체크인 판정 공용.
+
+    반환 dict:
+      * ``has_end``   — end_date가 설정돼 있나.
+      * ``end_date``  — 종료일(또는 None).
+      * ``closed``    — 마감됐나. status가 'ended'거나 (종료일이 오늘보다 과거).
+      * ``days_left`` — 오늘 기준 남은 일수(종료일 - 오늘). 종료일 없으면 None.
+                        0이면 오늘이 마감일(아직 체크인 가능), 음수면 지남."""
+    if on is None:
+        on = date.today()
+    end = bet.end_date
+    if end is None:
+        return {
+            "has_end": False,
+            "end_date": None,
+            "closed": bet.status == "ended",
+            "days_left": None,
+        }
+    return {
+        "has_end": True,
+        "end_date": end,
+        "closed": bet.status == "ended" or end < on,
+        "days_left": (end - on).days,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 내기(Bet) — 예측 내기(2b) 헬퍼 (순수/테스트 가능; HTTP·요청 컨텍스트 불필요)
 # --------------------------------------------------------------------------- #
@@ -1966,25 +1993,46 @@ def _register_routes(app: Flask):
 
         # 이번 달 일정(Schedule)을 조회해 같은 days_data에 병합한다(커플 스코프).
         # 사진만 있는 날·일정만 있는 날·둘 다 있는 날 모두 한 엔트리에 담긴다.
+        # 여러 날 일정(end_date)은 이 달과 겹치는 모든 날에 제목을 얹는다 —
+        # 이 달 전에 시작했거나 다음 달까지 이어지는 일정도 겹치는 구간만 표시한다.
+        month_end = date(year, month, days_in_month)
         schedules = (
             Schedule.query.filter(
                 Schedule.couple_id == couple.id,
-                Schedule.date >= month_start,
                 Schedule.date < next_start,
+                db.or_(
+                    Schedule.end_date >= month_start,
+                    db.and_(
+                        Schedule.end_date.is_(None),
+                        Schedule.date >= month_start,
+                    ),
+                ),
             )
             .order_by(Schedule.date.asc(), Schedule.id.asc())
             .all()
         )
         for s in schedules:
-            key = str(s.date.day)
-            entry = days_data.get(key)
-            if entry is None:
-                # 사진 없는 '일정만' 있는 날 — 사진 필드는 비워 둔다.
-                entry = {"count": 0, "cover": None, "ids": [], "schedules": []}
-                days_data[key] = entry
-            entry["schedules"].append(
-                {"id": s.id, "title": s.title, "event_id": s.event_id}
-            )
+            multi = s.end_date is not None and s.end_date != s.date
+            # 이 달과 겹치는 구간 [span_start, span_end]의 모든 날에 표시한다.
+            span_start = max(s.date, month_start)
+            span_end = min(s.end_date or s.date, month_end)
+            cur = span_start
+            while cur <= span_end:
+                key = str(cur.day)
+                entry = days_data.get(key)
+                if entry is None:
+                    # 사진 없는 '일정만' 있는 날 — 사진 필드는 비워 둔다.
+                    entry = {"count": 0, "cover": None, "ids": [], "schedules": []}
+                    days_data[key] = entry
+                entry["schedules"].append(
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "event_id": s.event_id,
+                        "multi": multi,
+                    }
+                )
+                cur += timedelta(days=1)
 
         # 이번 달 '내기 체크인'을 조회해 같은 days_data에 병합한다(커플 스코프).
         # 이 커플의 내기(Bet)에 속한 체크인만 세며, 체크인이 하나라도 있는 날은
@@ -2074,24 +2122,35 @@ def _register_routes(app: Flask):
 
         if request.method == "POST":
             d = _parse_date(request.form.get("date"))
+            end_raw = (request.form.get("end_date") or "").strip()
+            end = _parse_date(end_raw)
             title = (request.form.get("title") or "").strip()[:200]
             description = (request.form.get("description") or "").strip() or None
             event = _load_event(request.form.get("event_id"))
-            if not title or d is None:
-                flash("날짜와 제목을 모두 입력해줘.", "error")
+
+            def _rerender():
                 # 입력값을 살려 폼을 다시 보여준다.
                 return render_template(
                     "schedule_form.html",
                     mode="new",
                     schedule=None,
                     form_date=(request.form.get("date") or ""),
+                    form_end=end_raw,
                     form_title=title,
                     form_description=description or "",
                     event=event,
                 )
+
+            if not title or d is None:
+                flash("날짜와 제목을 모두 입력해줘.", "error")
+                return _rerender()
+            if end_raw and (end is None or end < d):
+                flash("종료일은 시작일과 같거나 이후 날짜여야 해.", "error")
+                return _rerender()
             sched = Schedule(
                 couple_id=u.couple_id,
                 date=d,
+                end_date=(end if end_raw else None),
                 title=title,
                 description=description,
                 created_by=u.id,
@@ -2120,6 +2179,7 @@ def _register_routes(app: Flask):
             mode="new",
             schedule=None,
             form_date=prefill_date.strftime("%Y-%m-%d"),
+            form_end="",
             form_title=form_title,
             form_description=form_description,
             event=event,
@@ -2143,20 +2203,31 @@ def _register_routes(app: Flask):
         sched = _get_schedule_or_404(u, sid)
         if request.method == "POST":
             d = _parse_date(request.form.get("date"))
+            end_raw = (request.form.get("end_date") or "").strip()
+            end = _parse_date(end_raw)
             title = (request.form.get("title") or "").strip()[:200]
             description = (request.form.get("description") or "").strip() or None
-            if not title or d is None:
-                flash("날짜와 제목을 모두 입력해줘.", "error")
+
+            def _rerender():
                 return render_template(
                     "schedule_form.html",
                     mode="edit",
                     schedule=sched,
                     form_date=(request.form.get("date") or ""),
+                    form_end=end_raw,
                     form_title=title,
                     form_description=description or "",
                     event=sched.event,
                 )
+
+            if not title or d is None:
+                flash("날짜와 제목을 모두 입력해줘.", "error")
+                return _rerender()
+            if end_raw and (end is None or end < d):
+                flash("종료일은 시작일과 같거나 이후 날짜여야 해.", "error")
+                return _rerender()
             sched.date = d
+            sched.end_date = end if end_raw else None
             sched.title = title
             sched.description = description
             sched.updated_at = datetime.utcnow()
@@ -2168,6 +2239,7 @@ def _register_routes(app: Flask):
             mode="edit",
             schedule=sched,
             form_date=sched.date.strftime("%Y-%m-%d"),
+            form_end=(sched.end_date.strftime("%Y-%m-%d") if sched.end_date else ""),
             form_title=sched.title,
             form_description=sched.description or "",
             event=sched.event,
@@ -2231,6 +2303,7 @@ def _register_routes(app: Flask):
                         "bet": b,
                         "type": "prediction",
                         "prediction": prediction_result(b, couple),
+                        "end": bet_end_info(b, today),
                     }
                 )
                 continue
@@ -2248,6 +2321,7 @@ def _register_routes(app: Flask):
                     "done_today": bool(mine and mine["done_today"]),
                     "target_name": (b.target_user.display_name
                                     if b.target_user_id else None),
+                    "end": bet_end_info(b, today),
                 }
             )
         return render_template("bets.html", rows=rows, me=u)
@@ -2268,6 +2342,7 @@ def _register_routes(app: Flask):
             form_count="",
             form_target="",
             form_start=date.today().strftime("%Y-%m-%d"),
+            form_end="",
             form_penalty="",
             form_description="",
             form_guess_a="",
@@ -2286,6 +2361,9 @@ def _register_routes(app: Flask):
             bet_type = (request.form.get("type") or "habit").strip()
             penalty = (request.form.get("penalty") or "").strip() or None
             description = (request.form.get("description") or "").strip() or None
+            # 종료일(마감일) — 두 종류 공통. 비면 NULL(무기한).
+            end_raw = (request.form.get("end_date") or "").strip()
+            end = _parse_date(end_raw)
 
             if bet_type == "prediction":
                 # 예측 제목은 ptitle로 받는다(JS 없이도 정확히 서버가 읽게 필드 분리).
@@ -2302,12 +2380,15 @@ def _register_routes(app: Flask):
                     errs.append(f"{a_name} 날짜")
                 if guess_b is None:
                     errs.append(f"{b_name} 날짜")
+                if end_raw and end is None:
+                    errs.append("종료일(올바른 날짜)")
                 if errs:
                     flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
                     return render_template("bet_form.html", **_bet_form_ctx(
                         u, "new", None,
                         form_type="prediction",
                         form_title=title,
+                        form_end=end_raw,
                         form_penalty=penalty or "",
                         form_description=description or "",
                         form_guess_a=(request.form.get("guess_a_date") or ""),
@@ -2319,6 +2400,7 @@ def _register_routes(app: Flask):
                     title=title,
                     description=description,
                     start_date=date.today(),  # 예측은 롤링 주 미사용 — 생성 마커
+                    end_date=(end if end_raw else None),
                     guess_a_date=guess_a,
                     guess_b_date=guess_b,
                     penalty=penalty,
@@ -2345,6 +2427,8 @@ def _register_routes(app: Flask):
                 errs.append("주 N회(1 이상)")
             if not target_ok:
                 errs.append("대상")
+            if end_raw and (end is None or end < start):
+                errs.append("종료일(시작일 이후)")
             if errs:
                 flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
                 return render_template("bet_form.html", **_bet_form_ctx(
@@ -2355,6 +2439,7 @@ def _register_routes(app: Flask):
                     form_target=(request.form.get("target") or ""),
                     form_start=(request.form.get("start_date")
                                 or date.today().strftime("%Y-%m-%d")),
+                    form_end=end_raw,
                     form_penalty=penalty or "",
                     form_description=description or "",
                 ))
@@ -2365,6 +2450,7 @@ def _register_routes(app: Flask):
                 description=description,
                 target_user_id=target_id,
                 start_date=start,
+                end_date=(end if end_raw else None),
                 count_target=count_target,
                 penalty=penalty,
                 status="active",
@@ -2398,6 +2484,9 @@ def _register_routes(app: Flask):
             return redirect(nxt)
         if bet.status != "active":
             flash("종료된 내기야.", "error")
+            return redirect(nxt)
+        if bet.end_date is not None and bet.end_date < today:
+            flash("이 내기는 마감됐어 — 종료일이 지났어.", "error")
             return redirect(nxt)
 
         existing = BetCheckin.query.filter_by(
@@ -2442,6 +2531,7 @@ def _register_routes(app: Flask):
                 bet=bet,
                 me=u,
                 pred=prediction_result(bet, couple),
+                end=bet_end_info(bet, today),
             )
 
         prog = bet_progress(bet, couple, today)
@@ -2469,6 +2559,7 @@ def _register_routes(app: Flask):
             is_participant=mine is not None,
             done_today=bool(mine and mine["done_today"]),
             target_name=(bet.target_user.display_name if bet.target_user_id else None),
+            end=bet_end_info(bet, today),
         )
 
     @app.route("/calendar/bets/<int:bid>/edit", methods=["GET", "POST"])
@@ -2481,6 +2572,9 @@ def _register_routes(app: Flask):
         if request.method == "POST":
             penalty = (request.form.get("penalty") or "").strip() or None
             description = (request.form.get("description") or "").strip() or None
+            # 종료일(마감일) — 두 종류 공통. 비면 NULL(무기한).
+            end_raw = (request.form.get("end_date") or "").strip()
+            end = _parse_date(end_raw)
 
             if bet.type == "prediction":
                 title = (request.form.get("ptitle") or "").strip()[:200]
@@ -2496,12 +2590,15 @@ def _register_routes(app: Flask):
                     errs.append(f"{a_name} 날짜")
                 if guess_b is None:
                     errs.append(f"{b_name} 날짜")
+                if end_raw and end is None:
+                    errs.append("종료일(올바른 날짜)")
                 if errs:
                     flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
                     return render_template("bet_form.html", **_bet_form_ctx(
                         u, "edit", bet,
                         form_type="prediction",
                         form_title=title,
+                        form_end=end_raw,
                         form_penalty=penalty or "",
                         form_description=description or "",
                         form_guess_a=(request.form.get("guess_a_date") or ""),
@@ -2510,6 +2607,7 @@ def _register_routes(app: Flask):
                 bet.title = title
                 bet.guess_a_date = guess_a
                 bet.guess_b_date = guess_b
+                bet.end_date = end if end_raw else None
                 bet.penalty = penalty
                 bet.description = description
                 bet.updated_at = datetime.utcnow()
@@ -2532,6 +2630,8 @@ def _register_routes(app: Flask):
                 errs.append("주 N회(1 이상)")
             if not target_ok:
                 errs.append("대상")
+            if end_raw and (end is None or end < start):
+                errs.append("종료일(시작일 이후)")
             if errs:
                 flash("입력을 확인해줘: " + ", ".join(errs) + ".", "error")
                 return render_template("bet_form.html", **_bet_form_ctx(
@@ -2542,6 +2642,7 @@ def _register_routes(app: Flask):
                     form_target=(request.form.get("target") or ""),
                     form_start=(request.form.get("start_date")
                                 or bet.start_date.strftime("%Y-%m-%d")),
+                    form_end=end_raw,
                     form_penalty=penalty or "",
                     form_description=description or "",
                 ))
@@ -2549,6 +2650,7 @@ def _register_routes(app: Flask):
             bet.count_target = count_target
             bet.target_user_id = target_id
             bet.start_date = start
+            bet.end_date = end if end_raw else None
             bet.penalty = penalty
             bet.description = description
             bet.updated_at = datetime.utcnow()
@@ -2557,11 +2659,13 @@ def _register_routes(app: Flask):
             return redirect(url_for("bet_detail", bid=bet.id))
 
         # GET — 현재 값으로 프리필(타입별).
+        _form_end = bet.end_date.strftime("%Y-%m-%d") if bet.end_date else ""
         if bet.type == "prediction":
             return render_template("bet_form.html", **_bet_form_ctx(
                 u, "edit", bet,
                 form_type="prediction",
                 form_title=bet.title,
+                form_end=_form_end,
                 form_penalty=bet.penalty or "",
                 form_description=bet.description or "",
                 form_guess_a=(bet.guess_a_date.strftime("%Y-%m-%d")
@@ -2576,6 +2680,7 @@ def _register_routes(app: Flask):
             form_count=(bet.count_target if bet.count_target else ""),
             form_target=(str(bet.target_user_id) if bet.target_user_id else ""),
             form_start=bet.start_date.strftime("%Y-%m-%d"),
+            form_end=_form_end,
             form_penalty=bet.penalty or "",
             form_description=bet.description or "",
         ))

@@ -128,6 +128,37 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding monthly_reports.report_json"
                     )
+
+        # 5) calendar_schedules: 여러 날 일정용 end_date 컬럼(포함 종료일).
+        #    calendar_schedules 테이블은 프로덕션에 이미 존재하므로 create_all이
+        #    ALTER하지 않는다 — 없을 때만 추가한다. Postgres·SQLite 모두 안전하고
+        #    반복 실행에 멱등하다. 기존 행은 NULL(단일 날짜 일정)로 남는다.
+        if "calendar_schedules" in insp.get_table_names():
+            scols = {c["name"]: c for c in insp.get_columns("calendar_schedules")}
+            if "end_date" not in scols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("ALTER TABLE calendar_schedules ADD COLUMN end_date DATE")
+                        )
+                    log.info("startup migration: added calendar_schedules.end_date")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "startup migration: failed adding calendar_schedules.end_date"
+                    )
+
+        # 6) bets: 내기 종료일(마감일) end_date 컬럼. bets 테이블은 프로덕션에 이미
+        #    존재하므로 없을 때만 추가한다. Postgres·SQLite 모두 안전하고 멱등하다.
+        #    기존 행은 NULL(무기한)로 남는다.
+        if "bets" in insp.get_table_names():
+            bcols = {c["name"]: c for c in insp.get_columns("bets")}
+            if "end_date" not in bcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE bets ADD COLUMN end_date DATE"))
+                    log.info("startup migration: added bets.end_date")
+                except Exception:  # noqa: BLE001
+                    log.exception("startup migration: failed adding bets.end_date")
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -739,6 +770,9 @@ class Schedule(db.Model):
         db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
     )
     date = db.Column(db.Date, nullable=False, index=True)
+    # 여러 날 일정의 종료일(포함). NULL이면 단일 날짜 일정(=date 하루).
+    # 값이 있으면 일정은 [date, end_date] 구간을 덮는다.
+    end_date = db.Column(db.Date, nullable=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
@@ -787,6 +821,9 @@ class Bet(db.Model):
     )
     # 롤링 주 기준점(달력 주가 아니라 이 날짜 + 7*k 로 굴러간다)
     start_date = db.Column(db.Date, nullable=False)
+    # 선택적 종료일(마감일). NULL이면 무기한(ongoing). 값이 있고 오늘보다 과거면
+    # '마감'으로 간주해 더 이상 체크인을 받지 않는다(표시 레벨 판정).
+    end_date = db.Column(db.Date, nullable=True)
     # habit: 주 N회 목표
     count_target = db.Column(db.Integer, nullable=True)
     penalty = db.Column(db.Text, nullable=True)  # 벌칙

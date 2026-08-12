@@ -1256,12 +1256,19 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   object-fit: cover;
   display: block;
 }
-/* +N 배지 (하루 사진이 2장 이상) */
-.cal-badge {
+/* 우상단 코너 — 내기 🔥 + 사진 +N 배지를 한 줄로(제목 바와 겹치지 않게 위쪽). */
+.cal-corner {
   position: absolute;
+  top: 2px;
   right: 3px;
-  bottom: 3px;
-  z-index: 2;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  pointer-events: none;
+}
+/* +N 배지 (하루 사진이 2장 이상) — 코너 안에 인라인 배치 */
+.cal-badge {
   font-size: 0.6rem;
   font-weight: 800;
   line-height: 1;
@@ -1289,16 +1296,41 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   font-size: 0.9rem;
 }
 
-/* 일정 표시 — 셀 우상단 작은 📌 배지(사진 썸네일 위에서도 보이게 그림자). */
-.cal-sched-dot {
+/* 일정 제목 라벨 — 셀 하단에 최대 2줄, 넘치면 +N. 사진 썸네일 위에서도
+   읽히도록 반투명 흰 배경 + 한 줄 말줄임. 셀 폭(360px에서 ~45px)에 맞춰 작게. */
+.cal-sched-labels {
   position: absolute;
-  top: 2px;
-  right: 3px;
+  left: 2px;
+  right: 2px;
+  bottom: 2px;
   z-index: 3;
-  font-size: 0.62rem;
-  line-height: 1;
-  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   pointer-events: none;
+}
+.cal-sched-label {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.5rem;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--ink, #3a2e33);
+  background: rgba(255, 255, 255, 0.86);
+  border-radius: 5px;
+  padding: 1px 3px;
+}
+.cal-sched-more {
+  align-self: flex-start;
+  font-size: 0.46rem;
+  font-weight: 800;
+  line-height: 1;
+  color: #fff;
+  background: rgba(255, 107, 157, 0.92);
+  border-radius: 5px;
+  padding: 1px 3px;
 }
 /* 사진 없는 '일정만' 있는 날도 셀이 눌리도록 배경 유지(기본 .cal-cell 배경). */
 
@@ -1346,17 +1378,12 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 }
 .cal-sched-mark { flex: none; font-size: 0.85rem; }
 
-/* 내기 체크인 아이콘 — 셀 좌하단 작은 🔥(사진 위에서도 보이게 그림자).
-   📌(우상)·+N(우하)·날짜(좌상)와 겹치지 않게 좌하단에 둔다. */
+/* 내기 체크인 아이콘 — 우상단 코너(.cal-corner) 안에 인라인으로 놓인 작은 🔥.
+   사진 썸네일 위에서도 보이게 그림자. 하단 제목 라벨과 겹치지 않는다. */
 .cal-bet-dot {
-  position: absolute;
-  bottom: 2px;
-  left: 3px;
-  z-index: 3;
   font-size: 0.62rem;
   line-height: 1;
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
-  pointer-events: none;
 }
 
 /* ---- 내기(Bet) 목록/상세 ---- */
@@ -1391,6 +1418,9 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .bet-prog-pill.met { background: var(--ok); color: var(--ok-ink); }
 .bet-prog-pill.miss { background: var(--err); color: var(--err-ink); }
 .bet-penalty { color: var(--muted); font-size: 0.85rem; }
+/* 종료일 표시 칩 — D-day(진행 중, 미래 마감일)와 마감(지난 마감일) */
+.chip.small.bet-dday-chip { background: var(--pink-soft); color: var(--pink); }
+.chip.small.bet-ended-chip { background: var(--err); color: var(--err-ink); }
 .bet-checkin-form { margin: 0; }
 .bet-checkin-form .btn { width: 100%; }
 .btn.bet-done { background: var(--ok); color: var(--ok-ink); }
