@@ -146,6 +146,21 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding calendar_schedules.end_date"
                     )
+            # 일정 시작 시각(선택) start_time. 없을 때만 추가한다. Postgres·SQLite
+            # 모두 TIME 타입을 지원하고, 반복 실행에 멱등하다. 기존 행은 NULL(종일).
+            if "start_time" not in scols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "ALTER TABLE calendar_schedules ADD COLUMN start_time TIME"
+                            )
+                        )
+                    log.info("startup migration: added calendar_schedules.start_time")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "startup migration: failed adding calendar_schedules.start_time"
+                    )
 
         # 6) bets: 내기 종료일(마감일) end_date 컬럼. bets 테이블은 프로덕션에 이미
         #    존재하므로 없을 때만 추가한다. Postgres·SQLite 모두 안전하고 멱등하다.
@@ -773,6 +788,8 @@ class Schedule(db.Model):
     # 여러 날 일정의 종료일(포함). NULL이면 단일 날짜 일정(=date 하루).
     # 값이 있으면 일정은 [date, end_date] 구간을 덮는다.
     end_date = db.Column(db.Date, nullable=True)
+    # 일정 시작 시각(선택). NULL이면 '종일'(시간 미지정). 값이 있으면 그 시각에 시작.
+    start_time = db.Column(db.Time, nullable=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
@@ -790,6 +807,16 @@ class Schedule(db.Model):
 
     creator = db.relationship("User")
     event = db.relationship("EventItem")
+
+    @property
+    def time_label(self):
+        """시작 시각을 '오전/오후 h:MM' 한국어로. 시간 미지정이면 ''(종일)."""
+        t = self.start_time
+        if t is None:
+            return ""
+        ampm = "오전" if t.hour < 12 else "오후"
+        h12 = t.hour % 12 or 12
+        return f"{ampm} {h12}:{t.minute:02d}"
 
 
 class Bet(db.Model):

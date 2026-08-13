@@ -22,6 +22,11 @@
     <label for="sched-date">날짜 <span class="muted small">(필수)</span>
       <input id="sched-date" type="date" name="date" required value="{{ form_date }}" />
     </label>
+    {# 시간은 네이티브 <input type="time"> — iOS/안드에선 기본 휠·다이얼 피커로 뜬다.
+       비우면 '종일' 일정(start_time NULL). #}
+    <label for="sched-time">시간 <span class="muted small">(선택 · 비우면 종일)</span>
+      <input id="sched-time" type="time" name="start_time" value="{{ form_time }}" />
+    </label>
     <label for="sched-end">종료일 <span class="muted small">(여러 날 일정이면 종료일)</span>
       <input id="sched-end" type="date" name="end_date" value="{{ form_end }}" />
     </label>
