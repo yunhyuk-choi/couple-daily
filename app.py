@@ -2363,8 +2363,9 @@ def _register_routes(app: Flask):
         )
         resp = app.response_class(body)
         resp.headers["Content-Type"] = "text/calendar; charset=utf-8"
+        # inline = iOS가 캘린더 앱으로 바로 넘김(다운로드 X)
         resp.headers["Content-Disposition"] = (
-            f'attachment; filename="ourday-schedule-{sched.id}.ics"'
+            f'inline; filename="ourday-schedule-{sched.id}.ics"'
         )
         return resp
 
@@ -4327,8 +4328,9 @@ def _register_routes(app: Flask):
         )
         resp = app.response_class(body)
         resp.headers["Content-Type"] = "text/calendar; charset=utf-8"
+        # inline = iOS가 캘린더 앱으로 바로 넘김(다운로드 X)
         resp.headers["Content-Disposition"] = (
-            f'attachment; filename="ourday-date-{item.id}.ics"'
+            f'inline; filename="ourday-date-{item.id}.ics"'
         )
         return resp
 
