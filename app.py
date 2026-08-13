@@ -571,7 +571,20 @@ def get_or_create_today_question(couple: Couple) -> DailyQuestion:
         {"question": r.text, "answers": [a.text for a in r.answers.all()]}
         for r in recent
     ]
-    text, source = ai.generate_daily_question(recent_pairs)
+    # 의미 중복 회피용 — 개인화(8개)보다 넓게 지난 질문 '텍스트'만 최대 40개 모은다.
+    past_questions = [
+        text_ for (text_,) in (
+            DailyQuestion.query.with_entities(DailyQuestion.text)
+            .filter(
+                DailyQuestion.couple_id == couple.id,
+                DailyQuestion.q_date < today,
+            )
+            .order_by(DailyQuestion.q_date.desc())
+            .limit(40)
+            .all()
+        )
+    ]
+    text, source = ai.generate_daily_question(recent_pairs, past_questions=past_questions)
 
     q = DailyQuestion(couple_id=couple.id, q_date=today, text=text, source=source)
     db.session.add(q)
@@ -2035,27 +2048,64 @@ def _register_routes(app: Flask):
                 cur += timedelta(days=1)
 
         # 이번 달 '내기 체크인'을 조회해 같은 days_data에 병합한다(커플 스코프).
-        # 이 커플의 내기(Bet)에 속한 체크인만 세며, 체크인이 하나라도 있는 날은
-        # 셀에 🔥 아이콘을 띄운다("bet": True). 사진·일정이 전혀 없고 체크인만 있는
-        # 날도 엔트리를 만들어 셀이 눌리고 아이콘이 보이게 한다.
-        bet_days = (
-            db.session.query(BetCheckin.date)
+        # 이 커플의 내기(Bet)에 속한 체크인만 세되, 날마다 '누가'(사람별)·'어떤 내기'
+        # 를 구분해 담는다. 아바타와 같은 팔레트를 user.id % 6 로 인덱싱해 사람별
+        # 색을 정한다(앱 전체 일관). 사진·일정이 없고 체크인만 있는 날도 엔트리를
+        # 만들어 셀이 눌리고 마커가 보이게 한다.
+        BET_PALETTE = ["#ff8fb1", "#ffb37a", "#8fd6b4", "#8fb6ff", "#c79bff", "#ff9e9e"]
+        bet_rows = (
+            db.session.query(
+                BetCheckin.date,
+                BetCheckin.user_id,
+                User.display_name,
+                Bet.id,
+                Bet.title,
+            )
             .join(Bet, BetCheckin.bet_id == Bet.id)
+            .join(User, BetCheckin.user_id == User.id)
             .filter(
                 Bet.couple_id == couple.id,
                 BetCheckin.date >= month_start,
                 BetCheckin.date < next_start,
             )
-            .distinct()
+            .order_by(BetCheckin.date.asc(), BetCheckin.user_id.asc(), Bet.id.asc())
             .all()
         )
-        for (cd,) in bet_days:
-            key = str(cd.day)
+        # 날짜별로 (사람별 요약 people_map)·(체크인 상세 목록)을 모은다.
+        bet_by_day = {}
+        for cd, uid, uname, bid, btitle in bet_rows:
+            day_info = bet_by_day.setdefault(cd.day, {"people": {}, "checkins": []})
+            person = day_info["people"].get(uid)
+            if person is None:
+                person = {
+                    "user_id": uid,
+                    "name": uname,
+                    "color": BET_PALETTE[uid % len(BET_PALETTE)],
+                    "count": 0,
+                }
+                day_info["people"][uid] = person
+            person["count"] += 1
+            day_info["checkins"].append(
+                {
+                    "user_id": uid,
+                    "name": uname,
+                    "color": BET_PALETTE[uid % len(BET_PALETTE)],
+                    "bet_id": bid,
+                    "bet_title": btitle,
+                }
+            )
+        for cd_day, day_info in bet_by_day.items():
+            key = str(cd_day)
             entry = days_data.get(key)
             if entry is None:
                 entry = {"count": 0, "cover": None, "ids": [], "schedules": []}
                 days_data[key] = entry
-            entry["bet"] = True
+            # 셀용: 사람별 색점(user id 순으로 안정 정렬).
+            entry["bet_people"] = [
+                day_info["people"][uid] for uid in sorted(day_info["people"])
+            ]
+            # 패널용: 각 체크인(사람+내기) 상세 목록.
+            entry["bet_checkins"] = day_info["checkins"]
 
         # 일요일 시작 그리드 — 앞쪽 빈칸 = (첫날 요일 +1) % 7 (월=0..일=6).
         lead = (month_start.weekday() + 1) % 7
