@@ -14,6 +14,7 @@
     {% else %}
     {{ schedule.date.strftime('%Y년 %m월 %d일') }}
     {% endif %}
+    {% if schedule.time_label %} · {{ schedule.time_label }}{% else %} · 종일{% endif %}
     {% if schedule.creator %} · {{ schedule.creator.display_name }}님이 추가{% endif %}
   </div>
   <h2 class="event-detail-title" style="margin:8px 0 0">{{ schedule.title }}</h2>
@@ -26,6 +27,12 @@
   {% if schedule.description %}
   <p class="event-desc" style="white-space:pre-wrap; word-break:break-word">{{ schedule.description }}</p>
   {% endif %}
+
+  {# 기기 캘린더에 추가 — .ics 링크. iOS Safari는 이 링크를 열면 캘린더 '이벤트
+     추가'가 뜬다(권한 불필요). 같은 탭 일반 링크가 iOS에서 가장 안정적. #}
+  <a class="btn primary sm" style="margin-top:16px"
+     href="{{ url_for('schedule_ics', sid=schedule.id) }}">📅 기기 캘린더에 추가</a>
+  <p class="muted small" style="margin:6px 0 0">아이폰·안드 캘린더로 추가돼.</p>
 
   <div class="pick-btns" style="margin-top:16px">
     <a class="btn sm" href="{{ url_for('schedule_edit', sid=schedule.id) }}">수정</a>
