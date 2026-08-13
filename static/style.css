@@ -276,6 +276,9 @@ input, textarea {
 }
 input:focus, textarea:focus { outline: none; border-color: var(--pink); }
 textarea { resize: vertical; }
+/* 네이티브 날짜·시간 피커(<input type=date|time>) — 기본 input 테마와 일관되게.
+   모바일에선 탭하면 OS 기본 휠/다이얼 피커가 뜬다(별도 스크립트 없음). */
+input[type="date"], input[type="time"] { min-height: 48px; }
 
 .btn {
   font: inherit;

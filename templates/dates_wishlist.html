@@ -25,6 +25,9 @@
         {# 데이트 전 계획: 캘린더에 날짜를 잡는다(행사 연결). #}
         <a class="btn sm plan-btn"
            href="{{ url_for('schedule_new', event_id=it.event.id) }}">📅 날짜 정하기</a>
+        {# 기기 캘린더에 바로 추가(.ics) — iOS/안드 캘린더로 추가된다. #}
+        <a class="btn ghost sm"
+           href="{{ url_for('event_ics', event_id=it.event.id) }}">📅 캘린더에 추가</a>
         {# 데이트 후 기록: 추억 앨범으로 연결. 둘은 함께 존재한다. #}
         <form method="post" action="{{ url_for('date_went', event_id=it.event.id) }}"
               class="went-form">

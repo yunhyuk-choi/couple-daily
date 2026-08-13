@@ -71,6 +71,8 @@
   <div class="confirmed-actions confirmed-actions-detail">
     {# 데이트 전 계획: 캘린더에 날짜 잡기(행사 연결). '다녀왔어'와 함께 존재. #}
     <a class="btn sm plan-btn" href="{{ url_for('schedule_new', event_id=item.id) }}">📅 날짜 정하기</a>
+    {# 기기 캘린더에 바로 추가(.ics) — iOS/안드 캘린더로 추가된다(권한 불필요). #}
+    <a class="btn ghost sm" href="{{ url_for('event_ics', event_id=item.id) }}">📅 캘린더에 추가</a>
     <form method="post" action="{{ url_for('date_went', event_id=item.id) }}"
           class="went-form went-detail">
       <button type="submit" class="btn primary sm went-btn">📸 다녀왔어 — 추억으로 남기기</button>

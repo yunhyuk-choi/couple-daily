@@ -134,7 +134,8 @@
       a.href = '/calendar/schedule/' + s.id;
       var t = document.createElement('span');
       t.className = 'cal-sched-title';
-      t.textContent = s.title;
+      // 시간이 있으면 '오전 9:00 · 제목'으로 접두(종일이면 제목만).
+      t.textContent = s.time ? (s.time + ' · ' + s.title) : s.title;
       a.appendChild(t);
       if (s.event_id) {
         var m = document.createElement('span');

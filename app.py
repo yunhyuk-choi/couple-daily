@@ -19,7 +19,7 @@ import string
 import tempfile
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from urllib.parse import urlencode
 
 import requests
@@ -46,6 +46,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
 import events
+import ics
 import insights
 import onedrive
 from models import (
@@ -2041,6 +2042,7 @@ def _register_routes(app: Flask):
                     {
                         "id": s.id,
                         "title": s.title,
+                        "time": s.time_label,  # '오전 9:00' 등, 종일이면 ''
                         "event_id": s.event_id,
                         "multi": multi,
                     }
@@ -2154,6 +2156,17 @@ def _register_routes(app: Flask):
         except (ValueError, TypeError):
             return None
 
+    def _parse_time(raw):
+        """'HH:MM' → datetime.time. 비었거나 형식이 틀리면 None(종일로 취급 — 비차단)."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            hh, mm = (int(x) for x in raw.split(":", 1))
+            return dtime(hh, mm)
+        except (ValueError, TypeError):
+            return None
+
     @app.route("/calendar/schedule/new", methods=["GET", "POST"])
     @active_couple_required
     def schedule_new():
@@ -2174,6 +2187,8 @@ def _register_routes(app: Flask):
             d = _parse_date(request.form.get("date"))
             end_raw = (request.form.get("end_date") or "").strip()
             end = _parse_date(end_raw)
+            time_raw = (request.form.get("start_time") or "").strip()
+            start_time = _parse_time(time_raw)  # 형식 틀리면 None(종일) — 비차단
             title = (request.form.get("title") or "").strip()[:200]
             description = (request.form.get("description") or "").strip() or None
             event = _load_event(request.form.get("event_id"))
@@ -2186,6 +2201,7 @@ def _register_routes(app: Flask):
                     schedule=None,
                     form_date=(request.form.get("date") or ""),
                     form_end=end_raw,
+                    form_time=time_raw,
                     form_title=title,
                     form_description=description or "",
                     event=event,
@@ -2201,6 +2217,7 @@ def _register_routes(app: Flask):
                 couple_id=u.couple_id,
                 date=d,
                 end_date=(end if end_raw else None),
+                start_time=start_time,
                 title=title,
                 description=description,
                 created_by=u.id,
@@ -2230,6 +2247,7 @@ def _register_routes(app: Flask):
             schedule=None,
             form_date=prefill_date.strftime("%Y-%m-%d"),
             form_end="",
+            form_time="",
             form_title=form_title,
             form_description=form_description,
             event=event,
@@ -2255,6 +2273,8 @@ def _register_routes(app: Flask):
             d = _parse_date(request.form.get("date"))
             end_raw = (request.form.get("end_date") or "").strip()
             end = _parse_date(end_raw)
+            time_raw = (request.form.get("start_time") or "").strip()
+            start_time = _parse_time(time_raw)  # 비었거나 틀리면 None(종일) — 비차단
             title = (request.form.get("title") or "").strip()[:200]
             description = (request.form.get("description") or "").strip() or None
 
@@ -2265,6 +2285,7 @@ def _register_routes(app: Flask):
                     schedule=sched,
                     form_date=(request.form.get("date") or ""),
                     form_end=end_raw,
+                    form_time=time_raw,
                     form_title=title,
                     form_description=description or "",
                     event=sched.event,
@@ -2278,6 +2299,7 @@ def _register_routes(app: Flask):
                 return _rerender()
             sched.date = d
             sched.end_date = end if end_raw else None
+            sched.start_time = start_time  # 비우면 종일로 되돌린다(클리어)
             sched.title = title
             sched.description = description
             sched.updated_at = datetime.utcnow()
@@ -2290,6 +2312,7 @@ def _register_routes(app: Flask):
             schedule=sched,
             form_date=sched.date.strftime("%Y-%m-%d"),
             form_end=(sched.end_date.strftime("%Y-%m-%d") if sched.end_date else ""),
+            form_time=(sched.start_time.strftime("%H:%M") if sched.start_time else ""),
             form_title=sched.title,
             form_description=sched.description or "",
             event=sched.event,
@@ -2306,6 +2329,44 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("일정을 삭제했어.", "ok")
         return redirect(url_for("index", month=month))
+
+    @app.route("/calendar/schedule/<int:sid>/ics")
+    @active_couple_required
+    def schedule_ics(sid):
+        """이 일정의 .ics(iCalendar)를 내려준다 — 탭하면 기기 캘린더에 '추가'된다
+        (iOS Safari→캘린더 이벤트 추가, 안드→기본/구글 캘린더). 이 커플의 일정이
+        아니면 404. 시간이 없으면 종일(배타적 DTEND), 있으면 그 시각 시작+1시간.
+        연결된 데이트 행사가 있으면 장소·링크를 LOCATION·URL로 싣는다."""
+        u = current_user()
+        sched = _get_schedule_or_404(u, sid)
+        all_day = sched.start_time is None
+        if all_day:
+            dt_start = sched.date
+            # 배타적 DTEND: 여러 날이면 end_date+1, 하루면 date+1.
+            dt_end = (sched.end_date or sched.date) + timedelta(days=1)
+        else:
+            dt_start = datetime.combine(sched.date, sched.start_time)
+            dt_end = dt_start + timedelta(hours=1)  # 기본 1시간
+        location = url = None
+        if sched.event is not None:
+            location = sched.event.place or None
+            url = sched.event.link or None
+        body = ics.build_ics(
+            uid=f"schedule-{sched.id}@ourday",
+            summary=sched.title,
+            dt_start=dt_start,
+            dt_end=dt_end,
+            all_day=all_day,
+            description=sched.description or None,
+            location=location,
+            url=url,
+        )
+        resp = app.response_class(body)
+        resp.headers["Content-Type"] = "text/calendar; charset=utf-8"
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="ourday-schedule-{sched.id}.ics"'
+        )
+        return resp
 
     # ---- 캘린더 '내기'(Bet) — 습관 내기(2a) ----
     def _get_bet_or_404(u, bid):
@@ -4234,6 +4295,42 @@ def _register_routes(app: Flask):
             partner_status=pk.get("partner_status"),
             confirmed=pk.get("confirmed", False),
         )
+
+    @app.route("/dates/<int:event_id>/ics")
+    @active_couple_required
+    def event_ics(event_id):
+        """데이트 뉴스 행사 하나의 .ics를 내려준다 — 탭하면 기기 캘린더에 '추가'된다.
+        행사는 전역 카탈로그(피드)라 로그인한 커플이면 모두 볼 수 있고, 없는 id면 404
+        (date_detail와 같은 접근 규칙). 행사에는 시간 정보가 없어 항상 종일이며,
+        DTEND는 배타적(end_date+1 또는 start+1)이다. 장소=LOCATION·링크=URL."""
+        item = db.session.get(EventItem, event_id)
+        if item is None:
+            abort(404)
+        # 시작일이 없으면 오늘로 폴백(방어). 종일: 배타적 DTEND = 종료일+1(또는 시작+1).
+        start = item.start_date or date.today()
+        dt_end = (item.end_date or start) + timedelta(days=1)
+        desc_bits = []
+        if item.place:
+            desc_bits.append(item.place)
+        if item.link:
+            desc_bits.append(item.link)
+        description = " · ".join(desc_bits) or None
+        body = ics.build_ics(
+            uid=f"event-{item.id}@ourday",
+            summary=item.title,
+            dt_start=start,
+            dt_end=dt_end,
+            all_day=True,
+            description=description,
+            location=item.place or None,
+            url=item.link or None,
+        )
+        resp = app.response_class(body)
+        resp.headers["Content-Type"] = "text/calendar; charset=utf-8"
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="ourday-date-{item.id}.ics"'
+        )
+        return resp
 
     # ---- 데이트 찜/방문함/관심없음 액션(AJAX JSON) ----
     def _pick_json(u, event_id):
