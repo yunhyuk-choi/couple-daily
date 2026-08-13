@@ -101,18 +101,27 @@ def _extract_json(raw: str):
 # ---------------------------------------------------------------------------
 # Daily question generation (personalized from past answers)
 # ---------------------------------------------------------------------------
-def generate_daily_question(recent_pairs):
+def generate_daily_question(recent_pairs, past_questions=None):
     """Generate one warm daily question, personalized from recent answers.
 
     recent_pairs: list of dicts {question, answers: [text, ...]} (most recent
     first), used to steer the new question. Returns (text, source) where source
     is 'ai' or 'fallback'.
+
+    past_questions: 이 커플이 지금까지 받은 지난 질문 '텍스트'들의 리스트(최신 먼저,
+    ~40개). recent_pairs(개인화용)보다 넓게 모아 '의미 중복 회피'에만 쓴다 — 워딩이
+    달라도 같은 뜻이면 새 질문이 겹치지 않게 모델이 직접 판단하도록 프롬프트에 넣는다.
+    선택 인자(없으면 무시)라 다른 호출부는 그대로 동작한다.
     """
     history_lines = []
     for i, p in enumerate(recent_pairs[:8], 1):
         ans = " / ".join(a for a in p.get("answers", []) if a)
         history_lines.append(f"{i}. Q: {p['question']}\n   A: {ans or '(답변 없음)'}")
     history_block = "\n".join(history_lines) if history_lines else "(아직 지난 답변이 없음)"
+
+    # 의미 중복 회피용 지난 질문 목록(넓게). 워딩이 달라도 같은 뜻이면 피하도록 나열.
+    past_list = [str(t).strip() for t in (past_questions or []) if str(t).strip()]
+    past_block = "\n".join(f"- {t}" for t in past_list) if past_list else "(아직 지난 질문이 없음)"
 
     prompt = (
         "너는 '사귀는 연인 두 사람'에게 매일 하나씩 던져줄 '오늘의 질문'을 만드는 "
@@ -133,9 +142,15 @@ def generate_daily_question(recent_pairs):
         "돕는 질문(잘 알려진 커플/관계 질문 앱들 같은 결). 날마다 결을 바꿔줘 "
         "(어떤 날은 가볍고 재밌게, 어떤 날은 잔잔하게).\n"
         "- 너무 무겁거나 캐묻거나 어색한 질문은 피해.\n"
-        "- 정확히 한 문장, 물음표로 끝나고, 어느 쪽이 읽어도 자연스러운 다정한 반말체.\n\n"
+        "- 정확히 한 문장, 물음표로 끝나고, 어느 쪽이 읽어도 자연스러운 다정한 반말체.\n"
+        "- 새 질문은 아래 '지금까지 나온 질문' 어느 것과도 의미가 겹치면 안 된다 — "
+        "워딩이 달라도 같은 뜻이면 반드시 다른 주제/각도로 바꿔라. 자연스러운 다음 "
+        "질문이 기존과 겹치면 다른 주제를 골라라.\n\n"
         "지난 대화는 오직 '중복 회피'용 참고 자료야(내용 인용 금지):\n"
         f"[최근 지난 질문과 답변]\n{history_block}\n\n"
+        "아래는 이 커플에게 지금까지 나온 질문들이야. 새 질문은 이것들과 '의미가 "
+        "겹치면' 안 돼(같은 뜻·같은 주제를 워딩만 바꾼 것도 중복이다):\n"
+        f"[지금까지 나온 질문]\n{past_block}\n\n"
         '출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이: '
         '{"question": "..."}'
     )

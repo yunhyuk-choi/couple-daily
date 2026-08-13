@@ -23,7 +23,7 @@
         {% set info = days_data.get(day|string) %}
         {% set has_photo = info and info.count %}
         {% set has_sched = info and info.schedules %}
-        {% set has_bet = info and info.bet %}
+        {% set has_bet = info and info.bet_people %}
         <button type="button"
                 class="cal-cell{% if has_photo %} has-photo{% endif %}{% if has_sched %} has-sched{% endif %}{% if has_bet %} has-bet{% endif %}{% if day == today_day %} is-today{% endif %}{% if day == selected_day %} is-selected{% endif %}"
                 data-day="{{ day }}"
@@ -37,10 +37,12 @@
                  onerror="this.closest('.cal-thumb').classList.add('is-error')" />
           </span>
           {% endif %}
-          {# 우상단 코너: 내기 🔥 + 사진 +N 배지(제목 바와 겹치지 않게 위쪽에). #}
+          {# 우상단 코너: 내기 달성 사람별 색점 + 사진 +N 배지(제목 바와 겹치지
+             않게 위쪽에). 색점은 아바타와 같은 팔레트라 누가 달성했는지 한눈에
+             구분되고, 한 사람이 그 날 2회 이상이면 점 안에 횟수를 표시한다. #}
           {% if has_bet or (has_photo and info.count > 1) %}
           <span class="cal-corner">
-            {% if has_bet %}<span class="cal-bet-dot" aria-hidden="true">🔥</span>{% endif %}
+            {% if has_bet %}{% for person in info.bet_people %}<span class="cal-bet-pdot" style="background: {{ person.color }}" aria-hidden="true">{% if person.count > 1 %}{{ person.count }}{% endif %}</span>{% endfor %}{% endif %}
             {% if has_photo and info.count > 1 %}<span class="cal-badge">+{{ info.count - 1 }}</span>{% endif %}
           </span>
           {% endif %}
@@ -69,6 +71,12 @@
        href="{{ url_for('schedule_new') }}">+ 일정</a>
   </div>
   <ul class="cal-sched-list" id="cal-sched-list"></ul>
+  {# 선택한 날의 '내기 달성' 목록 — 각 체크인을 사람 색점 + 이름 · 내기 제목으로.
+     같은 날 여러 내기·여러 사람이 각각 한 줄로 구분돼 보인다. 클라이언트가 채운다. #}
+  <div class="cal-bet-section" id="cal-bet-section" hidden>
+    <h3 class="cal-bet-head">🔥 내기 달성</h3>
+    <ul class="cal-bet-list" id="cal-bet-list"></ul>
+  </div>
   <div class="photo-grid cal-panel-grid" id="cal-panel-grid"></div>
   <p class="cal-panel-empty muted" id="cal-panel-empty" hidden>이 날은 아직 기록이 없어 🌱</p>
 </div>
@@ -101,6 +109,8 @@
   var panelEmpty = document.getElementById('cal-panel-empty');
   var panelDate = document.getElementById('cal-panel-date');
   var schedList = document.getElementById('cal-sched-list');
+  var betSection = document.getElementById('cal-bet-section');
+  var betList = document.getElementById('cal-bet-list');
   var addSched = document.getElementById('cal-add-sched');
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
@@ -137,10 +147,28 @@
       schedList.appendChild(li);
     });
 
+    // ---- 내기 달성 목록 (각 체크인 = 사람 색점 + 이름 · 내기 제목) ----
+    betList.innerHTML = '';
+    var betCheckins = (info && info.bet_checkins) || [];
+    betCheckins.forEach(function (c) {
+      var li = document.createElement('li');
+      li.className = 'cal-bet-item';
+      var dot = document.createElement('span');
+      dot.className = 'cal-bet-idot';
+      dot.style.background = c.color;
+      var label = document.createElement('span');
+      label.className = 'cal-bet-label';
+      label.textContent = c.name + ' · ' + c.bet_title;
+      li.appendChild(dot);
+      li.appendChild(label);
+      betList.appendChild(li);
+    });
+    betSection.hidden = betCheckins.length === 0;
+
     // ---- 사진 그리드 ----
     panelGrid.innerHTML = '';
     var ids = (info && info.ids) || [];
-    if (!scheds.length && !ids.length) {
+    if (!scheds.length && !betCheckins.length && !ids.length) {
       panelEmpty.hidden = false;
       return;
     }
