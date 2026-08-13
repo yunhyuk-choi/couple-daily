@@ -1378,12 +1378,65 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 }
 .cal-sched-mark { flex: none; font-size: 0.85rem; }
 
-/* 내기 체크인 아이콘 — 우상단 코너(.cal-corner) 안에 인라인으로 놓인 작은 🔥.
-   사진 썸네일 위에서도 보이게 그림자. 하단 제목 라벨과 겹치지 않는다. */
-.cal-bet-dot {
-  font-size: 0.62rem;
+/* 내기 달성 사람별 색점 — 우상단 코너(.cal-corner) 안에 인라인. 아바타와 같은
+   팔레트라 누가 달성했는지 한눈에 구분된다. 사진 썸네일 위에서도 보이게 흰 링 +
+   그림자. 같은 사람이 그 날 2회 이상이면 점 안에 횟수를 흰 숫자로 표시한다.
+   하단 제목 라벨과 겹치지 않는다(코너는 위쪽). */
+.cal-bet-pdot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 9px;
+  height: 9px;
+  padding: 0 1px;
+  border-radius: 999px;
+  font-size: 0.44rem;
+  font-weight: 800;
   line-height: 1;
-  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.92), 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* 날짜 패널 '내기 달성' 섹션 — 일정 아래, 사진 위. 각 체크인을 한 줄로. */
+.cal-bet-section { margin: 0 0 12px; }
+.cal-bet-head {
+  font-size: 0.82rem;
+  font-weight: 700;
+  margin: 0 0 8px;
+  color: var(--ink, #3a2e33);
+}
+.cal-bet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cal-bet-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--pink-soft);
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--ink, #3a2e33);
+}
+.cal-bet-idot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+.cal-bet-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- 내기(Bet) 목록/상세 ---- */
