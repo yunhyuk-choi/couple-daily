@@ -41,11 +41,13 @@ from flask import (
     send_from_directory,
     url_for,
 )
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
 import events
+import exifutil
 import ics
 import insights
 import onedrive
@@ -1979,19 +1981,23 @@ def _register_routes(app: Flask):
         next_start = date(year, month, days_in_month) + timedelta(days=1)
 
         # 이번 달 커플 사진을 조회해 '날짜 → 사진들'로 묶는다(커플 스코프).
+        # 유효 날짜 = COALESCE(taken_at, created_at): EXIF 촬영일이 있으면 그 날,
+        # 없으면 업로드시각으로 폴백한다. 나중에 올린 사진도 '찍은 날'에 매핑된다.
+        eff_date = func.coalesce(Photo.taken_at, Photo.created_at)
         photos = (
             Photo.query.filter(
                 Photo.couple_id == couple.id,
-                Photo.created_at >= datetime(year, month, 1),
-                Photo.created_at
+                eff_date >= datetime(year, month, 1),
+                eff_date
                 < datetime(next_start.year, next_start.month, next_start.day),
             )
-            .order_by(Photo.created_at.asc(), Photo.id.asc())
+            .order_by(eff_date.asc(), Photo.id.asc())
             .all()
         )
         by_day = {}
         for p in photos:
-            by_day.setdefault(p.created_at.day, []).append(p)
+            eff = p.taken_at or p.created_at  # 유효 날짜(촬영일 우선, 없으면 업로드일)
+            by_day.setdefault(eff.day, []).append(p)
 
         # 셀/패널이 함께 쓰는 JSON: "day" -> {count, cover, ids, schedules}
         PANEL_CAP = 60  # 하루 패널 썸네일 상한(과다 방지)
@@ -3648,6 +3654,13 @@ def _register_routes(app: Flask):
                 skipped += 1
                 reason = "사진 1장은 50MB 이하만 올릴 수 있어."
                 continue
+            # EXIF 촬영일시(DateTimeOriginal; HEIC 포함)를 뽑아 둔다 — 빠른 헤더
+            # 읽기라 업로드 경로에서 동기로 한다. 어떤 실패도 업로드를 깨면 안 되므로
+            # 방어적으로 감싼다(헬퍼도 이미 None을 돌려주지만 이중 안전).
+            try:
+                taken = exifutil.extract_taken_at(data)
+            except Exception:  # noqa: BLE001 - EXIF 추출은 best-effort
+                taken = None
             try:
                 item_id, stored_name = onedrive.upload_photo(data, file.filename)
             except onedrive.OneDriveError:
@@ -3667,6 +3680,7 @@ def _register_routes(app: Flask):
                 uploaded_by=u.id,
                 caption=caption,
                 caption_status="ready" if caption else "pending",
+                taken_at=taken,  # EXIF 촬영일(없으면 None → 캘린더는 created_at 폴백)
             )
             db.session.add(photo)
             # Commit per photo so one later failure can't lose earlier successes.
