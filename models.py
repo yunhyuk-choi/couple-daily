@@ -107,6 +107,18 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding photos.caption_status"
                     )
+            # photos.taken_at: EXIF 촬영일시 컬럼. 없을 때만 추가한다. Postgres·
+            # SQLite 모두 안전하고 반복 실행에 멱등하다. 기존 행은 NULL로 남아
+            # 캘린더가 created_at(업로드시각)으로 폴백한다(백필 불필요).
+            if "taken_at" not in pcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("ALTER TABLE photos ADD COLUMN taken_at TIMESTAMP")
+                        )
+                    log.info("startup migration: added photos.taken_at")
+                except Exception:  # noqa: BLE001
+                    log.exception("startup migration: failed adding photos.taken_at")
 
         # 4) monthly_reports: 월간 '우리 리포트'의 구조화된 전문(JSON) 컬럼.
         #    monthly_reports 테이블은 프로덕션에 이미 존재하므로 create_all이
@@ -410,6 +422,9 @@ class Photo(db.Model):
     # populated, or a manual caption was given), 'failed' (vision errored/timed
     # out — caption stays null). New auto-captioned uploads start 'pending'.
     caption_status = db.Column(db.String(16), default="pending", nullable=False)
+    # EXIF 촬영일시(DateTimeOriginal 등). null = 알 수 없음 → 캘린더는 업로드시각
+    # (created_at)으로 폴백한다. 업로드 시 exifutil.extract_taken_at으로 채운다.
+    taken_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     uploader = db.relationship("User")
