@@ -81,6 +81,44 @@ log = logging.getLogger(__name__)
 
 DEFAULT_APP_NAME = os.environ.get("APP_NAME", "우리의 하루")
 
+# HEIC/HEIF는 iOS Safari만 <img>로 렌더한다 — Android Chrome·데스크톱은 못 본다.
+# 풀이미지 프록시에서 HEIC 원본을 JPEG로 변환해 서빙하면 갤럭시·PC에서도 보인다.
+# Pillow(+pillow-heif)를 한 번만·방어적으로 로드한다. 없으면 _HEIC_OK=False로
+# 두고 변환을 건너뛴다(원본 그대로 서빙 — 앱은 계속 동작).
+try:  # pragma: no cover - 환경에 따라 분기
+    from io import BytesIO as _BytesIO
+    from PIL import Image as _PILImage  # type: ignore
+
+    try:
+        import pillow_heif as _pillow_heif  # type: ignore
+
+        _pillow_heif.register_heif_opener()  # HEIC/HEIF를 PIL.Image.open이 열게 등록(1회)
+    except Exception:  # noqa: BLE001 - HEIC 미지원이어도 다른 포맷 경로는 산다
+        log.info("app: pillow-heif 미탑재 — HEIC→JPEG 변환 비활성")
+    _HEIC_OK = True
+except Exception:  # noqa: BLE001 - Pillow 자체가 없으면 변환 전체 비활성
+    _PILImage = None  # type: ignore
+    _HEIC_OK = False
+    log.info("app: Pillow 미탑재 — HEIC→JPEG 변환 비활성(원본 서빙)")
+
+
+def _heic_to_jpeg(data):
+    """HEIC/HEIF 바이트를 JPEG 바이트로 변환. 실패하면 None(호출부는 원본 폴백).
+
+    절대 예외를 던지지 않는다 — Pillow/pillow-heif 부재·디코드 실패 모두 None.
+    """
+    if not _HEIC_OK or not data:
+        return None
+    try:
+        with _PILImage.open(_BytesIO(data)) as img:
+            rgb = img.convert("RGB")
+            out = _BytesIO()
+            rgb.save(out, format="JPEG", quality=85)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
+        log.warning("HEIC→JPEG 변환 실패 — 원본 바이트로 폴백", exc_info=True)
+        return None
+
 # ---- Kakao OAuth 2.0 config (read from env; never hardcode secrets) ----
 KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY")
 KAKAO_CLIENT_SECRET = os.environ.get("KAKAO_CLIENT_SECRET")  # optional
@@ -3746,6 +3784,22 @@ def _register_routes(app: Flask):
             abort(404)  # gone from OneDrive
         if not ctype or not ctype.startswith("image/"):
             ctype = _content_type_for(photo.filename or photo.original_name)
+        # HEIC/HEIF는 갤럭시·PC 브라우저가 <img>로 못 본다 → JPEG로 변환해 서빙한다.
+        # 변환 불가/실패 시 원본 바이트로 폴백(_heic_to_jpeg가 None) — 절대 500 없음.
+        # 다운로드(?download=1)는 원본 파일명·바이트를 그대로 유지한다(.heic 이름에
+        # JPEG를 담지 않도록) — 표시 경로만 변환한다.
+        name = photo.original_name or photo.filename or ""
+        ext = os.path.splitext(name)[1].lower()
+        # ctype가 이미 웹에서 그려지는 포맷이면 그대로 통과(재인코딩 금지). 확장자
+        # (.heic/.heif)는 ctype가 없거나 일반적일 때만 HEIC 신호로 쓴다.
+        web_ok = ctype in ("image/jpeg", "image/png", "image/webp", "image/gif")
+        is_heic = ctype in ("image/heic", "image/heif") or (
+            ext in (".heic", ".heif") and not web_ok
+        )
+        if is_heic and not request.args.get("download"):
+            jpeg = _heic_to_jpeg(data)
+            if jpeg is not None:
+                data, ctype = jpeg, "image/jpeg"
         resp = app.response_class(data, mimetype=ctype)
         resp.headers["Cache-Control"] = "private, max-age=3600"
         # ?download=1 → force a browser download of the ORIGINAL file bytes with
