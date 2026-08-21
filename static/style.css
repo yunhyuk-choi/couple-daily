@@ -1550,3 +1550,227 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 }
 .confirmed-actions .went-form { margin: 0; }
 .confirmed-actions-detail { margin-top: 14px; }
+
+/* ===================================================================== */
+/* 데이트 후기 → 블로그 포스트 (P1) — 목록·상세·작성 폼                    */
+/* ===================================================================== */
+
+/* ---- 정적 별점(목록·상세) — 회색 별 위에 핑크 별을 %만큼 덮어 반쪽까지 표현 --- */
+.stars-static {
+  position: relative;
+  display: inline-block;
+  font-size: 1.1rem;
+  line-height: 1;
+  letter-spacing: 2px;
+  color: var(--pink-soft);      /* 빈 별(바탕) */
+  white-space: nowrap;
+}
+.stars-static .stars-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--pct, 0%);
+  overflow: hidden;
+  color: var(--pink);           /* 채운 별 */
+  white-space: nowrap;
+}
+.stars-num {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: normal;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* ---- 후기 목록 카드 ---- */
+.review-list { display: flex; flex-direction: column; gap: 12px; }
+.review-card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+  transition: transform 0.08s, filter 0.15s;
+}
+.review-card:active { transform: scale(0.99); }
+.review-card .rc-topic { font-weight: 800; font-size: 1.05rem; margin: 0 0 4px; }
+.review-card .rc-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.review-card .rc-loc { color: var(--muted); font-size: 0.85rem; }
+.review-card .rc-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-top: 8px;
+}
+.review-card .rc-date { color: var(--muted); font-size: 0.8rem; }
+
+/* ---- 인터랙티브 별점 위젯(작성 폼) — 드래그/탭/키보드로 0~10 ---- */
+.star-rate-wrap { display: flex; align-items: center; gap: 12px; }
+.star-rate {
+  position: relative;
+  display: inline-block;
+  font-size: 2.2rem;
+  line-height: 1;
+  letter-spacing: 4px;
+  color: var(--pink-soft);
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: none;           /* 포인터 드래그가 스크롤에 먹히지 않게 */
+  user-select: none;
+  -webkit-user-select: none;
+  border-radius: 8px;
+}
+.star-rate:focus { outline: none; }
+.star-rate:focus-visible { box-shadow: 0 0 0 3px rgba(255,107,157,0.35); }
+.star-rate .sr-fill {
+  position: absolute;
+  top: 0; left: 0;
+  width: var(--pct, 0%);
+  overflow: hidden;
+  color: var(--pink);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.star-rate-val { font-weight: 800; color: var(--pink); font-variant-numeric: tabular-nums; }
+
+/* ---- 사진 선택 그리드(작성 폼) — photo-open 스켈레톤 재사용 ---- */
+.rev-pick-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+@media (min-width: 560px) { .rev-pick-grid { grid-template-columns: repeat(4, 1fr); } }
+.rev-pick {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  padding: 0;
+  border: none;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--pink-soft);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  transition: transform 0.08s, filter 0.15s;
+}
+.rev-pick:active { transform: scale(0.98); }
+.rev-pick::before {
+  content: "";
+  position: absolute; inset: 0; z-index: 0;
+  background: linear-gradient(100deg, var(--pink-soft) 30%, #fff6fa 50%, var(--pink-soft) 70%);
+  background-size: 200% 100%;
+  animation: thumb-shimmer 1.2s ease-in-out infinite;
+}
+.rev-pick.is-loaded::before { display: none; }
+.rev-pick.is-error::before { animation: none; background: var(--pink-soft); }
+.rev-pick .rev-pick-img {
+  display: block; width: 100%; height: 100%; object-fit: cover;
+  position: relative; z-index: 1; opacity: 0; transition: opacity 0.35s ease;
+}
+.rev-pick .rev-pick-img.loaded { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .rev-pick::before { animation: none; } }
+/* 선택 오버레이(체크) */
+.rev-pick .rev-check {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  width: 24px; height: 24px; border-radius: 999px;
+  display: none; align-items: center; justify-content: center;
+  background: var(--pink); color: #fff; font-size: 0.9rem; font-weight: 800;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+.rev-pick.selected { outline: 3px solid var(--pink); outline-offset: -3px; }
+.rev-pick.selected .rev-check { display: flex; }
+.rev-pick.selected .rev-pick-img { filter: brightness(0.92); }
+
+/* ---- 선택된 사진 순서 스트립 ---- */
+.rev-strip-head { display: flex; align-items: center; justify-content: space-between; margin: 14px 0 8px; }
+.rev-strip {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding: 4px 2px 8px;
+  -webkit-overflow-scrolling: touch;
+}
+.rev-strip::-webkit-scrollbar { height: 0; }
+.rev-strip-empty { color: var(--muted); font-size: 0.85rem; padding: 6px 2px; }
+.rev-strip-item {
+  position: relative;
+  flex: 0 0 auto;
+  width: 84px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  touch-action: none;
+}
+.rev-strip-item.dragging { opacity: 0.6; }
+.rev-strip-thumb {
+  position: relative;
+  width: 84px; height: 84px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--pink-soft);
+  box-shadow: var(--shadow);
+}
+.rev-strip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.rev-strip-num {
+  position: absolute; top: 4px; left: 4px;
+  min-width: 20px; height: 20px; padding: 0 5px;
+  border-radius: 999px;
+  background: var(--pink); color: #fff;
+  font-size: 0.72rem; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+.rev-strip-drag {
+  position: absolute; top: 4px; right: 4px;
+  width: 22px; height: 22px; border-radius: 6px;
+  background: rgba(40,22,31,0.45); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  cursor: grab; font-size: 0.8rem; touch-action: none;
+}
+.rev-strip-btns { display: flex; gap: 4px; justify-content: center; }
+.rev-strip-btns button {
+  font: inherit;
+  border: none;
+  background: var(--pink-soft);
+  color: var(--pink);
+  border-radius: 8px;
+  padding: 3px 7px;
+  font-size: 0.8rem;
+  font-weight: 800;
+  cursor: pointer;
+  line-height: 1;
+}
+.rev-strip-btns button:disabled { opacity: 0.35; cursor: default; }
+.rev-strip-btns .rev-rm { background: var(--err); color: var(--err-ink); }
+
+/* 상세: 선택 사진(순서) — 정사각 썸네일 그리드 재사용 느낌 */
+.review-photos {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+@media (min-width: 560px) { .review-photos { grid-template-columns: repeat(4, 1fr); } }
+.review-photos .rp-cell {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--pink-soft);
+  box-shadow: var(--shadow);
+}
+.review-photos .rp-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.review-photos .rp-num {
+  position: absolute; top: 4px; left: 4px;
+  min-width: 20px; height: 20px; padding: 0 5px;
+  border-radius: 999px; background: var(--pink); color: #fff;
+  font-size: 0.72rem; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+.review-prose { white-space: pre-wrap; margin: 10px 0 0; }
+.review-placeholder {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--pink-soft); color: var(--pink);
+  border-radius: var(--radius); padding: 14px 16px; margin-top: 16px;
+  font-weight: 700;
+}
+.review-detail-actions { display: flex; gap: 8px; margin-top: 18px; }
