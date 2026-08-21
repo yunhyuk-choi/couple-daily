@@ -1682,7 +1682,26 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .rev-pick.selected .rev-pick-img { filter: brightness(0.92); }
 
 /* ---- 선택된 사진 순서 스트립 ---- */
-.rev-strip-head { display: flex; align-items: center; justify-content: space-between; margin: 14px 0 8px; }
+.rev-strip-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 14px 0 6px; }
+/* 갤러리에서 바로 올리기 — 핑크 테마 pill 버튼 */
+.rev-gallery-btn {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 800;
+  border: none;
+  border-radius: 999px;
+  padding: 7px 13px;
+  background: var(--pink);
+  color: #fff;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  line-height: 1;
+  white-space: nowrap;
+}
+.rev-gallery-btn:active { transform: scale(0.97); }
+.rev-gallery-btn:disabled { opacity: 0.55; cursor: default; }
+.rev-gallery-hint { margin: 0 2px 6px; }
 .rev-strip {
   display: flex;
   gap: 10px;
