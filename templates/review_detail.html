@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_stars.html" import stars %}
+{% block title %}{{ review.topic }} · 후기 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>{{ review.topic }}</h1>
+</div>
+
+<div class="card">
+  <div class="rc-meta">
+    {{ stars(review.overall_score) }}
+    {% if review.location %}<span class="rc-loc">📍 {{ review.location }}</span>{% endif %}
+  </div>
+  <p class="review-prose">{{ review.prose }}</p>
+
+  {% if photos %}
+  <div class="review-photos">
+    {% for p in photos %}
+    <div class="rp-cell">
+      <span class="rp-num" aria-hidden="true">{{ loop.index }}</span>
+      <img src="{{ url_for('memory_thumb', photo_id=p.id) }}" loading="lazy"
+           alt="{{ p.caption or p.original_name or '후기 사진' }}" />
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+
+{# P1은 AI 출력이 없다 — 다음 단계 예고 placeholder. P2가 이 카드를 인앱 웹뷰
+   미리보기 + 네이버 복사텍스트로 교체한다. #}
+<div class="review-placeholder">
+  <span aria-hidden="true">✨</span>
+  <span>AI 초안은 다음 단계에서 생성돼요</span>
+</div>
+
+<div class="review-detail-actions">
+  <a class="btn ghost sm" href="{{ url_for('review_edit', rid=review.id) }}">✏️ 수정</a>
+  <form method="post" action="{{ url_for('review_delete', rid=review.id) }}"
+        onsubmit="return confirm('이 후기를 삭제할까?');">
+    <button type="submit" class="btn ghost sm">🗑 삭제</button>
+  </form>
+  <a class="btn ghost sm" href="{{ url_for('reviews') }}" style="margin-left:auto;">목록</a>
+</div>
+{% endblock %}
