@@ -1,7 +1,7 @@
 # 데이트 후기 → 네이버 블로그 포스트 자동생성 — 스펙 (durable blueprint)
 
 > 이 문서는 세션이 끊겨도 다음 세션이 이어받을 수 있게 합의된 스펙을 박제한 것이다.
-> 코드와 함께 커밋한다. **P1(현재)** = 폼 + 모델 + 목록/상세. **P2(다음)** = AI 생성 + 인앱 웹뷰 미리보기 + 네이버 복사텍스트.
+> 코드와 함께 커밋한다. **P1(완료)** = 폼 + 모델 + 목록/상세. **P2(완료)** = AI 생성 + 인앱 웹뷰 미리보기 + 네이버 복사텍스트.
 
 ## 1. 기능 개요
 
@@ -46,37 +46,95 @@
 - `@property photos_ordered` → `photo_ids` 순서대로 이 커플의 Photo 행을 돌려준다 (JSON 디코드 → 조회 → 순서 유지 → 없는 id 스킵).
 - Brand-new 테이블 — `db.create_all()`가 만든다 (ALTER 마이그레이션 불필요).
 
-## 4. P2 AI 출력 JSON 형태 (`ai_json`에 저장)
+## 4. P2 AI 출력 JSON 형태 (`ai_json`에 저장 — 최종형)
+
+`ai.write_review(topic, location, prose, overall_score, photos) -> dict|None`이
+`claude`를 **한 번** 호출해 만든다(`_normalize_review`로 정규화). `photos` 인자는
+`{"index": i, "caption": <그 사진 AI 캡션>, "tags": [..]}`의 **순서 리스트**.
 
 ```json
 {
-  "title": "포스트 제목 (검색 의도를 담은)",
-  "summary": "답변 우선(answer-first) 요약 — 첫 ~200자 안에 핵심 결론",
-  "info_block": "장소·위치·비용·소요시간 등 스캔 가능한 정보 블록(구조화 텍스트)",
-  "sections": [
-    { "heading": "검색 의도 기반 소제목", "text": "본문 단락", "photo_index": 0 }
-  ],
-  "ratings": [
-    { "aspect": "분위기", "score": 8 }
-  ],
-  "faq": [
-    { "q": "자주 묻는 질문", "a": "답변" }
-  ],
-  "hashtags": ["#데이트", "#장소명"]
+  "title": "검색 의도를 담은 포스트 제목",
+  "summary": "answer-first 요약 — 한줄평 + 총점 결론을 맨 앞에",
+  "info_block": [ { "label": "위치", "value": "..." } ],
+  "sections": [ { "heading": "검색어형 소제목", "text": "본문 단락", "photo_index": 0 } ],
+  "ratings": [ { "aspect": "분위기", "score": 8 } ],
+  "faq": [ { "q": "자주 묻는 질문", "a": "답변" } ],
+  "hashtags": ["#장소명", "#데이트"]
 }
 ```
 
-- `sections[].photo_index` = `photo_ids` 순서 리스트에 대한 0-based 인덱스 (그 단락에 붙일 사진).
+- `info_block`은 **구조화 리스트**(P1 스펙의 문자열에서 확정) — 훑기 쉬운 label:value.
+- `sections[].photo_index` = `photos` 순서 리스트의 0-based 인덱스(그 단락에 붙일 사진).
+- **정규화 규칙**: 모든 문자열 `.strip()`; 모든 score 0..10 클램프; `photo_index`는
+  `0..len(photos)-1` 범위일 때만 유지(아니면 null); `ratings`≤6·`faq`≤4·`hashtags`≤10;
+  빈 항목 제거; 해시태그는 `#` 없으면 자동 부착. `title`·`summary`·`sections`(≥1) 없으면
+  `None`(→ 워커가 실패 처리). `overall_score`는 AI가 아니라 **사용자 값**을 표시에 그대로 쓴다.
 
-## 5. SEO / AEO 규칙 (P2 프롬프트가 지켜야 할 것)
+## 5. 네이버-AI 최적화 규칙 (P2 프롬프트가 인코딩하는 것 — 핵심)
 
-- **Answer-first summary**: 첫 ~200자 안에 핵심 결론/요약을 먼저 준다.
-- **Intent-based headings**: 소제목은 검색 의도(“가볼만해?”, “주차 되나?” 등) 기반.
-- **Scannable info block**: 장소·위치·비용·시간을 훑기 쉬운 블록으로.
-- **FAQ**: 자주 묻는 질문 섹션 (AEO — 음성/AI 답변 최적화).
-- **Explicit ratings**: 측면별 점수를 명시(분위기/가성비/재방문의사 등).
-- **First-hand tone**: 실제 다녀온 1인칭 경험 톤.
-- **Hashtags**: 네이버 블로그 해시태그.
+타깃 = **네이버 통합검색 / AI 브리핑(하이퍼클로바X 기반)**. 생성 글은 네이버 AI가
+**인용**하고 네이버의 **실제 경험 필터**를 통과하도록 구성한다.
+
+- **진짜 경험 후기 톤**: 네이버 AI는 광고성·AI 티 나는 일반론을 적극 하위 노출시킨다.
+  모든 서술을 사용자 `prose` + 실제 사진 `caption`에 근거해 구체적·1인칭·다녀온 느낌으로.
+- **No-fabrication**: 사용자가 주지 않은 사실(특히 **가격·영업시간·정확한 메뉴**)은 지어내지
+  않는다 — 모르면 빼거나 "방문 시 확인". 과장된 마케팅 톤·상투어 금지.
+- **Answer-first**: `summary`가 한줄평 + 총점 결론을 맨 앞에.
+- **검색어형 소제목**: 사람들이 검색하는 말투(예: "○○동 △△카페 위치·가는 길",
+  "분위기·인테리어", "메뉴·가격", "데이트 코스로 어때?", "총평").
+- **스캔 가능한 info_block**: 위치/가격대/이런 점 좋아요 등 label:value, 아는 것만.
+- **FAQ 2~3개**: 질문형이 AI 인용에 강함 — 현실적 데이트 후기 질문.
+- **명시 별점**: 총점 + 맥락형 항목별 3~5개(분위기/맛·메뉴/가성비/데이트적합도/재방문의향 등).
+- **적정 분량**: sections 본문 합계 대략 900~1400자, 각 사진 한 줄 설명(캡션 활용),
+  검색어형 해시태그.
+
+## 5.1 네이버 복사텍스트 포맷 (`_review_copy_text(review) -> str`)
+
+이미지는 네이버에 붙여넣을 수 없으므로 사진 자리에 `[사진 N]` 마커(사진 순서대로
+1부터)를 넣은 **플레인 텍스트**를 만든다. `edited_text`가 있으면 그것을, 없으면 이
+함수 출력을 편집 textarea에 시드한다. 형태:
+
+```text
+<title>
+
+<summary>
+⭐ 총점 ★★★★☆ (8/10)
+
+▶ 핵심 정보
+· <label>: <value>
+
+<section heading>
+<section text>
+[사진 1] — <그 사진 캡션>
+
+⭐ 별점
+· <aspect> ★★★★☆ (8/10)
+
+❓ 자주 묻는 질문
+Q. ...
+A. ...
+
+<#hashtag #hashtag ...>
+```
+
+- 별 문자열(`_star_bar`): 꽉 찬 별=2점, 홀수는 반쪽 `⯪`, 나머지 `☆`(5칸). 옆에 `(N/10)` 병기.
+- 사진 마커는 그 섹션의 `photo_index`가 가리키는 순서 위치에 놓는다(캡션 없으면 마커만).
+
+## 5.2 백그라운드 워커 · 라우트 (P2)
+
+- `generate_review(app, review_id)` — 데몬 스레드, review_id 가드로 중복 차단, 자체
+  `app_context`, `_CAPTION_SEM`으로 `ai.write_review` 직렬화(512MB: 동시에 claude 하나).
+  성공 시 `ai_json`+`status='ready'`, 실패 시 `'failed'`(단 직전 성공 초안 있으면 유지).
+  커밋 rollback 가드, 절대 raise 안 함. **claude는 오직 이 워커에서만.**
+- 라우트: `review_new` POST → `status='pending'` + 스폰 → 상세로. `review_edit` POST →
+  입력 변경이므로 pending + `edited_text=None` + 재생성 스폰. `POST .../regenerate`
+  (`review_regenerate`) → pending + edited_text 비우고 재생성. `POST .../save-text`
+  (`review_save_text`) → 편집 복사본을 `edited_text`에 저장(fetch면 JSON, 아니면 리다이렉트).
+- 상세(`review_detail`): `pending`이면 "초안 쓰는 중" + `pending`일 때만 `<meta refresh 4s>`
+  (case_detail 판결중 패턴). `ready`면 **웹뷰 미리보기**(제목·요약·info·섹션+인라인 전체
+  이미지·별점·FAQ·해시태그) + **편집 가능한 네이버 복사본**(복사/저장/다시 생성). `failed`면
+  재시도. 전부 커플 스코프, cross-couple 404.
 
 ## 6. 작성 폼 UI 상세
 
@@ -104,9 +162,11 @@
 | 메서드 | 경로 | endpoint | 역할 |
 |---|---|---|---|
 | GET | `/reviews` | `reviews` | 이 커플 후기 목록(최신순). 카드: 주제·위치·별점·작성일·상태힌트. 빈 상태. + 새 후기 FAB |
-| GET,POST | `/reviews/new` | `review_new` | 작성 폼 / 저장(status='draft', created_by=me) |
-| GET | `/reviews/<rid>` | `review_detail` | 저장된 후기 표시 + placeholder 카드 |
-| GET,POST | `/reviews/<rid>/edit` | `review_edit` | 주제/위치/산문/별점/사진 편집 |
+| GET,POST | `/reviews/new` | `review_new` | 작성 폼 / 저장(P2: status='pending' + 초안 생성 스폰) |
+| GET | `/reviews/<rid>` | `review_detail` | 후기 표시 + (P2) 웹뷰 미리보기·네이버 복사본 |
+| GET,POST | `/reviews/<rid>/edit` | `review_edit` | 주제/위치/산문/별점/사진 편집(P2: pending 재생성) |
+| POST | `/reviews/<rid>/regenerate` | `review_regenerate` | (P2) 초안 다시 생성(edited_text 비움) |
+| POST | `/reviews/<rid>/save-text` | `review_save_text` | (P2) 편집한 네이버 복사본 저장 |
 | POST | `/reviews/<rid>/delete` | `review_delete` | 삭제 → 목록 |
 
 - cross-couple rid → 404.
@@ -118,5 +178,5 @@
 
 ## 9. 단계 구분
 
-- **P1 (현재)**: 폼 + 모델 + 목록 + 상세. **AI 없음.** 단 AI가 P2에서 쓸 모든 것을 저장한다.
-- **P2 (다음)**: 백그라운드 AI 생성 + 인앱 웹뷰 미리보기(`/memories/<id>/image` 인라인) + 편집 가능한 네이버 복사텍스트(`[사진 N]` 마커).
+- **P1 (완료)**: 폼 + 모델 + 목록 + 상세. **AI 없음.** 단 AI가 P2에서 쓸 모든 것을 저장한다.
+- **P2 (완료)**: 백그라운드 AI 생성 + 인앱 웹뷰 미리보기(`/memories/<id>/image` 인라인) + 편집 가능한 네이버 복사텍스트(`[사진 N]` 마커). 상세는 §5.2 참조.

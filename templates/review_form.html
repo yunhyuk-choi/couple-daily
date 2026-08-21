@@ -75,7 +75,7 @@
               placeholder="분위기, 좋았던 점, 아쉬운 점, 추천 포인트를 편하게 적어줘. AI가 이걸 블로그 글로 다듬어줄 거야.">{{ form.prose if form else '' }}</textarea>
   </label>
 
-  <button class="btn primary" type="submit">저장</button>
+  <button class="btn primary" type="submit">{{ '수정 → 초안 다시 생성' if editing else '등록 → AI 초안 생성' }}</button>
   {% if editing %}
   <a class="btn ghost sm" href="{{ url_for('review_detail', rid=editing.id) }}"
      style="align-self:center;">취소</a>

@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% from "_stars.html" import stars %}
 {% block title %}{{ review.topic }} · 후기 · {{ app_name }}{% endblock %}
+{% block head %}
+  {# 생성 중일 때만 4초마다 새로고침 — 백그라운드 초안이 끝나면 자동으로 결과가
+     뜬다. (의존성 없는 순수 meta refresh. 'ready'/'failed'가 되면 자연히 멈춘다.) #}
+  {% if review.status == 'pending' %}<meta http-equiv="refresh" content="4" />{% endif %}
+{% endblock %}
 {% block content %}
 <div class="page-head">
   <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
@@ -27,12 +32,149 @@
   {% endif %}
 </div>
 
-{# P1은 AI 출력이 없다 — 다음 단계 예고 placeholder. P2가 이 카드를 인앱 웹뷰
-   미리보기 + 네이버 복사텍스트로 교체한다. #}
+{# ---- P2: 생성 중 / 초안 준비됨 / 실패 ---- #}
+{% if review.status == 'pending' %}
 <div class="review-placeholder">
   <span aria-hidden="true">✨</span>
-  <span>AI 초안은 다음 단계에서 생성돼요</span>
+  <span>AI가 블로그 초안을 쓰고 있어요… (잠시만!)</span>
 </div>
+
+{% elif review.status == 'failed' %}
+<div class="review-failed">
+  <p>초안 생성이 잘 안 됐어. 잠시 뒤 다시 시도해줘 🙏</p>
+  <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
+    <button type="submit" class="btn primary sm">↻ 다시 생성</button>
+  </form>
+</div>
+
+{% elif review.status == 'ready' and review.ai %}
+{% set ai = review.ai %}
+{# 1) 인앱 웹뷰 미리보기 — 블로그처럼 #}
+<article class="review-webview">
+  <h2 class="rv-title">{{ ai.title }}</h2>
+  {% if ai.summary %}<p class="rv-summary">{{ ai.summary }}</p>{% endif %}
+
+  {% if ai.info_block %}
+  <div class="rv-info">
+    <div class="rv-info-head">▶ 핵심 정보</div>
+    <dl>
+      {% for it in ai.info_block %}
+      <div class="rv-info-row"><dt>{{ it.label }}</dt><dd>{{ it.value }}</dd></div>
+      {% endfor %}
+    </dl>
+  </div>
+  {% endif %}
+
+  {% for sec in ai.sections %}
+  <section class="rv-section">
+    {% if sec.heading %}<h3 class="rv-heading">{{ sec.heading }}</h3>{% endif %}
+    {% if sec.text %}<p class="rv-text">{{ sec.text }}</p>{% endif %}
+    {% if sec.photo_index is not none and sec.photo_index < photos|length %}
+    {% set sp = photos[sec.photo_index] %}
+    <figure class="rv-photo">
+      <img src="{{ url_for('memory_image', photo_id=sp.id) }}" loading="lazy"
+           alt="{{ sp.caption or '후기 사진' }}"
+           onload="this.classList.add('loaded'); this.closest('.rv-photo').classList.add('is-loaded')"
+           onerror="this.closest('.rv-photo').classList.add('is-error')" />
+      {% if sp.caption %}<figcaption>{{ sp.caption }}</figcaption>{% endif %}
+    </figure>
+    {% endif %}
+  </section>
+  {% endfor %}
+
+  {% if ai.ratings %}
+  <div class="rv-ratings">
+    <div class="rv-ratings-head">⭐ 별점</div>
+    {% for r in ai.ratings %}
+    <div class="rv-rating-row"><span class="rv-aspect">{{ r.aspect }}</span>{{ stars(r.score) }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if ai.faq %}
+  <div class="rv-faq">
+    <div class="rv-faq-head">❓ 자주 묻는 질문</div>
+    {% for f in ai.faq %}
+    <div class="rv-faq-item">
+      <p class="rv-q">Q. {{ f.q }}</p>
+      <p class="rv-a">A. {{ f.a }}</p>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if ai.hashtags %}
+  <p class="rv-hashtags">
+    {% for t in ai.hashtags %}<span>{{ t }}</span>{% endfor %}
+  </p>
+  {% endif %}
+</article>
+
+{# 2) 네이버 복사본 — 편집 가능한 텍스트 + 복사/저장 #}
+<div class="review-copy-wrap">
+  <div class="rv-copy-head">
+    <strong>네이버 복사본</strong>
+    <span class="muted rv-copy-hint">네이버 글쓰기에 붙여넣고, [사진 N] 자리에 사진을 넣어줘.</span>
+  </div>
+  <form method="post" action="{{ url_for('review_save_text', rid=review.id) }}" id="copy-form">
+    <textarea id="review-copy" name="text" rows="16" spellcheck="false">{{ copy_text }}</textarea>
+    <div class="rv-copy-actions">
+      <button type="button" class="btn primary sm" id="copy-btn">📋 복사</button>
+      <button type="submit" class="btn ghost sm">저장</button>
+      <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
+            style="margin-left:auto;"
+            onsubmit="return confirm('초안을 다시 만들까? 편집한 복사본은 새 초안으로 바뀌어.');">
+        <button type="submit" class="btn ghost sm">↻ 다시 생성</button>
+      </form>
+    </div>
+  </form>
+</div>
+<div class="copy-toast" id="copy-toast" hidden>복사됨!</div>
+
+<script>
+(function () {
+  var btn = document.getElementById('copy-btn');
+  var ta = document.getElementById('review-copy');
+  var toast = document.getElementById('copy-toast');
+  var form = document.getElementById('copy-form');
+  if (!btn || !ta) return;
+  function showToast(msg) {
+    if (!toast) return;
+    toast.textContent = msg;
+    toast.hidden = false;
+    // 강제 리플로우 후 클래스 토글로 페이드 인
+    void toast.offsetWidth;
+    toast.classList.add('show');
+    setTimeout(function () { toast.classList.remove('show'); toast.hidden = true; }, 1600);
+  }
+  function saveQuiet() {
+    if (!form) return;
+    try {
+      var fd = new FormData();
+      fd.append('text', ta.value);
+      fetch(form.action, {
+        method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      });
+    } catch (e) { /* best-effort */ }
+  }
+  btn.addEventListener('click', function () {
+    var text = ta.value;
+    function done() { showToast('복사됨!'); saveQuiet(); }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () {
+        ta.focus(); ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        done();
+      });
+    } else {
+      ta.focus(); ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      done();
+    }
+  });
+})();
+</script>
+{% endif %}
 
 <div class="review-detail-actions">
   <a class="btn ghost sm" href="{{ url_for('review_edit', rid=review.id) }}">✏️ 수정</a>
