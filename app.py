@@ -1503,6 +1503,207 @@ def _spawn_recommend_if_idle(app, couple_id):
         log.exception("failed to spawn recommend thread for couple %s", couple_id)
 
 
+# ---------------------------------------------------------------------------
+# 데이트 후기 → 네이버 블로그 초안 백그라운드 생성 (P2)
+# 캡션·채점·추천과 공유하는 _CAPTION_SEM으로 claude를 직렬화하고(512MB: 동시에
+# claude 하나만), review_id 단위 in-process 가드로 중복 실행을 막는다. 절대 스레드
+# 밖으로 raise하지 않고 finally에서 가드를 해제한다.
+# ---------------------------------------------------------------------------
+_generating_reviews_lock = threading.Lock()
+_generating_reviews: set[int] = set()
+
+
+def generate_review(app, review_id):
+    """백그라운드 워커: 한 BlogReview의 네이버 블로그 초안을 생성한다.
+
+    judge_case와 같은 결 — 새 app_context(→ 새 thread-local DB 세션)를 열고
+    BlogReview + 순서대로의 사진 캡션/태그를 모아 _CAPTION_SEM 안에서
+    ``ai.write_review``를 '한 번' 호출한다. 성공하면 ai_json + status='ready',
+    실패하면 status='failed'(단, 직전에 쓸 만한 ai_json이 있으면 그걸 유지해
+    'ready'로 둔다). 커밋은 rollback 가드. 절대 raise 안 하고 finally에서 가드 해제.
+    """
+    try:
+        with app.app_context():
+            try:
+                review = db.session.get(BlogReview, review_id)
+                if review is None:
+                    return  # 생성 전에 삭제됐을 수 있음
+
+                # 직전 성공 초안이 있으면 실패 시 유지하려고 미리 캡처.
+                prior_ok = review.ai is not None
+
+                # 순서대로 사진 재료(index/caption/tags)를 만든다. 준비된 캡션이
+                # 없는 사진은 caption ""(모델이 지어내지 않게).
+                photos_arg = []
+                for i, p in enumerate(review.photos_ordered):
+                    cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
+                    photos_arg.append({"index": i, "caption": cap, "tags": p.tags_list})
+
+                topic = review.topic
+                location = review.location
+                prose = review.prose
+                overall = review.overall_score
+
+                # 캡션·채점·추천과 '같은' 세마포어로 claude 콜을 직렬화. claude가
+                # 터져도 실패로만 취급(스레드를 죽이지 못하게).
+                _CAPTION_SEM.acquire()
+                try:
+                    try:
+                        result = ai.write_review(
+                            topic, location, prose, overall, photos_arg
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "claude write_review raised (review=%s)", review_id
+                        )
+                        result = None
+                finally:
+                    _CAPTION_SEM.release()
+
+                # 행이 바뀌었을 수 있어 재조회.
+                review = db.session.get(BlogReview, review_id)
+                if review is None:
+                    return
+                now = datetime.utcnow()
+                if result:
+                    review.ai_json = json.dumps(result, ensure_ascii=False)
+                    review.status = "ready"
+                elif prior_ok:
+                    # 실패했지만 직전 초안이 있으니 그대로 살려 둔다.
+                    review.status = "ready"
+                else:
+                    review.status = "failed"
+                review.updated_at = now
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception(
+                        "commit failed for blog review (review=%s)", review_id
+                    )
+            except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
+                db.session.rollback()
+                log.exception("generate_review failed (review=%s)", review_id)
+    finally:
+        with _generating_reviews_lock:
+            _generating_reviews.discard(review_id)
+
+
+def _spawn_generate_review(app, review_id):
+    """이 후기 초안 생성 백그라운드 스레드를 스폰(이미 진행 중이면 no-op).
+
+    judge_case 스폰과 같은 패턴 — review_id 가드로 중복(더블탭)을 떨군다. 절대
+    raise 안 하고, 스폰 실패 시 가드 키를 되돌린다."""
+    spawn = False
+    with _generating_reviews_lock:
+        if review_id not in _generating_reviews:
+            _generating_reviews.add(review_id)
+            spawn = True
+    if not spawn:
+        return
+    try:
+        threading.Thread(
+            target=generate_review, args=(app, review_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — 초안 생성은 best-effort, redirect를 막지 않게
+        log.exception("failed to spawn review thread for review %s", review_id)
+        with _generating_reviews_lock:
+            _generating_reviews.discard(review_id)
+
+
+def _star_bar(score):
+    """0~10 점수를 별 5개 문자열로(꽉 찬 별=2점, 홀수는 반쪽 ⯪). 복사텍스트용."""
+    s = max(0, min(10, int(score or 0)))
+    full = s // 2
+    half = 1 if s % 2 else 0
+    empty = 5 - full - half
+    return "★" * full + "⯪" * half + "☆" * empty
+
+
+def _review_copy_text(review):
+    """review.ai(JSON) → 네이버에 그대로 붙여넣는 '플레인 텍스트' 블록.
+
+    이미지는 네이버에 붙여넣을 수 없으니 사진 자리에는 ``[사진 N] — 캡션`` 마커를
+    둔다(사진 순서대로 1부터 번호). 초안이 없으면 "".
+    """
+    ai_data = review.ai
+    if not ai_data:
+        return ""
+
+    # 순서대로의 캡션(마커 옆에 붙일 설명). 준비된 캡션 없으면 "".
+    captions = []
+    for p in review.photos_ordered:
+        cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
+        captions.append(cap)
+
+    lines = []
+    title = (ai_data.get("title") or "").strip()
+    summary = (ai_data.get("summary") or "").strip()
+    if title:
+        lines.append(title)
+        lines.append("")
+    if summary:
+        lines.append(summary)
+    score = max(0, min(10, int(review.overall_score or 0)))
+    lines.append(f"⭐ 총점 {_star_bar(score)} ({score}/10)")
+
+    info = ai_data.get("info_block") or []
+    if info:
+        lines.append("")
+        lines.append("▶ 핵심 정보")
+        for it in info:
+            label = (it.get("label") or "").strip()
+            value = (it.get("value") or "").strip()
+            if label and value:
+                lines.append(f"· {label}: {value}")
+
+    for sec in ai_data.get("sections") or []:
+        heading = (sec.get("heading") or "").strip()
+        text = (sec.get("text") or "").strip()
+        if not heading and not text:
+            continue
+        lines.append("")
+        if heading:
+            lines.append(heading)
+        if text:
+            lines.append(text)
+        pi = sec.get("photo_index")
+        if isinstance(pi, int) and 0 <= pi < len(captions):
+            cap = captions[pi]
+            marker = f"[사진 {pi + 1}]"
+            lines.append(f"{marker} — {cap}" if cap else marker)
+
+    ratings = ai_data.get("ratings") or []
+    if ratings:
+        lines.append("")
+        lines.append("⭐ 별점")
+        for r in ratings:
+            aspect = (r.get("aspect") or "").strip()
+            if not aspect:
+                continue
+            rs = max(0, min(10, int(r.get("score") or 0)))
+            lines.append(f"· {aspect} {_star_bar(rs)} ({rs}/10)")
+
+    faq = ai_data.get("faq") or []
+    if faq:
+        lines.append("")
+        lines.append("❓ 자주 묻는 질문")
+        for f in faq:
+            q = (f.get("q") or "").strip()
+            a = (f.get("a") or "").strip()
+            if not q or not a:
+                continue
+            lines.append(f"Q. {q}")
+            lines.append(f"A. {a}")
+
+    hashtags = [t for t in (ai_data.get("hashtags") or []) if str(t).strip()]
+    if hashtags:
+        lines.append("")
+        lines.append(" ".join(str(t).strip() for t in hashtags))
+
+    return "\n".join(lines).strip() + "\n"
+
+
 # 선채점 커플당 하드 캡 — 워커 배치(≈24행)를 최대 이만큼 반복(≈480행)해
 # 부분 실패로 인한 폭주(무한 재선택)를 막는다.
 _PREWARM_MAX_BATCHES = 20
@@ -4655,11 +4856,13 @@ def _register_routes(app: Flask):
             prose=prose,
             overall_score=score,
             photo_ids=json.dumps(photo_ids) if photo_ids else None,
-            status="draft",
+            status="pending",  # (P2) 바로 백그라운드 초안 생성으로.
         )
         db.session.add(review)
         db.session.commit()
-        flash("후기를 저장했어. 다음 단계에서 블로그 초안을 만들 거야 ✍️", "success")
+        # (P2) 백그라운드로 네이버 블로그 초안 생성을 시작한다(요청 경로 아님).
+        _spawn_generate_review(current_app._get_current_object(), review.id)
+        flash("등록 완료! AI가 블로그 초안을 쓰는 중이야 ✍️", "success")
         return redirect(url_for("review_detail", rid=review.id))
 
     @app.route("/reviews/<int:rid>")
@@ -4671,10 +4874,13 @@ def _register_routes(app: Flask):
         review = db.session.get(BlogReview, rid)
         if review is None or review.couple_id != u.couple_id:
             abort(404)
+        # 네이버 복사본: 사용자가 편집한 게 있으면 그걸, 없으면 생성 초안에서 조립.
+        copy_text = review.edited_text or _review_copy_text(review)
         return render_template(
             "review_detail.html",
             review=review,
             photos=review.photos_ordered,
+            copy_text=copy_text,
         )
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
@@ -4734,8 +4940,13 @@ def _register_routes(app: Flask):
         review.prose = prose
         review.overall_score = score
         review.photo_ids = json.dumps(photo_ids) if photo_ids else None
+        # 입력이 바뀌었으니 초안을 새로 뽑는다 — pending으로 되돌리고 편집본은
+        # 비워(새 초안이 복사본으로 보이게) 백그라운드 재생성을 시작한다.
+        review.status = "pending"
+        review.edited_text = None
         db.session.commit()
-        flash("후기를 수정했어.", "success")
+        _spawn_generate_review(current_app._get_current_object(), review.id)
+        flash("후기를 수정했어. 바뀐 내용으로 초안을 다시 만드는 중이야 ✍️", "success")
         return redirect(url_for("review_detail", rid=review.id))
 
     @app.route("/reviews/<int:rid>/delete", methods=["POST"])
@@ -4750,6 +4961,41 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("후기를 삭제했어.", "success")
         return redirect(url_for("reviews"))
+
+    @app.route("/reviews/<int:rid>/regenerate", methods=["POST"])
+    @active_couple_required
+    def review_regenerate(rid):
+        """초안 '다시 생성' — pending으로 되돌리고 편집본을 비운 뒤 백그라운드
+        재생성을 스폰한다. 새 초안이 복사본으로 보이도록 edited_text를 지운다.
+        cross-couple은 404."""
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        review.status = "pending"
+        review.edited_text = None
+        db.session.commit()
+        _spawn_generate_review(current_app._get_current_object(), review.id)
+        flash("초안을 다시 만드는 중이야 ✍️", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/save-text", methods=["POST"])
+    @active_couple_required
+    def review_save_text(rid):
+        """편집한 네이버 복사본을 edited_text에 저장(영속). fetch면 JSON, 아니면
+        상세로 리다이렉트. 빈 값이면 None으로 저장해 다음엔 생성 초안이 다시
+        시드된다. cross-couple은 404."""
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        text = (request.form.get("text") or "").strip()
+        review.edited_text = text or None
+        db.session.commit()
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify(ok=True)
+        flash("복사본을 저장했어.", "success")
+        return redirect(url_for("review_detail", rid=review.id))
 
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
