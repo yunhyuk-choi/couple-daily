@@ -160,7 +160,6 @@
       item.innerHTML =
         '<div class="rev-strip-thumb">' +
           '<span class="rev-strip-num" aria-hidden="true"></span>' +
-          '<span class="rev-strip-drag" title="드래그해서 순서 변경" aria-hidden="true">⠿</span>' +
           '<img alt="" src="' + thumbUrl(id) + '" />' +
         '</div>' +
         '<div class="rev-strip-btns">' +
@@ -253,45 +252,8 @@
       }
     });
 
-    // ---- 포인터 드래그 재정렬(폴백은 위 이동 버튼) ----
-    // 노드를 재생성하지 않고 직접 옮기므로 pointer capture가 드래그 내내 유지된다.
-    var drag = null;
-    strip.addEventListener('pointerdown', function (e) {
-      var handle = e.target.closest('.rev-strip-drag');
-      if (!handle) return;                       // 손잡이에서만 드래그 시작
-      var it = e.target.closest('.rev-strip-item');
-      if (!it) return;
-      drag = it;
-      it.classList.add('dragging');
-      it.style.pointerEvents = 'none';           // elementFromPoint가 아래를 보게
-      try { it.setPointerCapture(e.pointerId); } catch (_) {}
-      e.preventDefault();
-    });
-    strip.addEventListener('pointermove', function (e) {
-      if (!drag) return;
-      e.preventDefault();
-      var el = document.elementFromPoint(e.clientX, e.clientY);
-      var target = el && el.closest ? el.closest('.rev-strip-item') : null;
-      if (!target || target === drag || target.parentNode !== strip) return;
-      var r = target.getBoundingClientRect();
-      var after = e.clientX > (r.left + r.width / 2);  // 대상 중앙 기준 앞/뒤
-      if (after) {
-        strip.insertBefore(drag, target.nextElementSibling);
-      } else {
-        strip.insertBefore(drag, target);
-      }
-      sync();
-    });
-    function endDragItem(e) {
-      if (!drag) return;
-      drag.classList.remove('dragging');
-      drag.style.pointerEvents = '';
-      try { drag.releasePointerCapture(e.pointerId); } catch (_) {}
-      drag = null;
-      sync();
-    }
-    strip.addEventListener('pointerup', endDragItem);
-    strip.addEventListener('pointercancel', endDragItem);
+    // 순서 재정렬은 ◀▶ 버튼으로만(드래그 핸들 제거 — 터치에서 불안정하고 가로
+    // 스크롤 제스처와 충돌했다). 스트립은 이제 가로 스크롤만 담당한다.
 
     // ---- 갤러리에서 바로 업로드: 폰 갤러리/카메라 다중 선택 → 순차 업로드 → 촬영일 순 담기 ----
     // 추억 페이지 업로더와 동일한 하드닝된 경로(/memories/upload?ajax=1, 1장/요청, 50MB·HEIC·
