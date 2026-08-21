@@ -1,0 +1,8 @@
+{# 정적 별점 매크로 — 0~10 점수를 별 5개(반쪽까지)로. 회색 별 위에 핑크 별을
+   score*10 %만큼 덮어 홀수 점수는 반쪽 별로 보인다. 순수 CSS(의존성 없음).
+   숫자(N / 10)는 별 블록 '밖'의 형제라 채움 %가 숫자 폭에 영향받지 않는다. #}
+{% macro stars(score, show_num=True) %}
+{%- set s = [[score|int, 0]|max, 10]|min -%}
+<span class="stars-static" style="--pct: {{ s * 10 }}%"
+      role="img" aria-label="10점 만점에 {{ s }}점"><span aria-hidden="true">★★★★★</span><span class="stars-fill" aria-hidden="true">★★★★★</span></span>{%- if show_num %}<span class="stars-num">{{ s }} / 10</span>{% endif -%}
+{% endmacro %}

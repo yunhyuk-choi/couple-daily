@@ -913,3 +913,100 @@ class BetCheckin(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     user = db.relationship("User")
+
+
+class BlogReview(db.Model):
+    """'데이트 후기 → 네이버 블로그 포스트' 한 건 (P1: 데이터+작성 UX).
+
+    커플이 다녀온 데이트를 주제/장소 · 위치 · 느낀점(산문) · 반쪽별 별점(0~10) ·
+    추억 사진(순서 유지)으로 남긴다. P1은 여기까지 저장만 한다(status='draft').
+    P2가 이 원문을 재료로 백그라운드 `claude`로 SEO/AEO 블로그 포스트를 만들어
+    ``ai_json``에 담고, 사용자가 편집한 복사텍스트를 ``edited_text``에 담는다.
+    커플 스코프(``couple_id``). brand-new 테이블 — db.create_all()가 만들어 ALTER
+    마이그레이션이 필요 없다.
+
+    ``status`` 라이프사이클:
+      * 'draft'   — 생성됨, AI 아직 안 돌림(P1의 유일한 상태).
+      * 'pending' — (P2) 백그라운드 생성 대기/진행 중.
+      * 'ready'   — (P2) ai_json 채워짐(미리보기 렌더 가능).
+      * 'failed'  — (P2) 생성 실패.
+    """
+    __tablename__ = "blog_reviews"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    # 주제/장소명(필수)
+    topic = db.Column(db.String(200), nullable=False)
+    # 위치(선택) — 주소·동네 등
+    location = db.Column(db.String(300), nullable=True)
+    # 느낀점·특징 3~4줄 원문(필수)
+    prose = db.Column(db.Text, nullable=False)
+    # 반쪽별 별점 합계(0~10). 별 5개 × 2점, 홀수는 반쪽.
+    overall_score = db.Column(db.Integer, nullable=False)
+    # 선택한 Photo id들을 JSON list[int]로, **순서 유지**해 저장.
+    photo_ids = db.Column(db.Text, nullable=True)
+    # (P2) AI가 만든 구조화 포스트 JSON.
+    ai_json = db.Column(db.Text, nullable=True)
+    # (P2) 사용자가 편집한 네이버 복사텍스트.
+    edited_text = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(16), default="draft", nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    creator = db.relationship("User")
+
+    @property
+    def photo_ids_list(self):
+        """photo_ids(JSON)를 int 리스트로 디코드(없거나 깨졌으면 [])."""
+        if not self.photo_ids:
+            return []
+        try:
+            v = json.loads(self.photo_ids)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(v, list):
+            return []
+        out = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    @property
+    def photos_ordered(self):
+        """photo_ids 순서대로 이 커플의 Photo 행을 돌려준다.
+
+        JSON 디코드 → 한 번의 IN 조회 → photo_ids 순서로 재정렬 → 커플 밖이거나
+        사라진 id는 스킵. (커플 스코프를 여기서 다시 강제해 안전하게.)
+        """
+        ids = self.photo_ids_list
+        if not ids:
+            return []
+        rows = (
+            Photo.query.filter(
+                Photo.id.in_(ids), Photo.couple_id == self.couple_id
+            ).all()
+        )
+        by_id = {p.id: p for p in rows}
+        return [by_id[i] for i in ids if i in by_id]
+
+    @property
+    def ai(self):
+        """ai_json을 구조화 dict로 디코드(없거나 깨졌으면 None) — P2용."""
+        if not self.ai_json:
+            return None
+        try:
+            v = json.loads(self.ai_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None

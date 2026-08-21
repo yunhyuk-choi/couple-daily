@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_stars.html" import stars %}
+{% block title %}후기 · 데이트 · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <img class="emoji hero-sm" src="{{ url_for('static', filename='emoji/date_calendar.svg') }}" alt="" />
+  <h1>데이트 후기</h1>
+</div>
+
+{% if not reviews %}
+  <div class="card center-card">
+    <img class="emoji hero" src="{{ url_for('static', filename='emoji/love_letter.svg') }}" alt="" />
+    <p class="muted">아직 남긴 데이트 후기가 없어.<br />오른쪽 아래 <strong>+</strong> 버튼으로 첫 후기를 써보자!</p>
+    <a class="btn primary sm" href="{{ url_for('review_new') }}">+ 새 후기 쓰기</a>
+  </div>
+{% else %}
+  <div class="review-list">
+    {% for r in reviews %}
+    <a class="review-card" href="{{ url_for('review_detail', rid=r.id) }}">
+      <p class="rc-topic">{{ r.topic }}</p>
+      <div class="rc-meta">
+        {{ stars(r.overall_score) }}
+        {% if r.location %}<span class="rc-loc">📍 {{ r.location }}</span>{% endif %}
+      </div>
+      <div class="rc-foot">
+        <span class="rc-date">{{ r.created_at.strftime('%Y.%m.%d') }}</span>
+        {# 상태 힌트 — P1은 항상 '초안'. P2에서 작성중/완료가 붙는다. #}
+        {% if r.status == 'draft' %}
+          <span class="chip small">초안</span>
+        {% elif r.status == 'pending' %}
+          <span class="chip small">작성중</span>
+        {% elif r.status == 'ready' %}
+          <span class="chip small">완료</span>
+        {% elif r.status == 'failed' %}
+          <span class="chip small">실패</span>
+        {% endif %}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+{% endif %}
+
+{# Floating action button — 새 후기 작성 진입점. #}
+<a class="fab glass" href="{{ url_for('review_new') }}"
+   aria-label="새 후기 쓰기">
+  <span class="fab-plus" aria-hidden="true">+</span>
+</a>
+{% endblock %}

@@ -55,6 +55,7 @@ from models import (
     Answer,
     Bet,
     BetCheckin,
+    BlogReview,
     Case,
     CaseStatement,
     Comment,
@@ -4512,6 +4513,243 @@ def _register_routes(app: Flask):
             confirmed_items=confirmed_items,
             wish_items=wish_items,
         )
+
+    # ---- 데이트 후기 → 블로그 포스트 (P1: 데이터 + 작성 UX) ----
+    def _couple_photos_for_picker(couple_id):
+        """작성 폼의 사진 선택 그리드용 — 이 커플 사진을 최신순 dict 리스트로.
+
+        _photo_grid.html와 같은 필드 모양(id·caption·tags·caption_status·
+        original_name)을 주되, 여기선 썸네일 선택 UI만 쓴다. OneDrive 미연결이면
+        빈 리스트(폼은 '앨범에 사진이 없어' 안내를 보인다). 순수 DB 읽기.
+        """
+        if not onedrive.onedrive_enabled():
+            return []
+        rows = (
+            Photo.query.filter_by(couple_id=couple_id)
+            .order_by(Photo.created_at.desc(), Photo.id.desc())
+            .all()
+        )
+        return [
+            {
+                "id": p.id,
+                "caption": p.caption,
+                "tags": p.tags_list,
+                "caption_status": p.caption_status,
+                "original_name": p.original_name,
+            }
+            for p in rows
+        ]
+
+    def _parse_photo_ids(raw, couple_id):
+        """폼 hidden input(photo_ids)을 이 커플의 Photo id 리스트로 파싱한다.
+
+        JSON 배열 우선, 실패하면 CSV로 관대하게 파싱한다. **순서를 유지**하고,
+        중복은 첫 등장만 남기며, 이 커플 소유가 아닌 id는 조용히 버린다(스코프 강제).
+        """
+        raw = (raw or "").strip()
+        ids = []
+        if raw:
+            parsed = None
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                candidates = parsed
+            else:
+                # CSV 폴백(예: "3,1,2").
+                candidates = [tok for tok in raw.replace("\n", ",").split(",")]
+            for c in candidates:
+                try:
+                    ids.append(int(c))
+                except (ValueError, TypeError):
+                    continue
+        if not ids:
+            return []
+        # 커플 소유 사진만 남긴다(순서 유지 + 중복 제거).
+        owned = {
+            pid
+            for (pid,) in db.session.query(Photo.id)
+            .filter(Photo.id.in_(ids), Photo.couple_id == couple_id)
+            .all()
+        }
+        seen = set()
+        out = []
+        for i in ids:
+            if i in owned and i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
+
+    def _review_form_error(u, form, editing=None):
+        """작성/수정 폼을 입력값을 유지한 채 다시 렌더(유효성 오류 경로)."""
+        return render_template(
+            "review_form.html",
+            photos=_couple_photos_for_picker(u.couple_id),
+            editing=editing,
+            form=form,
+        )
+
+    @app.route("/reviews")
+    @active_couple_required
+    def reviews():
+        """이 커플의 데이트 후기 목록(최신순). 순수 DB 읽기."""
+        u = current_user()
+        rows = (
+            BlogReview.query.filter_by(couple_id=u.couple_id)
+            .order_by(BlogReview.created_at.desc(), BlogReview.id.desc())
+            .all()
+        )
+        return render_template("reviews.html", reviews=rows)
+
+    @app.route("/reviews/new", methods=["GET", "POST"])
+    @active_couple_required
+    def review_new():
+        """데이트 후기 작성 — GET은 폼, POST는 저장(status='draft'). AI 없음(P1)."""
+        u = current_user()
+        if request.method == "GET":
+            return render_template(
+                "review_form.html",
+                photos=_couple_photos_for_picker(u.couple_id),
+                editing=None,
+                form=None,
+            )
+
+        topic = (request.form.get("topic") or "").strip()[:200]
+        location = (request.form.get("location") or "").strip()[:300] or None
+        prose = (request.form.get("prose") or "").strip()
+        raw_ids = request.form.get("photo_ids") or ""
+        photo_ids = _parse_photo_ids(raw_ids, u.couple_id)
+
+        # 별점 0~10 정수 파싱(clamp).
+        try:
+            score = int((request.form.get("overall_score") or "").strip())
+        except (ValueError, TypeError):
+            score = None
+        if score is not None:
+            score = max(0, min(10, score))
+
+        # 폼 상태(오류 시 재렌더용) — 파싱된 값들을 그대로 담는다.
+        form = {
+            "topic": topic,
+            "location": location or "",
+            "prose": prose,
+            "overall_score": score if score is not None else 0,
+            "photo_ids": photo_ids,
+        }
+        if not topic:
+            flash("주제/장소를 입력해줘.", "error")
+            return _review_form_error(u, form)
+        if not prose:
+            flash("느낀점을 한두 줄이라도 남겨줘.", "error")
+            return _review_form_error(u, form)
+        if score is None:
+            flash("별점을 매겨줘.", "error")
+            return _review_form_error(u, form)
+
+        review = BlogReview(
+            couple_id=u.couple_id,
+            created_by=u.id,
+            topic=topic,
+            location=location,
+            prose=prose,
+            overall_score=score,
+            photo_ids=json.dumps(photo_ids) if photo_ids else None,
+            status="draft",
+        )
+        db.session.add(review)
+        db.session.commit()
+        flash("후기를 저장했어. 다음 단계에서 블로그 초안을 만들 거야 ✍️", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>")
+    @active_couple_required
+    def review_detail(rid):
+        """저장된 후기 상세 — 주제/위치 · 별점 · 산문 · 선택 사진(순서). P1은 AI
+        출력이 없어 placeholder 카드를 보인다. cross-couple은 404."""
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        return render_template(
+            "review_detail.html",
+            review=review,
+            photos=review.photos_ordered,
+        )
+
+    @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
+    @active_couple_required
+    def review_edit(rid):
+        """후기 수정 — 주제/위치/산문/별점/사진 선택+순서. cross-couple은 404."""
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+
+        if request.method == "GET":
+            form = {
+                "topic": review.topic,
+                "location": review.location or "",
+                "prose": review.prose,
+                "overall_score": review.overall_score,
+                "photo_ids": review.photo_ids_list,
+            }
+            return render_template(
+                "review_form.html",
+                photos=_couple_photos_for_picker(u.couple_id),
+                editing=review,
+                form=form,
+            )
+
+        topic = (request.form.get("topic") or "").strip()[:200]
+        location = (request.form.get("location") or "").strip()[:300] or None
+        prose = (request.form.get("prose") or "").strip()
+        photo_ids = _parse_photo_ids(request.form.get("photo_ids") or "", u.couple_id)
+        try:
+            score = int((request.form.get("overall_score") or "").strip())
+        except (ValueError, TypeError):
+            score = None
+        if score is not None:
+            score = max(0, min(10, score))
+
+        form = {
+            "topic": topic,
+            "location": location or "",
+            "prose": prose,
+            "overall_score": score if score is not None else 0,
+            "photo_ids": photo_ids,
+        }
+        if not topic:
+            flash("주제/장소를 입력해줘.", "error")
+            return _review_form_error(u, form, editing=review)
+        if not prose:
+            flash("느낀점을 한두 줄이라도 남겨줘.", "error")
+            return _review_form_error(u, form, editing=review)
+        if score is None:
+            flash("별점을 매겨줘.", "error")
+            return _review_form_error(u, form, editing=review)
+
+        review.topic = topic
+        review.location = location
+        review.prose = prose
+        review.overall_score = score
+        review.photo_ids = json.dumps(photo_ids) if photo_ids else None
+        db.session.commit()
+        flash("후기를 수정했어.", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/delete", methods=["POST"])
+    @active_couple_required
+    def review_delete(rid):
+        """후기 삭제 → 목록. cross-couple은 404."""
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        db.session.delete(review)
+        db.session.commit()
+        flash("후기를 삭제했어.", "success")
+        return redirect(url_for("reviews"))
 
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
