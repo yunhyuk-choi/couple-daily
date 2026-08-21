@@ -1702,15 +1702,24 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .rev-gallery-btn:active { transform: scale(0.97); }
 .rev-gallery-btn:disabled { opacity: 0.55; cursor: default; }
 .rev-gallery-hint { margin: 0 2px 6px; }
+/* 선택 사진은 한 줄로 가로 나열 — 5장 이상이면 스트립만 가로 스크롤한다.
+   overflow-x:auto + flex-wrap:nowrap + max-width:100%로 스트립 내부만 넘치고
+   페이지(body)는 가로 스크롤이 생기지 않는다. */
 .rev-strip {
   display: flex;
+  flex-wrap: nowrap;
   gap: 10px;
+  max-width: 100%;
   overflow-x: auto;
+  overflow-y: hidden;
   padding: 4px 2px 8px;
-  -webkit-overflow-scrolling: touch;
+  -webkit-overflow-scrolling: touch;   /* iOS 관성 스크롤 */
+  scrollbar-width: thin;
 }
 .rev-strip::-webkit-scrollbar { height: 0; }
 .rev-strip-empty { color: var(--muted); font-size: 0.85rem; padding: 6px 2px; }
+/* 각 아이템은 폭 고정(flex:0 0 auto)이라 줄어들지 않고 한 줄로 이어진다.
+   썸네일 + ◀✕▶ 버튼이 한 컬럼으로 묶여 통째로 함께 스크롤된다. */
 .rev-strip-item {
   position: relative;
   flex: 0 0 auto;
@@ -1718,9 +1727,7 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   display: flex;
   flex-direction: column;
   gap: 4px;
-  touch-action: none;
 }
-.rev-strip-item.dragging { opacity: 0.6; }
 .rev-strip-thumb {
   position: relative;
   width: 84px; height: 84px;
@@ -1737,13 +1744,6 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   background: var(--pink); color: #fff;
   font-size: 0.72rem; font-weight: 800;
   display: flex; align-items: center; justify-content: center;
-}
-.rev-strip-drag {
-  position: absolute; top: 4px; right: 4px;
-  width: 22px; height: 22px; border-radius: 6px;
-  background: rgba(40,22,31,0.45); color: #fff;
-  display: flex; align-items: center; justify-content: center;
-  cursor: grab; font-size: 0.8rem; touch-action: none;
 }
 .rev-strip-btns { display: flex; gap: 4px; justify-content: center; }
 .rev-strip-btns button {
