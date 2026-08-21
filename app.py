@@ -3833,6 +3833,7 @@ def _register_routes(app: Flask):
             manual_caption = None
 
         saved_ids = []          # rows that need background captioning
+        saved_takens = []       # saved_ids와 짝: 각 사진의 taken_at(EXIF, 없으면 None)
         saved = 0
         skipped = 0             # invalid / empty / too-big files
         failed = 0              # OneDrive upload errors
@@ -3890,6 +3891,7 @@ def _register_routes(app: Flask):
             saved += 1
             if caption is None:
                 saved_ids.append(photo.id)
+                saved_takens.append(taken)
 
         # Fire-and-forget auto-captioning for each new photo. The HTTP response
         # returns after the OneDrive PUTs + DB inserts — it NEVER waits on the
@@ -3908,6 +3910,11 @@ def _register_routes(app: Flask):
         # 클라이언트가 진행률/실패 파일명을 직접 표시하고, 전부 끝난 뒤 페이지를
         # 새로고침해 새 그리드+flash를 보여준다.
         if ajax:
+            # 후기 작성 폼의 갤러리 업로더(1장/요청)를 위해 방금 만든 Photo의 id와
+            # 촬영일(taken_at)을 추가로 돌려준다 — 클라이언트가 촬영일 순으로 정렬해
+            # 선택 스트립에 담는다. 기존 필드는 그대로라 추억 페이지 업로더는 무영향.
+            new_photo_id = saved_ids[0] if saved_ids else None
+            new_taken = saved_takens[0] if saved_takens else None
             return jsonify(
                 ok=(saved > 0),
                 saved=saved,
@@ -3915,6 +3922,8 @@ def _register_routes(app: Flask):
                 failed=failed,
                 filename=last_name,
                 reason=reason,
+                photo_id=new_photo_id,
+                taken_at=(new_taken.isoformat() if new_taken else None),
             )
 
         # One honest flash summarizing the batch outcome.

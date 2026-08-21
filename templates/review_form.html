@@ -35,16 +35,23 @@
   </div>
 
   {# ---- 사진 선택 + 순서 ---- #}
+  {# 스트립·갤러리 업로드 UI는 앨범에 사진이 없어도 항상 렌더한다 — 갤러리에서 바로
+     올린 사진이 스트립에 담기기 때문. 앨범 그리드만 사진이 있을 때 렌더한다. #}
   <div>
-    <span style="font-weight:600; font-size:0.92rem;">사진 <span class="muted small">(추억 앨범에서 골라 순서를 정해)</span></span>
+    <span style="font-weight:600; font-size:0.92rem;">사진 <span class="muted small">(앨범에서 고르거나 갤러리에서 바로 올려)</span></span>
+    <div class="rev-strip-head">
+      <span class="muted small" id="rev-count">0장 선택됨</span>
+      {# 폰 갤러리/카메라에서 여러 장 한 번에 — 순차 업로드 후 촬영일 순으로 스트립에 담는다 #}
+      <button type="button" class="rev-gallery-btn" id="rev-gallery-btn">📷 갤러리에서 올리기</button>
+    </div>
+    <div class="rev-gallery-hint muted small" id="rev-gallery-hint">여러 장 한 번에 OK · 촬영일 순으로 담겨.</div>
+    {# 갤러리/카메라 다중 선택(운영체제 순서로 들어옴 → 촬영일로 재정렬) #}
+    <input type="file" id="rev-file" accept="image/*" multiple hidden />
+    {# 선택된 사진의 순서 스트립(선택/업로드하면 여기에 순서대로 쌓인다) #}
+    <div class="rev-strip" id="rev-strip">
+      <span class="rev-strip-empty" id="rev-strip-empty">아래에서 사진을 탭하거나 갤러리에서 올리면 여기에 순서대로 담겨.</span>
+    </div>
     {% if photos %}
-      <div class="rev-strip-head">
-        <span class="muted small" id="rev-count">0장 선택됨</span>
-      </div>
-      {# 선택된 사진의 순서 스트립(선택하면 여기에 순서대로 쌓인다) #}
-      <div class="rev-strip" id="rev-strip">
-        <span class="rev-strip-empty" id="rev-strip-empty">아래에서 사진을 탭하면 여기에 순서대로 담겨.</span>
-      </div>
       {# 선택 그리드 — 썸네일 탭으로 선택/해제 #}
       <div class="rev-pick-grid" id="rev-grid" style="margin-top:8px;">
         {% for p in photos %}
@@ -61,8 +68,8 @@
       </div>
     {% else %}
       <p class="muted small" style="margin-top:6px;">
-        아직 추억 앨범에 사진이 없어. 사진 없이도 후기를 저장할 수 있어 —
-        나중에 추억을 올리고 수정에서 사진을 골라도 돼.
+        아직 추억 앨범에 사진이 없어 — 위 <b>갤러리에서 올리기</b>로 바로 담거나,
+        사진 없이 저장하고 나중에 골라도 돼.
       </p>
     {% endif %}
     {# 최종 순서 id 리스트(JSON) — 모든 변경마다 JS가 동기화한다 #}
@@ -285,6 +292,96 @@
     }
     strip.addEventListener('pointerup', endDragItem);
     strip.addEventListener('pointercancel', endDragItem);
+
+    // ---- 갤러리에서 바로 업로드: 폰 갤러리/카메라 다중 선택 → 순차 업로드 → 촬영일 순 담기 ----
+    // 추억 페이지 업로더와 동일한 하드닝된 경로(/memories/upload?ajax=1, 1장/요청, 50MB·HEIC·
+    // EXIF)를 그대로 재사용한다 — 새 업로드 경로를 만들지 않는다. OS 다중선택은 '탭 순서'를
+    // 주지 않으므로(브라우저는 OS 순서로 받음) 서버가 돌려준 taken_at(EXIF 촬영일)로 정렬해
+    // 스트립에 담는다. 담긴 사진은 makeItem/sync를 재사용하므로 탭 선택과 완전히 동일하게
+    // 재정렬·해제된다. 올린 사진은 추억 앨범에도 저장되고 배경 캡셔닝이 돈다(의도된 동작).
+    var fileInput = document.getElementById('rev-file');
+    var galBtn = document.getElementById('rev-gallery-btn');
+    var galHint = document.getElementById('rev-gallery-hint');
+    if (fileInput && galBtn) {
+      var uploading = false;
+      function setHint(msg) { if (galHint) galHint.textContent = msg; }
+
+      // 사진 1장 순차 업로드 → { ok, id, taken }. 실패는 ok:false로 집계(폼은 절대 안 깨짐).
+      function uploadOne(file) {
+        var fd = new FormData();
+        fd.append('photos', file, file.name);   // 서버 필드명은 memories 업로더와 동일
+        return fetch('/memories/upload?ajax=1', {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' },
+          body: fd,
+          credentials: 'same-origin',
+        }).then(function (resp) {
+          return resp.json().catch(function () { return { ok: false }; });
+        }).then(function (data) {
+          if (data && data.ok && data.saved && data.photo_id) {
+            return { ok: true, id: data.photo_id, taken: data.taken_at || null };
+          }
+          return { ok: false };
+        }).catch(function () {
+          return { ok: false };   // 네트워크 오류 → 실패로 집계
+        });
+      }
+
+      galBtn.addEventListener('click', function () {
+        if (uploading) return;
+        fileInput.click();       // 숨긴 input 열기 = 폰 갤러리/카메라
+      });
+
+      fileInput.addEventListener('change', function () {
+        var files = Array.prototype.slice.call(fileInput.files || [])
+          .filter(function (f) { return f && f.type.indexOf('image/') === 0; });
+        if (!files.length || uploading) { fileInput.value = ''; return; }
+
+        uploading = true;
+        galBtn.disabled = true;
+        var total = files.length;
+        var okItems = [];        // { id, taken, ord }
+        var failed = 0;
+
+        // 한 번에 몰아 보내지 않고 1장씩 순차 전송(이전 요청 완료 후 다음) — memories 업로더와 동일.
+        function step(i) {
+          if (i >= total) return finish();
+          setHint((i + 1) + '/' + total + ' 업로드 중…');
+          uploadOne(files[i]).then(function (r) {
+            if (r.ok) okItems.push({ id: r.id, taken: r.taken, ord: i });
+            else failed += 1;
+            step(i + 1);
+          });
+        }
+
+        function finish() {
+          // 촬영일(taken_at) 오름차순 정렬 — 모르는 것(null)은 뒤로, 그다음 업로드 순서 유지.
+          okItems.sort(function (a, b) {
+            var ta = a.taken, tb = b.taken;
+            if (ta && tb) { if (ta < tb) return -1; if (ta > tb) return 1; return a.ord - b.ord; }
+            if (ta && !tb) return -1;
+            if (!ta && tb) return 1;
+            return a.ord - b.ord;
+          });
+          // 정렬된 순서로 스트립 끝에 append(이미 있으면 스킵), 마지막에 sync 1회로 번호·JSON 갱신.
+          okItems.forEach(function (it) {
+            if (!findItem(it.id)) strip.appendChild(makeItem(it.id));
+          });
+          sync();
+
+          if (failed) {
+            setHint(total + '장 중 ' + (total - failed) + '장 완료, ' + failed + '장 실패.');
+          } else {
+            setHint(total + '장 담았어 · 촬영일 순으로 정렬됨.');
+          }
+          fileInput.value = '';   // 같은 파일 재선택 가능하게 초기화
+          galBtn.disabled = false;
+          uploading = false;
+        }
+
+        step(0);
+      });
+    }
 
     // ---- 초기 상태 복원(수정/유효성 오류 재렌더): hidden JSON의 순서대로 스트립 구성 ----
     (function initFromHidden() {
