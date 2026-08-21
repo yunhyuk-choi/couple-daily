@@ -826,3 +826,232 @@ def recommend_dates(profile_text, candidates):
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] date recommendation failed: {e}", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------------------
+# 데이트 후기 → 네이버 블로그 포스트 (P2) — 네이버 AI 검색 최적화 초안 1콜
+# ---------------------------------------------------------------------------
+def _clamp_score10(v, default=0):
+    """점수를 0~10 정수로 강제·클램프(못 쓰면 default)."""
+    try:
+        n = int(round(float(v)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(10, n))
+
+
+def _normalize_review(data, photos):
+    """claude가 준 원본 dict를 렌더 가능한 일관 스키마로 정규화한다 (순수/오프라인).
+
+    claude 없이 가짜 dict로 바로 단위 테스트할 수 있게 분리했다. 규칙:
+      * 모든 문자열 .strip().
+      * title·summary 비면 최종 None(호출부에서 실패 처리).
+      * info_block: {label, value} 리스트, 둘 중 하나라도 비면 제거.
+      * sections: {heading, text, photo_index} 리스트, heading·text 모두 비면 제거.
+        photo_index는 0..len(photos)-1 범위일 때만 유지(아니면 null).
+      * ratings: {aspect, score} 최대 6개, aspect 비면 제거, score 0..10 클램프.
+      * faq: {q, a} 최대 4개, q·a 둘 중 하나라도 비면 제거.
+      * hashtags: 최대 10개, 공백 제거, 빈 것 제거, 앞에 # 없으면 붙임.
+      * 유효 섹션이 하나도 없으면 None.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    n_photos = len(photos or [])
+
+    def _s(v):
+        return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
+
+    title = _s(data.get("title"))
+    summary = _s(data.get("summary"))
+
+    # info_block
+    info = []
+    raw_info = data.get("info_block")
+    if isinstance(raw_info, list):
+        for it in raw_info:
+            if not isinstance(it, dict):
+                continue
+            label = _s(it.get("label"))
+            value = _s(it.get("value"))
+            if label and value:
+                info.append({"label": label, "value": value})
+
+    # sections
+    sections = []
+    raw_sections = data.get("sections")
+    if isinstance(raw_sections, list):
+        for it in raw_sections:
+            if not isinstance(it, dict):
+                continue
+            heading = _s(it.get("heading"))
+            text = _s(it.get("text"))
+            if not heading and not text:
+                continue
+            pi = it.get("photo_index")
+            try:
+                pi = int(pi)
+            except (TypeError, ValueError):
+                pi = None
+            if pi is None or pi < 0 or pi >= n_photos:
+                pi = None
+            sections.append({"heading": heading, "text": text, "photo_index": pi})
+
+    # ratings (최대 6)
+    ratings = []
+    raw_ratings = data.get("ratings")
+    if isinstance(raw_ratings, list):
+        for it in raw_ratings:
+            if not isinstance(it, dict):
+                continue
+            aspect = _s(it.get("aspect"))
+            if not aspect:
+                continue
+            ratings.append({"aspect": aspect, "score": _clamp_score10(it.get("score"), 0)})
+            if len(ratings) >= 6:
+                break
+
+    # faq (최대 4)
+    faq = []
+    raw_faq = data.get("faq")
+    if isinstance(raw_faq, list):
+        for it in raw_faq:
+            if not isinstance(it, dict):
+                continue
+            q = _s(it.get("q"))
+            a = _s(it.get("a"))
+            if not q or not a:
+                continue
+            faq.append({"q": q, "a": a})
+            if len(faq) >= 4:
+                break
+
+    # hashtags (최대 10, # 보장)
+    hashtags = []
+    raw_tags = data.get("hashtags")
+    if isinstance(raw_tags, list):
+        for t in raw_tags:
+            s = _s(t)
+            if not s:
+                continue
+            if not s.startswith("#"):
+                s = "#" + s.lstrip("#").replace(" ", "")
+            hashtags.append(s)
+            if len(hashtags) >= 10:
+                break
+
+    if not title or not summary or not sections:
+        return None
+
+    return {
+        "title": title,
+        "summary": summary,
+        "info_block": info,
+        "sections": sections,
+        "ratings": ratings,
+        "faq": faq,
+        "hashtags": hashtags,
+    }
+
+
+def write_review(topic, location, prose, overall_score, photos):
+    """데이트 후기 원문을 네이버 AI 검색 최적화 블로그 초안(구조화 JSON)으로 만든다.
+
+    ``photos``: ``{"index": i, "caption": <그 사진의 AI 캡션>, "tags": [..]}``의
+    순서 리스트(호출부가 순서대로 넘긴다). claude를 '한 번'만 호출하고 strict JSON을
+    파싱해 ``_normalize_review``로 정규화한 dict를 돌려주거나, 어떤 실패에도 ``None``을
+    돌려준다(절대 raise 안 함). 느린 서브프로세스라 호출부가 반드시 백그라운드에서
+    돌린다.
+
+    타깃 = 네이버 통합검색/AI 브리핑(하이퍼클로바X). 생성 글은 네이버 AI가 인용하고,
+    '진짜 경험 후기' 필터를 통과하도록 구성한다.
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return None
+    prose = (prose or "").strip()
+    location = (location or "").strip()
+    overall_score = _clamp_score10(overall_score, 0)
+    photos = photos or []
+
+    # 사진 재료 블록 — 각 사진의 index(0-based)·캡션·태그를 그대로 준다. 캡션이
+    # 없으면 '(설명 없음)'로 표시하되, 모델이 지어내지 않도록 명시한다.
+    if photos:
+        photo_lines = []
+        for p in photos:
+            idx = p.get("index")
+            cap = (p.get("caption") or "").strip() or "(설명 없음)"
+            tags = p.get("tags") or []
+            tag_str = ", ".join(str(t).strip() for t in tags if str(t).strip())
+            line = f"- [사진 {idx}] {cap}"
+            if tag_str:
+                line += f" (태그: {tag_str})"
+            photo_lines.append(line)
+        photo_block = "\n".join(photo_lines)
+        photo_rule = (
+            f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이야. 각 섹션의 "
+            "photo_index에는 그 단락과 가장 잘 맞는 사진의 번호(0-based)를 넣고, 붙일 "
+            "사진이 없으면 null로 둬. 없는 번호는 절대 쓰지 마. 사진 설명은 위 캡션에만 "
+            "근거하고 지어내지 마.\n"
+        )
+    else:
+        photo_block = "(첨부된 사진 없음)"
+        photo_rule = "- 첨부된 사진이 없으니 모든 섹션의 photo_index는 null로 둬.\n"
+
+    loc_line = f"위치: {location}\n" if location else "위치: (입력 안 함)\n"
+
+    prompt = (
+        "[페르소나]\n"
+        "너는 연인이 다녀온 데이트를 '네이버 블로그'에 올릴 진짜 경험 후기 포스트로 "
+        "다듬어주는 다정한 도우미야.\n\n"
+        "[가장 중요한 목표]\n"
+        "이 글은 '네이버 통합검색·AI 브리핑(하이퍼클로바X 기반)'이 인용하고, 네이버의 "
+        "'실제 방문 경험' 필터를 통과하도록 써야 해. 네이버 AI는 광고성·AI 티 나는 "
+        "일반론 글을 적극적으로 하위 노출시켜. 그러니 아래 규칙을 반드시 지켜:\n"
+        "1) 진짜 다녀온 1인칭 경험 톤으로. 아래 사용자의 '느낀점 원문'과 '사진 캡션'에 "
+        "적힌 실제 내용에만 근거해서 구체적·개인적으로 써. 과장된 마케팅 톤·상투적 "
+        "미사여구·일반론 금지.\n"
+        "2) 사용자가 주지 않은 사실(특히 정확한 가격·영업시간·메뉴 등)은 절대 지어내지 "
+        "마. 모르면 빼거나 '방문 시 확인'이라고 써.\n"
+        "3) answer-first: summary(요약)는 맨 앞에서 한줄평 + 결론을 먼저 준다.\n"
+        "4) 소제목(sections[].heading)은 사람들이 실제로 검색하는 말투로("
+        "예: '○○동 △△카페 위치·가는 길', '분위기·인테리어', '메뉴·가격', "
+        "'데이트 코스로 어때?', '총평').\n"
+        "5) info_block은 위치/가격대/이런 점 좋아요 같은 훑기 쉬운 label:value만, "
+        "아는 것만.\n"
+        "6) FAQ 2~3개(질문형이 AI 인용에 강함) — 실제 데이트 후기에서 궁금할 현실적 질문.\n"
+        "7) 별점: 총점 외에 맥락형 항목별 3~5개(예: 분위기/맛·메뉴/가성비/데이트적합도/"
+        "재방문의향 중 글 내용에 맞는 것).\n"
+        "8) 분량은 sections 본문 합계 대략 900~1400자. 검색어형 해시태그.\n\n"
+        "[사용자가 남긴 후기 원문]\n"
+        f"주제/장소: {topic}\n"
+        f"{loc_line}"
+        f"사용자가 매긴 총점: {overall_score}/10\n"
+        f"느낀점·특징(원문):\n{prose or '(원문 없음)'}\n\n"
+        "[첨부 사진과 그 설명(캡션)]\n"
+        f"{photo_block}\n\n"
+        "[사진 규칙]\n"
+        f"{photo_rule}\n"
+        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이 출력해:\n"
+        "{\n"
+        '  "title": "검색 의도를 담은 포스트 제목",\n'
+        '  "summary": "한줄평 + 총점 결론을 맨 앞에 담은 answer-first 요약(2~3문장)",\n'
+        '  "info_block": [{"label": "위치", "value": "..."}, '
+        '{"label": "이런 점 좋아요", "value": "..."}],\n'
+        '  "sections": [{"heading": "검색어형 소제목", "text": "실제 경험 톤 본문", '
+        '"photo_index": 0}],\n'
+        '  "ratings": [{"aspect": "분위기", "score": 8}],  // score 0~10 정수, 3~5개\n'
+        '  "faq": [{"q": "질문", "a": "답변"}],  // 2~3개\n'
+        '  "hashtags": ["#장소명", "#데이트"]\n'
+        "}"
+    )
+    try:
+        raw = _run_claude(prompt)
+        data = _extract_json(raw)
+        result = _normalize_review(data, photos)
+        if not result:
+            raise ValueError("empty review")
+        return result
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] blog review generation failed: {e}", file=sys.stderr)
+        return None
