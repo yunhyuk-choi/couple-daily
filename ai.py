@@ -936,19 +936,98 @@ def _clamp_score10(v, default=0):
     return max(0, min(10, n))
 
 
-def _normalize_review(data, photos):
-    """claude가 준 원본 dict를 렌더 가능한 일관 스키마로 정규화한다 (순수/오프라인).
+def _valid_crop(crop):
+    """[x,y,w,h] 정규화 크롭이 유효(4개 float·0..1·경계 안·양수)하면 리스트로, 아니면
+    None. 수동/구스키마 변환에서 넘어온 크롭 보존용(순수/오프라인)."""
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in crop)
+    except (TypeError, ValueError):
+        return None
+    if not all(0.0 <= v <= 1.0 for v in (x, y, w, h)):
+        return None
+    if w <= 0 or h <= 0 or x + w > 1.0001 or y + h > 1.0001:
+        return None
+    return [x, y, w, h]
 
-    claude 없이 가짜 dict로 바로 단위 테스트할 수 있게 분리했다. 규칙:
-      * 모든 문자열 .strip().
-      * title·summary 비면 최종 None(호출부에서 실패 처리).
-      * info_block: {label, value} 리스트, 둘 중 하나라도 비면 제거.
-      * sections: {heading, text, photo_index} 리스트, heading·text 모두 비면 제거.
-        photo_index는 0..len(photos)-1 범위일 때만 유지(아니면 null).
-      * ratings: {aspect, score} 최대 6개, aspect 비면 제거, score 0..10 클램프.
-      * faq: {q, a} 최대 4개, q·a 둘 중 하나라도 비면 제거.
-      * hashtags: 최대 10개, 공백 제거, 빈 것 제거, 앞에 # 없으면 붙임.
-      * 유효 섹션이 하나도 없으면 None.
+
+def _normalize_block(b, n_photos, _s):
+    """자유형 블록 하나를 타입별로 검증·정규화한다. 못 쓰면 None(호출부가 드롭).
+
+    지원 타입: para/heading/quote(text) · image(photo_index[,crop]) ·
+    info/ratings/faq(items). 알 수 없는 타입·빈 내용은 None.
+    """
+    if not isinstance(b, dict):
+        return None
+    t = _s(b.get("type")).lower()
+    if t in ("para", "heading", "quote"):
+        text = _s(b.get("text"))
+        return {"type": t, "text": text} if text else None
+    if t == "image":
+        pi = b.get("photo_index")
+        try:
+            pi = int(pi)
+        except (TypeError, ValueError):
+            return None
+        if pi < 0 or pi >= n_photos:
+            return None
+        blk = {"type": "image", "photo_index": pi}
+        crop = _valid_crop(b.get("crop"))
+        if crop:  # 수동/구스키마 변환에서 온 크롭을 보존
+            blk["crop"] = crop
+        return blk
+    if t == "info":
+        items = []
+        for it in (b.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            label = _s(it.get("label"))
+            value = _s(it.get("value"))
+            if label and value:
+                items.append({"label": label, "value": value})
+            if len(items) >= 8:
+                break
+        return {"type": "info", "items": items} if items else None
+    if t == "ratings":
+        items = []
+        for it in (b.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            aspect = _s(it.get("aspect"))
+            if not aspect:
+                continue
+            items.append({"aspect": aspect, "score": _clamp_score10(it.get("score"), 0)})
+            if len(items) >= 6:
+                break
+        return {"type": "ratings", "items": items} if items else None
+    if t == "faq":
+        items = []
+        for it in (b.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            q = _s(it.get("q"))
+            a = _s(it.get("a"))
+            if not q or not a:
+                continue
+            items.append({"q": q, "a": a})
+            if len(items) >= 6:
+                break
+        return {"type": "faq", "items": items} if items else None
+    return None
+
+
+def _normalize_review(data, photos, overall_score=0):
+    """claude가 준 자유형 블록 dict를 렌더 가능한 일관 스키마로 정규화(순수/오프라인).
+
+    새 스키마: ``{title, blocks:[{type,...}], hashtags:[..]}``. 블록은 AI가 자유롭게
+    구성·정렬한다. 규칙:
+      * 모든 문자열 .strip(). title 비면 None.
+      * blocks: 타입별 검증(_normalize_block), 못 쓰는 블록은 드롭. 최대 60개.
+      * AEO 필수요소 보강: ratings 블록이 하나도 없으면 overall_score에서 만들어
+        끝에 덧붙인다. info·faq가 없으면 프롬프트 실패지만 우아하게(로그만) 진행.
+      * hashtags: 최대 10개, 앞에 # 보장.
+      * title이 없거나 서술 콘텐츠(para/quote)가 전혀 없으면 None.
     """
     if not isinstance(data, dict):
         return None
@@ -959,67 +1038,15 @@ def _normalize_review(data, photos):
         return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
 
     title = _s(data.get("title"))
-    summary = _s(data.get("summary"))
 
-    # info_block
-    info = []
-    raw_info = data.get("info_block")
-    if isinstance(raw_info, list):
-        for it in raw_info:
-            if not isinstance(it, dict):
-                continue
-            label = _s(it.get("label"))
-            value = _s(it.get("value"))
-            if label and value:
-                info.append({"label": label, "value": value})
-
-    # sections
-    sections = []
-    raw_sections = data.get("sections")
-    if isinstance(raw_sections, list):
-        for it in raw_sections:
-            if not isinstance(it, dict):
-                continue
-            heading = _s(it.get("heading"))
-            text = _s(it.get("text"))
-            if not heading and not text:
-                continue
-            pi = it.get("photo_index")
-            try:
-                pi = int(pi)
-            except (TypeError, ValueError):
-                pi = None
-            if pi is None or pi < 0 or pi >= n_photos:
-                pi = None
-            sections.append({"heading": heading, "text": text, "photo_index": pi})
-
-    # ratings (최대 6)
-    ratings = []
-    raw_ratings = data.get("ratings")
-    if isinstance(raw_ratings, list):
-        for it in raw_ratings:
-            if not isinstance(it, dict):
-                continue
-            aspect = _s(it.get("aspect"))
-            if not aspect:
-                continue
-            ratings.append({"aspect": aspect, "score": _clamp_score10(it.get("score"), 0)})
-            if len(ratings) >= 6:
-                break
-
-    # faq (최대 4)
-    faq = []
-    raw_faq = data.get("faq")
-    if isinstance(raw_faq, list):
-        for it in raw_faq:
-            if not isinstance(it, dict):
-                continue
-            q = _s(it.get("q"))
-            a = _s(it.get("a"))
-            if not q or not a:
-                continue
-            faq.append({"q": q, "a": a})
-            if len(faq) >= 4:
+    blocks = []
+    raw_blocks = data.get("blocks")
+    if isinstance(raw_blocks, list):
+        for b in raw_blocks:
+            nb = _normalize_block(b, n_photos, _s)
+            if nb:
+                blocks.append(nb)
+            if len(blocks) >= 60:
                 break
 
     # hashtags (최대 10, # 보장)
@@ -1036,18 +1063,28 @@ def _normalize_review(data, photos):
             if len(hashtags) >= 10:
                 break
 
-    if not title or not summary or not sections:
+    if not title:
+        return None
+    has_text = any(b["type"] in ("para", "quote") for b in blocks)
+    if not has_text:
         return None
 
-    return {
-        "title": title,
-        "summary": summary,
-        "info_block": info,
-        "sections": sections,
-        "ratings": ratings,
-        "faq": faq,
-        "hashtags": hashtags,
-    }
+    # AEO 필수요소 보강: ratings 없으면 총점으로 하나 만들어 붙인다.
+    if not any(b["type"] == "ratings" for b in blocks):
+        blocks.append(
+            {
+                "type": "ratings",
+                "items": [
+                    {"aspect": "전체 만족도", "score": _clamp_score10(overall_score, 0)}
+                ],
+            }
+        )
+    if not any(b["type"] == "info" for b in blocks):
+        print("[ai] review missing info block — degraded", file=sys.stderr)
+    if not any(b["type"] == "faq" for b in blocks):
+        print("[ai] review missing faq block — degraded", file=sys.stderr)
+
+    return {"title": title, "blocks": blocks, "hashtags": hashtags}
 
 
 def write_review(topic, location, prose, overall_score, photos):
@@ -1085,14 +1122,14 @@ def write_review(topic, location, prose, overall_score, photos):
             photo_lines.append(line)
         photo_block = "\n".join(photo_lines)
         photo_rule = (
-            f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이야. 각 섹션의 "
-            "photo_index에는 그 단락과 가장 잘 맞는 사진의 번호(0-based)를 넣고, 붙일 "
-            "사진이 없으면 null로 둬. 없는 번호는 절대 쓰지 마. 사진 설명은 위 캡션에만 "
-            "근거하고 지어내지 마.\n"
+            f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이야. 사진을 넣고 "
+            "싶은 자리에 image 블록을 두고 photo_index에 그 자리에 가장 잘 맞는 사진 "
+            "번호(0-based)를 넣어. 없는 번호는 절대 쓰지 마. 굳이 모든 사진을 다 넣을 "
+            "필요는 없어. 사진 설명은 위 캡션에만 근거하고 지어내지 마.\n"
         )
     else:
         photo_block = "(첨부된 사진 없음)"
-        photo_rule = "- 첨부된 사진이 없으니 모든 섹션의 photo_index는 null로 둬.\n"
+        photo_rule = "- 첨부된 사진이 없으니 image 블록은 넣지 마.\n"
 
     loc_line = f"위치: {location}\n" if location else "위치: (입력 안 함)\n"
 
@@ -1113,9 +1150,9 @@ def write_review(topic, location, prose, overall_score, photos):
         "[말투 — 감성 후기 v2]\n"
         "- 존댓말 기반의 생생한 블로그 말투로 써. '~했어요', '~더라구요', "
         "'~추천드려요' 처럼 다녀온 사람이 도란도란 얘기하듯이. 따뜻하고 친근하게.\n"
-        "- 문장을 짧게 끊어. 한 문장 = 한 줄. summary와 각 sections[].text 안에서 "
-        "문장이 끝날 때마다 실제 줄바꿈 문자(\\n)로 줄을 나눠. 한 줄에 한 문장만 담아 "
-        "(빌더가 각 줄을 가운데 정렬된 한 줄로 렌더해). 한 섹션 text는 대략 3~5줄.\n"
+        "- 문장을 짧게 끊어. 한 문장 = 한 줄. para/quote text 안에서 문장이 끝날 "
+        "때마다 실제 줄바꿈 문자(\\n)로 줄을 나눠. 한 줄에 한 문장만 담아 (빌더가 각 "
+        "줄을 가운데 정렬된 한 줄로 렌더해). 한 para는 대략 3~5줄.\n"
         "- 짧은 줄 끝에는 마침표(.)를 웬만하면 붙이지 마. 진짜 블로거는 짧은 한 줄에 "
         "일일이 마침표를 안 찍어 — 마침표를 줄마다 찍으면 AI 티가 나. 좀 긴 문장이라 "
         "마침표가 읽기 편할 때만 예외적으로 붙여. 물음표(?)·느낌표(!)는 평소대로 써.\n"
@@ -1123,28 +1160,38 @@ def write_review(topic, location, prose, overall_score, photos):
         "🔥 😀 👍 💯 💕 같은 흔하고 촌스러운 이모지는 절대 쓰지 마. 소제목마다 붙는 "
         "장식 이모지는 시스템이 알아서 넣으니 넌 넣지 마.\n\n"
         "[강조 마크업 — 색은 쓰지 말고 '표시'만]\n"
-        "본문(summary·sections[].text) 안에서 강조하고 싶은 말은 아래 가벼운 기호로 "
-        "'감싸기'만 해. 실제 색상 코드·HTML·<span>은 절대 쓰지 마(빌더가 고정 팔레트로 "
-        "바꿔줘). 기호는 다음 네 가지만:\n"
+        "para/quote text 안에서 강조하고 싶은 말은 아래 가벼운 기호로 '감싸기'만 해. "
+        "실제 색상 코드·HTML·<span>은 절대 쓰지 마(빌더가 고정 팔레트로 바꿔줘). "
+        "기호는 다음 네 가지만:\n"
         "  *감정·상호·핵심어*  → 별표 하나로 감싸면 핑크 강조.\n"
         "  `가격·주차·시간 같은 팩트`  → 백틱으로 감싸면 파랑 팩트 강조.\n"
         "  ==진짜 인상 깊었던 한마디==  → 등호 두 개로 감싸면 형광펜.\n"
         "  **꼭 굵게**  → 별표 두 개로 감싸면 굵게.\n"
         "규칙: 한 줄에 강조는 최대 1~2개만. 남발하면 AI 티가 나서 역효과야. 기호는 "
-        "강조할 '단어/짧은 구'에만 딱 붙여서 감싸(줄 전체를 감싸지 마).\n\n"
-        "[구조·AEO 규칙]\n"
-        "3) answer-first: summary(요약)는 맨 앞에서 한줄평 + 결론을 먼저 준다. "
-        "위 말투대로 짧은 줄들(\\n)로 나눠서.\n"
-        "4) 소제목(sections[].heading)은 사람들이 실제로 검색하는 말투로("
-        "예: '○○동 △△카페 위치·가는 길', '분위기·인테리어', '메뉴·가격', "
-        "'데이트 코스로 어때?', '총평'). heading에는 강조 기호를 쓰지 마.\n"
-        "5) info_block은 훑기 쉬운 짧은 label:value만, 아는 것만(예: 분위기·웨이팅·"
-        "위치·가격대·이런 점 좋아요). value는 한 줄로 짧게. '방문 날짜'는 시스템이 "
-        "실제 날짜로 넣으니 넌 넣지 마.\n"
-        "6) FAQ 2~3개(질문형이 AI 인용에 강함) — 실제 데이트 후기에서 궁금할 현실적 질문.\n"
-        "7) 별점: 총점 외에 맥락형 항목별 3~5개(예: 분위기/맛·메뉴/가성비/데이트적합도/"
-        "재방문의향 중 글 내용에 맞는 것).\n"
-        "8) 분량은 sections 본문 합계 대략 900~1400자. 검색어형 해시태그.\n\n"
+        "강조할 '단어/짧은 구'에만 딱 붙여서 감싸(줄 전체를 감싸지 마). heading에는 "
+        "강조 기호를 쓰지 마(깔끔하게).\n\n"
+        "[글의 구성 — 자유형 블록, 매번 다르게]\n"
+        "글은 정해진 틀 없이 'blocks' 배열로 자유롭게 구성해. 아래 블록들을 네가 "
+        "원하는 순서로, 원하는 개수로 섞어(para/heading/image를 자연스럽게 교차). "
+        "고정된 뼈대(요약→소제목1→소제목2…)를 그대로 반복하지 말고, 이 후기만의 "
+        "각도·순서·소제목으로 매 생성마다 구성을 다르게 짜. 사용할 수 있는 블록:\n"
+        '  - {"type":"para","text":"본문(짧은 줄 \\n)"}\n'
+        '  - {"type":"heading","text":"검색어형 소제목"}\n'
+        '  - {"type":"image","photo_index":0}\n'
+        '  - {"type":"info","items":[{"label":"분위기","value":".."}]}\n'
+        '  - {"type":"ratings","items":[{"aspect":"분위기","score":9}]}\n'
+        '  - {"type":"faq","items":[{"q":"..","a":".."}]}\n'
+        '  - {"type":"quote","text":"한줄 총평"}\n\n'
+        "[반드시 지킬 것 — AEO]\n"
+        "- 맨 앞은 answer-first para로 시작하길 권장(한줄평+결론 먼저).\n"
+        "- info 블록 1개 이상: 훑기 쉬운 짧은 label:value(분위기·웨이팅·위치·가격대·"
+        "이런 점 좋아요 등, 아는 것만). '방문 날짜'는 시스템이 실제 날짜로 넣으니 넣지 마.\n"
+        "- ratings 블록 1개 이상: 총점 외 맥락형 항목별 3~5개(분위기/맛·메뉴/가성비/"
+        "데이트적합도/재방문의향 등 글에 맞는 것). score는 0~10 정수.\n"
+        "- faq 블록 1개 이상: 질문형 2~3개(AI 인용에 강함). 실제 궁금할 현실적 질문.\n"
+        "- heading은 사람들이 실제로 검색하는 말투로(예: '○○동 △△카페 위치·가는 길', "
+        "'분위기·인테리어', '메뉴·가격', '주차 되나요', '데이트 코스로 어때').\n"
+        "- 본문(para) 총량 대략 900~1400자. 검색어형 hashtags.\n\n"
         "[사용자가 남긴 후기 원문]\n"
         f"주제/장소: {topic}\n"
         f"{loc_line}"
@@ -1155,24 +1202,23 @@ def write_review(topic, location, prose, overall_score, photos):
         "[사진 규칙]\n"
         f"{photo_rule}\n"
         "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이 출력해. "
-        "text·summary 값 안의 줄바꿈은 JSON 문자열이므로 \\n 으로 이스케이프해:\n"
+        "text 값 안의 줄바꿈은 JSON 문자열이므로 \\n 으로 이스케이프해:\n"
         "{\n"
         '  "title": "검색 의도를 담은 포스트 제목",\n'
-        '  "summary": "한줄평 + 결론을 맨 앞에 담은 answer-first 요약. 짧은 줄들을 '
-        '\\n 으로 나눠서(강조 기호 사용 가능)",\n'
-        '  "info_block": [{"label": "분위기", "value": "..."}, '
-        '{"label": "웨이팅", "value": "..."}],\n'
-        '  "sections": [{"heading": "검색어형 소제목", "text": "짧은 문장들을 \\n으로 '
-        '나눈 실제 경험 톤 본문(강조 기호 사용)", "photo_index": 0}],\n'
-        '  "ratings": [{"aspect": "분위기", "score": 8}],  // score 0~10 정수, 3~5개\n'
-        '  "faq": [{"q": "질문", "a": "답변"}],  // 2~3개\n'
+        '  "blocks": [ {"type":"para","text":"answer-first 한줄평\\n결론"}, '
+        '{"type":"heading","text":"검색어형 소제목"}, '
+        '{"type":"para","text":"짧은 줄들 \\n 로"}, {"type":"image","photo_index":0}, '
+        '{"type":"info","items":[{"label":"분위기","value":".."}]}, '
+        '{"type":"ratings","items":[{"aspect":"분위기","score":9}]}, '
+        '{"type":"faq","items":[{"q":"..","a":".."}]}, '
+        '{"type":"quote","text":"한줄 총평"} ],\n'
         '  "hashtags": ["#장소명", "#데이트"]\n'
         "}"
     )
     try:
         raw = _run_claude(prompt)
         data = _extract_json(raw)
-        result = _normalize_review(data, photos)
+        result = _normalize_review(data, photos, overall_score)
         if not result:
             raise ValueError("empty review")
         return result

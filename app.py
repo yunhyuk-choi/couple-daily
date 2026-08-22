@@ -1679,23 +1679,54 @@ _generating_reviews_lock = threading.Lock()
 _generating_reviews: set[int] = set()
 
 
+def _crop_hint_for_image(blocks, idx):
+    """image 블록(blocks[idx]) 주변에서 크롭 힌트(그 사진이 말하는 대상)를 뽑는다.
+
+    가장 가까운 앞쪽 heading + 가장 가까운 para(앞쪽 우선, 없으면 뒤쪽)를 합쳐준다.
+    """
+    heading = ""
+    para = ""
+    for j in range(idx - 1, -1, -1):
+        b = blocks[j]
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "heading" and not heading:
+            heading = (b.get("text") or "").strip()
+        if b.get("type") == "para" and not para:
+            para = (b.get("text") or "").strip()
+        if heading and para:
+            break
+    if not para:
+        for j in range(idx + 1, len(blocks)):
+            b = blocks[j]
+            if isinstance(b, dict) and b.get("type") == "para":
+                para = (b.get("text") or "").strip()
+                break
+    return (heading + " — " + para).strip(" —").strip()
+
+
 def _attach_section_crops(result, photos_ordered):
-    """result['sections'] 각 항목에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
+    """result['blocks']의 각 image 블록에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
 
     유효 photo_index마다: 원본 바이트 → 표시 크기 → ``ai.suggest_crop``(비전으로
-    '이 단락이 말하는 대상' focus 박스) → ``compute_crop_rect``(결정론적 목표비율)
-    → ``sec['crop']``. suggest_crop이 None이어도 focus=None(중앙 크롭)으로 크롭을
-    저장해 서빙이 항상 랜드스케이프가 되게 한다. 사진당 실패는 그 사진만 크롭 없이
-    넘어간다(전체 실패로 번지지 않게). 각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로
-    직렬화한다(_run_claude에는 세마포어를 두지 않는다). 저장 원본은 손대지 않는다.
+    '이 사진이 말하는 대상' focus 박스, 힌트는 주변 heading·para) →
+    ``compute_crop_rect``(결정론적 목표비율) → ``block['crop']``. suggest_crop이
+    None이어도 focus=None(중앙 크롭)으로 크롭을 저장해 서빙이 항상 랜드스케이프가
+    되게 한다. 사진당 실패는 그 사진만 크롭 없이 넘어간다(전체 실패로 번지지 않게).
+    각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로 직렬화한다. 저장 원본은 안 건드린다.
     """
     if not result or not isinstance(result, dict):
         return
     photos_ordered = photos_ordered or []
     n = len(photos_ordered)
-    for sec in result.get("sections") or []:
+    blocks = result.get("blocks")
+    if not isinstance(blocks, list):
+        return
+    for i, blk in enumerate(blocks):
         try:
-            pi = sec.get("photo_index")
+            if not isinstance(blk, dict) or blk.get("type") != "image":
+                continue
+            pi = blk.get("photo_index")
             if not isinstance(pi, int) or pi < 0 or pi >= n:
                 continue
             p = photos_ordered[pi]
@@ -1710,9 +1741,7 @@ def _attach_section_crops(result, photos_ordered):
             if not dims:
                 continue  # Pillow 부재/디코드 실패 → 크롭 없이(다운스케일만 서빙)
             img_w, img_h = dims
-            hint = (
-                (sec.get("heading") or "") + " — " + (sec.get("text") or "")
-            ).strip()
+            hint = _crop_hint_for_image(blocks, i)
             name = p.original_name or p.filename or ""
             ext = os.path.splitext(name)[1].lower()
             _CAPTION_SEM.acquire()
@@ -1724,10 +1753,11 @@ def _attach_section_crops(result, photos_ordered):
             finally:
                 _CAPTION_SEM.release()
             rect = compute_crop_rect(img_w, img_h, focus, _BLOG_CROP_ASPECT)
-            sec["crop"] = [round(v, 4) for v in rect]
+            blk["crop"] = [round(v, 4) for v in rect]
         except Exception:  # noqa: BLE001 — 사진당 실패 격리(초안은 계속)
             log.exception(
-                "section crop 계산 실패 (photo_index=%s)", sec.get("photo_index")
+                "image crop 계산 실패 (photo_index=%s)", blk.get("photo_index")
+                if isinstance(blk, dict) else "?"
             )
             continue
 
@@ -1896,83 +1926,148 @@ def _strip_emph(v):
     return s
 
 
+def _ensure_blocks(ai_data):
+    """어떤 스키마의 review.ai든 새 자유형 blocks dict로 정규화해 돌려준다.
+
+    새 스키마(``blocks`` 있음)는 그대로 통과. 옛 스키마(summary/sections/
+    info_block/ratings/faq)는 blocks로 변환한다: summary→para, 각 section→
+    [heading?, para?, image?], info_block→info, ratings→ratings, faq→faq.
+    (마무리 quote는 빌더가 quote 블록이 없을 때 알아서 붙이므로 여기선 안 만든다.)
+    이후 빌더·크롭은 오직 ``blocks``만 다룬다. ai_data가 없으면 None. 원본을
+    변형하지 않게 새 dict를 만든다.
+    """
+    if not ai_data or not isinstance(ai_data, dict):
+        return None
+    title = (ai_data.get("title") or "").strip()
+    hashtags = [str(t).strip() for t in (ai_data.get("hashtags") or []) if str(t).strip()]
+
+    raw_blocks = ai_data.get("blocks")
+    if isinstance(raw_blocks, list):
+        return {"title": title, "blocks": list(raw_blocks), "hashtags": hashtags}
+
+    # --- 옛 스키마 → blocks 변환 ---
+    blocks = []
+    summary = (ai_data.get("summary") or "").strip()
+    if summary:
+        blocks.append({"type": "para", "text": summary})
+    for sec in ai_data.get("sections") or []:
+        if not isinstance(sec, dict):
+            continue
+        heading = (sec.get("heading") or "").strip()
+        text = (sec.get("text") or "").strip()
+        if heading:
+            blocks.append({"type": "heading", "text": heading})
+        if text:
+            blocks.append({"type": "para", "text": text})
+        pi = sec.get("photo_index")
+        if isinstance(pi, int):
+            blk = {"type": "image", "photo_index": pi}
+            crop = sec.get("crop")
+            if crop:
+                blk["crop"] = crop
+            blocks.append(blk)
+    info_items = [it for it in (ai_data.get("info_block") or []) if isinstance(it, dict)]
+    if info_items:
+        blocks.append({"type": "info", "items": info_items})
+    rating_items = [it for it in (ai_data.get("ratings") or []) if isinstance(it, dict)]
+    if rating_items:
+        blocks.append({"type": "ratings", "items": rating_items})
+    faq_items = [it for it in (ai_data.get("faq") or []) if isinstance(it, dict)]
+    if faq_items:
+        blocks.append({"type": "faq", "items": faq_items})
+    return {"title": title, "blocks": blocks, "hashtags": hashtags}
+
+
 def _review_copy_text(review):
     """review.ai(JSON) → 네이버에 그대로 붙여넣는 '플레인 텍스트' 블록.
 
-    이미지는 네이버에 붙여넣을 수 없으니 사진 자리에는 ``[사진 N] — 캡션`` 마커를
-    둔다(사진 순서대로 1부터 번호). 초안이 없으면 "".
+    자유형 blocks를 순서대로 평문화한다. 이미지는 네이버에 붙여넣을 수 없으니
+    사진 자리에는 ``[사진 N] — 캡션`` 마커를 둔다(사진 순서대로 1부터 번호).
+    강조 토큰은 제거. 초안이 없으면 "".
     """
-    ai_data = review.ai
-    if not ai_data:
+    data = _ensure_blocks(review.ai)
+    if not data:
         return ""
 
-    # 순서대로의 캡션(마커 옆에 붙일 설명). 준비된 캡션 없으면 "".
     captions = []
     for p in review.photos_ordered:
         cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
         captions.append(cap)
 
     lines = []
-    title = (ai_data.get("title") or "").strip()
-    summary = _strip_emph((ai_data.get("summary") or "").strip())
+    title = (data.get("title") or "").strip()
     if title:
         lines.append(title)
         lines.append("")
-    if summary:
-        lines.append(summary)
-    score = max(0, min(10, int(review.overall_score or 0)))
-    lines.append(f"⭐ 총점 {_star_bar(score)} ({score}/10)")
 
-    info = ai_data.get("info_block") or []
-    if info:
-        lines.append("")
-        lines.append("▶ 핵심 정보")
-        for it in info:
-            label = (it.get("label") or "").strip()
-            value = (it.get("value") or "").strip()
-            if label and value:
-                lines.append(f"· {label}: {value}")
-
-    for sec in ai_data.get("sections") or []:
-        heading = (sec.get("heading") or "").strip()
-        text = _strip_emph((sec.get("text") or "").strip())
-        if not heading and not text:
+    for blk in data.get("blocks") or []:
+        if not isinstance(blk, dict):
             continue
-        lines.append("")
-        if heading:
-            lines.append(heading)
-        if text:
-            lines.append(text)
-        pi = sec.get("photo_index")
-        if isinstance(pi, int) and 0 <= pi < len(captions):
-            cap = captions[pi]
-            marker = f"[사진 {pi + 1}]"
-            lines.append(f"{marker} — {cap}" if cap else marker)
+        t = blk.get("type")
+        if t == "para":
+            text = _strip_emph((blk.get("text") or "").strip())
+            if text:
+                lines.append("")
+                lines.append(text)
+        elif t == "heading":
+            heading = (blk.get("text") or "").strip()
+            if heading:
+                lines.append("")
+                lines.append(heading)
+        elif t == "quote":
+            text = _strip_emph((blk.get("text") or "").strip())
+            if text:
+                lines.append("")
+                lines.append(text)
+        elif t == "image":
+            pi = blk.get("photo_index")
+            if isinstance(pi, int) and 0 <= pi < len(captions):
+                cap = captions[pi]
+                marker = f"[사진 {pi + 1}]"
+                lines.append(f"{marker} — {cap}" if cap else marker)
+        elif t == "info":
+            items = [it for it in (blk.get("items") or []) if isinstance(it, dict)]
+            rows = []
+            for it in items:
+                label = (it.get("label") or "").strip()
+                value = (it.get("value") or "").strip()
+                if label and value:
+                    rows.append(f"· {label}: {value}")
+            if rows:
+                lines.append("")
+                lines.append("▶ 핵심 정보")
+                lines.extend(rows)
+        elif t == "ratings":
+            rows = []
+            for it in (blk.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                aspect = (it.get("aspect") or "").strip()
+                if not aspect:
+                    continue
+                rs = max(0, min(10, int(it.get("score") or 0)))
+                rows.append(f"· {aspect} {_star_bar(rs)} ({rs}/10)")
+            if rows:
+                lines.append("")
+                lines.append("⭐ 별점")
+                lines.extend(rows)
+        elif t == "faq":
+            rows = []
+            for it in (blk.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                q = (it.get("q") or "").strip()
+                a = (it.get("a") or "").strip()
+                if not q or not a:
+                    continue
+                rows.append(f"Q. {q}")
+                rows.append(f"A. {a}")
+            if rows:
+                lines.append("")
+                lines.append("❓ 자주 묻는 질문")
+                lines.extend(rows)
 
-    ratings = ai_data.get("ratings") or []
-    if ratings:
-        lines.append("")
-        lines.append("⭐ 별점")
-        for r in ratings:
-            aspect = (r.get("aspect") or "").strip()
-            if not aspect:
-                continue
-            rs = max(0, min(10, int(r.get("score") or 0)))
-            lines.append(f"· {aspect} {_star_bar(rs)} ({rs}/10)")
-
-    faq = ai_data.get("faq") or []
-    if faq:
-        lines.append("")
-        lines.append("❓ 자주 묻는 질문")
-        for f in faq:
-            q = (f.get("q") or "").strip()
-            a = (f.get("a") or "").strip()
-            if not q or not a:
-                continue
-            lines.append(f"Q. {q}")
-            lines.append(f"A. {a}")
-
-    hashtags = [t for t in (ai_data.get("hashtags") or []) if str(t).strip()]
+    hashtags = [t for t in (data.get("hashtags") or []) if str(t).strip()]
     if hashtags:
         lines.append("")
         lines.append(" ".join(str(t).strip() for t in hashtags))
@@ -2088,8 +2183,8 @@ def _review_copy_html(review):
     이스케이프(구조 태그만 직접 조립). 이미지는 공개 서명 URL(blog_img_url·절대)로
     — 인증 프록시(/memories/<id>/image) 금지. 초안이 없으면 "".
     """
-    ai_data = review.ai
-    if not ai_data:
+    data = _ensure_blocks(review.ai)
+    if not data:
         return ""
 
     def esc(v):
@@ -2100,18 +2195,8 @@ def _review_copy_html(review):
     CENTER = 'style="text-align:center;margin:0 0 6px;"'          # 본문 한 줄
     H3 = ('style="text-align:center;font-size:17px;font-weight:800;'
           'color:#222;margin:6px 0 14px;"')
-    # 소제목 장식 이모지 — 빌더가 섹션 인덱스로 순환(AI가 못 고른다).
+    # 소제목 장식 이모지 — 빌더가 heading 순서로 순환(AI가 못 고른다).
     MOTIFS = ["☕️", "🍰", "📷", "🌿", "🍽️", "🤍"]
-
-    def center_lines(raw):
-        """줄바꿈(\\n)으로 나눈 각 줄을 강조 적용된 가운데 <p>로."""
-        chunks = []
-        for ln in str(raw or "").replace("\r\n", "\n").split("\n"):
-            ln = ln.strip()
-            if not ln:
-                continue
-            chunks.append(f'<p {CENTER}>{_emph_html(ln)}</p>')
-        return chunks
 
     photos = review.photos_ordered
     score = max(0, min(10, int(review.overall_score or 0)))
@@ -2123,30 +2208,32 @@ def _review_copy_html(review):
 
     out = []
 
+    def add_hr():
+        """직전이 이미 HR이면 중복 방지, 아니면 구분선 추가."""
+        if out and out[-1] == HR:
+            return
+        out.append(HR)
+
+    def center_lines(raw):
+        for ln in str(raw or "").replace("\r\n", "\n").split("\n"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            out.append(f'<p {CENTER}>{_emph_html(ln)}</p>')
+
     # 1) 제목(가운데). 줄바꿈은 <br>로.
-    title = (ai_data.get("title") or "").strip()
+    title = (data.get("title") or "").strip()
     if title:
         title_html = "<br>".join(
-            _emph_html(t.strip()) for t in title.replace("\r\n", "\n").split("\n") if t.strip()
+            _emph_html(t.strip())
+            for t in title.replace("\r\n", "\n").split("\n") if t.strip()
         )
         out.append(
             '<h2 style="text-align:center;font-size:20px;font-weight:800;'
             f'line-height:1.5;color:#222;margin:6px 0 22px;">{title_html}</h2>'
         )
 
-    # 2) 헤더 정보 블록(표 아님, 가운데 줄들). AI info_block의 '방문 날짜'는 버리고
-    #    시스템이 계산한 실제 방문 날짜를 쓴다. 끝에 핑크 내돈내산 라인.
-    for it in ai_data.get("info_block") or []:
-        label = (it.get("label") or "").strip()
-        value = (it.get("value") or "").strip()
-        if not label or not value:
-            continue
-        if "방문" in label and ("날짜" in label or "일" in label):
-            continue  # 실제 계산값으로 대체 → AI값 무시
-        out.append(
-            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
-            f'<b>{esc(label)}</b> : {esc(value)}</p>'
-        )
+    # 2) 시스템 헤더 — 실제 방문 날짜 + 핑크 내돈내산 라인(항상, 위치 고정).
     if visit_ymd:
         out.append(
             f'<p style="text-align:center;margin:2px 0;line-height:2;">'
@@ -2156,52 +2243,36 @@ def _review_copy_html(review):
         '<p style="text-align:center;color:#e64980;font-weight:700;'
         'letter-spacing:1px;margin:12px 0 2px;">✱ 내돈내산 데이트 후기 ✱</p>'
     )
-
-    # 3) 구분선.
     out.append(HR)
 
-    # 4) 인트로 = summary를 가운데 짧은 줄들로.
-    out.extend(center_lines(ai_data.get("summary")))
-
-    # 5) 섹션 — 모티프 라인 + <h3> + 가운데 줄들 + 사진(공개 URL) + 구분선.
-    for idx, sec in enumerate(ai_data.get("sections") or []):
-        heading = (sec.get("heading") or "").strip()
-        text = (sec.get("text") or "").strip()
-        if not heading and not text:
-            continue
-        out.append(HR)
-        motif = MOTIFS[idx % len(MOTIFS)]
-        out.append(
-            '<p style="text-align:center;color:#c4c4c4;letter-spacing:3px;'
-            f'margin:22px 0 8px;">· · · {motif} · · ·</p>'
-        )
-        if heading:
-            out.append(f'<h3 {H3}>{esc(heading)}</h3>')
-        out.extend(center_lines(text))
-        pi = sec.get("photo_index")
-        if isinstance(pi, int) and 0 <= pi < len(photos):
-            p = photos[pi]
-            cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
-            alt = esc(cap or heading or "후기 사진")
-            # 생성 시 저장된 내용 인지 크롭(있으면)을 서명 URL에 실어 서버가 그 영역을
-            # 랜드스케이프로 잘라 서빙한다. 없으면(옛 후기) 크롭 없이 다운스케일만.
-            section_crop = sec.get("crop")
-            src = esc(blog_img_url(p, crop=section_crop))  # 공개 서명 절대 URL
-            out.append(
-                f'<p style="text-align:center;margin:14px 0 4px;">'
-                f'<img src="{src}" alt="{alt}" '
-                'style="max-width:100%;height:auto;border-radius:10px;"></p>'
-            )
-
-    # 6) 별점 표(타깃 스타일).
-    ratings = ai_data.get("ratings") or []
-    valid_ratings = [r for r in ratings if (r.get("aspect") or "").strip()]
-    if valid_ratings:
-        out.append(HR)
+    def render_info(items):
         rows = []
-        for r in valid_ratings:
-            aspect = (r.get("aspect") or "").strip()
-            rs = max(0, min(10, int(r.get("score") or 0)))
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            label = (it.get("label") or "").strip()
+            value = (it.get("value") or "").strip()
+            if not label or not value:
+                continue
+            if "방문" in label and ("날짜" in label or "일" in label):
+                continue  # 방문 날짜는 시스템 헤더가 담당 → AI값 무시(중복·지어냄 방지)
+            rows.append(
+                f'<p style="text-align:center;margin:2px 0;line-height:2;">'
+                f'<b>{esc(label)}</b> : {esc(value)}</p>'
+            )
+        if rows:
+            add_hr()
+            out.extend(rows)
+
+    def render_ratings(items):
+        rows = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            aspect = (it.get("aspect") or "").strip()
+            if not aspect:
+                continue
+            rs = max(0, min(10, int(it.get("score") or 0)))
             rows.append(
                 f'<tr><td style="padding:9px;">{esc(aspect)}</td>'
                 f'<td style="padding:9px;">{_star_bar(rs)} ({rs}/10)</td></tr>'
@@ -2210,6 +2281,7 @@ def _review_copy_html(review):
             f'<tr><td style="padding:9px;"><b>총점</b></td>'
             f'<td style="padding:9px;"><b>{_star_bar(score)} ({score}/10)</b></td></tr>'
         )
+        add_hr()
         out.append(
             '<table border="1" style="border-collapse:collapse;width:100%;'
             'font-size:14.5px;text-align:center;">'
@@ -2217,43 +2289,105 @@ def _review_copy_html(review):
             '<th style="padding:9px;">별점</th></tr>' + "".join(rows) + "</table>"
         )
 
-    # 7) 구분선 + 한줄 총평(가운데) + 방문월 footer(실제 날짜).
-    out.append(HR)
-    topic = (review.topic or "").strip()
-    if topic:
-        closing = (
-            f"{esc(topic)} 다녀온 진짜 후기였어요.<br>"
-            "여기 고민 중이라면 한 번 가보시길 추천드려요 🤍"
+    def render_faq(items):
+        faq_out = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            q = (it.get("q") or "").strip()
+            a = (it.get("a") or "").strip()
+            if not q or not a:
+                continue
+            faq_out.append(f'<p style="margin:2px 0;"><b>Q. {esc(q)}</b></p>')
+            faq_out.append(f'<p style="margin:2px 0 12px;">A. {esc(a)}</p>')
+        if faq_out:
+            add_hr()
+            out.append(f'<h3 {H3}>자주 묻는 질문</h3>')
+            out.extend(faq_out)
+
+    def render_quote(text):
+        add_hr()
+        body = "<br>".join(
+            _emph_html(ln.strip())
+            for ln in str(text or "").replace("\r\n", "\n").split("\n") if ln.strip()
         )
-    else:
-        closing = "다녀온 진짜 후기였어요.<br>좋은 데이트 되시길 추천드려요 🤍"
-    foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
-    out.append(
-        '<blockquote style="border:0;text-align:center;font-size:16px;'
-        f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
-        '<span style="display:block;color:#aaa;font-size:13px;'
-        f'margin-top:8px;">{foot}</span></blockquote>'
-    )
+        foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
+        out.append(
+            '<blockquote style="border:0;text-align:center;font-size:16px;'
+            f'color:#444;margin:8px 0;line-height:1.9;">{body}'
+            '<span style="display:block;color:#aaa;font-size:13px;'
+            f'margin-top:8px;">{foot}</span></blockquote>'
+        )
 
-    # 8) 구분선 + FAQ(좌측 정렬).
-    faq_out = []
-    for f in ai_data.get("faq") or []:
-        q = (f.get("q") or "").strip()
-        a = (f.get("a") or "").strip()
-        if not q or not a:
+    # 3) 블록을 순서대로 렌더.
+    motif_i = 0
+    has_quote = False
+    for blk in data.get("blocks") or []:
+        if not isinstance(blk, dict):
             continue
-        faq_out.append(f'<p style="margin:2px 0;"><b>Q. {esc(q)}</b></p>')
-        faq_out.append(f'<p style="margin:2px 0 12px;">A. {esc(a)}</p>')
-    if faq_out:
-        out.append(HR)
-        out.append(f'<h3 {H3}>자주 묻는 질문</h3>')
-        out.extend(faq_out)
+        t = blk.get("type")
+        if t == "heading":
+            heading = (blk.get("text") or "").strip()
+            if not heading:
+                continue
+            add_hr()
+            motif = MOTIFS[motif_i % len(MOTIFS)]
+            motif_i += 1
+            out.append(
+                '<p style="text-align:center;color:#c4c4c4;letter-spacing:3px;'
+                f'margin:22px 0 8px;">· · · {motif} · · ·</p>'
+            )
+            out.append(f'<h3 {H3}>{esc(heading)}</h3>')
+        elif t == "para":
+            center_lines(blk.get("text"))
+        elif t == "image":
+            pi = blk.get("photo_index")
+            if isinstance(pi, int) and 0 <= pi < len(photos):
+                p = photos[pi]
+                cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
+                alt = esc(cap or "후기 사진")
+                # 저장된 내용 인지/수동 크롭(있으면)을 서명 URL에 실어 서버가 그 영역을
+                # 잘라 서빙. 없으면(옛 후기) 크롭 없이 다운스케일만.
+                src = esc(blog_img_url(p, crop=blk.get("crop")))
+                out.append(
+                    f'<p style="text-align:center;margin:14px 0 4px;">'
+                    f'<img src="{src}" alt="{alt}" '
+                    'style="max-width:100%;height:auto;border-radius:10px;"></p>'
+                )
+        elif t == "info":
+            render_info(blk.get("items"))
+        elif t == "ratings":
+            render_ratings(blk.get("items"))
+        elif t == "faq":
+            render_faq(blk.get("items"))
+        elif t == "quote":
+            render_quote(blk.get("text"))
+            has_quote = True
 
-    # 9) 구분선 + 해시태그(가운데, 핑크).
-    hashtags = [str(t).strip() for t in (ai_data.get("hashtags") or []) if str(t).strip()]
+    # 4) quote 블록이 없으면 마무리 총평(주제 기반)을 붙여 방문월 footer를 보장.
+    if not has_quote:
+        topic = (review.topic or "").strip()
+        if topic:
+            closing = (
+                f"{esc(topic)} 다녀온 진짜 후기였어요.<br>"
+                "여기 고민 중이라면 한 번 가보시길 추천드려요 🤍"
+            )
+        else:
+            closing = "다녀온 진짜 후기였어요.<br>좋은 데이트 되시길 추천드려요 🤍"
+        add_hr()
+        foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
+        out.append(
+            '<blockquote style="border:0;text-align:center;font-size:16px;'
+            f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
+            '<span style="display:block;color:#aaa;font-size:13px;'
+            f'margin-top:8px;">{foot}</span></blockquote>'
+        )
+
+    # 5) 해시태그(가운데, 핑크).
+    hashtags = [str(t).strip() for t in (data.get("hashtags") or []) if str(t).strip()]
     if hashtags:
         joined = " ".join(esc(t) for t in hashtags)
-        out.append(HR)
+        add_hr()
         out.append(
             '<p style="text-align:center;color:#e0559b;font-weight:600;'
             f'margin:6px 0;">{joined}</p>'
@@ -5523,24 +5657,29 @@ def _register_routes(app: Flask):
         copy_html = _refresh_blog_img_tokens(
             review.edited_text or _review_copy_html(review)
         )
-        # 수동 크롭 조정 UI 재료 — 사진 + 저장된 크롭이 있는 섹션만. 뷰포트에 띄울
-        # '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 그대로 쓴다.
+        # 수동 크롭 조정 UI 재료 — image 블록마다(블록 인덱스 기준). 옛/새 스키마 모두
+        # _ensure_blocks로 통일해 블록 인덱스가 crop-save와 일치하게 한다. 뷰포트에
+        # 띄울 '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 쓴다.
         crop_sections = []
         if review.status == "ready" and review.ai:
+            data = _ensure_blocks(review.ai)
+            blocks = (data or {}).get("blocks") or []
             photos_ordered = review.photos_ordered
-            for i, sec in enumerate(review.ai.get("sections") or []):
-                pi = sec.get("photo_index")
-                crop = sec.get("crop")
-                if isinstance(pi, int) and 0 <= pi < len(photos_ordered) and crop:
-                    p = photos_ordered[pi]
-                    crop_sections.append(
-                        {
-                            "index": i,
-                            "heading": (sec.get("heading") or "").strip(),
-                            "img_url": blog_img_url(p),  # 크롭 없는 풀이미지
-                            "crop": crop,
-                        }
-                    )
+            for i, blk in enumerate(blocks):
+                if not isinstance(blk, dict) or blk.get("type") != "image":
+                    continue
+                pi = blk.get("photo_index")
+                if not (isinstance(pi, int) and 0 <= pi < len(photos_ordered)):
+                    continue
+                p = photos_ordered[pi]
+                crop_sections.append(
+                    {
+                        "index": i,  # 블록 인덱스(crop-save가 target)
+                        "heading": _crop_hint_for_image(blocks, i)[:40],
+                        "img_url": blog_img_url(p),  # 크롭 없는 풀이미지
+                        "crop": blk.get("crop") or [0.0, 0.0, 1.0, 1.0],
+                    }
+                )
         return render_template(
             "review_detail.html",
             review=review,
@@ -5666,13 +5805,14 @@ def _register_routes(app: Flask):
     @app.route("/reviews/<int:rid>/crop", methods=["POST"])
     @active_couple_required
     def review_crop_save(rid):
-        """한 섹션 사진의 '수동 크롭'을 저장한다(사용자가 사진 위치를 직접 조정).
+        """한 image 블록의 '수동 크롭'을 저장한다(사용자가 사진 위치를 직접 조정).
 
-        요청: section(0-based 섹션 인덱스) + crop='x,y,w,h'(정규화). 검증: 4개 float,
-        0..1·경계 안, 픽셀 비율 ≈ 4:3(사진 크기를 알 수 있을 때만 엄격). 통과하면
-        ``sections[i]['crop']``만 갱신해 ai_json에 다시 넣는다 — edited_text는 절대
-        건드리지 않는다(다음 렌더에서 _review_copy_html이 새 크롭을 &c=로 반영).
-        AJAX면 JSON, 아니면 상세로 리다이렉트. cross-couple 404·잘못된 입력 400.
+        요청: section(0-based '블록' 인덱스) + crop='x,y,w,h'(정규화). 검증: 4개 float,
+        0..1·경계 안, 대상이 image 블록, 픽셀 비율 ≈ 4:3(사진 크기를 알 수 있을 때만
+        엄격). 통과하면 해당 image 블록의 crop만 갱신해 ai_json에 다시 넣는다 —
+        edited_text는 절대 건드리지 않는다. 옛 스키마 후기는 _ensure_blocks로 blocks로
+        변환해 저장하므로 이후 blocks로 통일된다. AJAX면 JSON, 아니면 리다이렉트.
+        cross-couple 404·잘못된 입력 400.
         """
         u = current_user()
         review = db.session.get(BlogReview, rid)
@@ -5686,17 +5826,20 @@ def _register_routes(app: Flask):
             flash(msg, "error")
             return redirect(url_for("review_detail", rid=rid))
 
-        ai_data = review.ai
-        if not ai_data or not isinstance(ai_data.get("sections"), list):
+        # 옛/새 스키마를 blocks로 통일(블록 인덱스가 UI와 일치).
+        data = _ensure_blocks(review.ai)
+        if not data or not isinstance(data.get("blocks"), list):
             return _fail("아직 초안이 없어.", 400)
-        sections = ai_data["sections"]
+        blocks = data["blocks"]
 
         try:
             idx = int(request.form.get("section", ""))
         except (ValueError, TypeError):
-            return _fail("잘못된 섹션이야.", 400)
-        if idx < 0 or idx >= len(sections):
-            return _fail("잘못된 섹션이야.", 400)
+            return _fail("잘못된 블록이야.", 400)
+        if idx < 0 or idx >= len(blocks):
+            return _fail("잘못된 블록이야.", 400)
+        if not isinstance(blocks[idx], dict) or blocks[idx].get("type") != "image":
+            return _fail("이미지 블록이 아니야.", 400)
 
         parts = (request.form.get("crop") or "").split(",")
         if len(parts) != 4:
@@ -5718,13 +5861,13 @@ def _register_routes(app: Flask):
 
         # 픽셀 비율 검증(사진 크기를 알 수 있을 때만 — onedrive 조회 실패 시 관대).
         try:
-            pi = sections[idx].get("photo_index")
+            pi = blocks[idx].get("photo_index")
             photos_ordered = review.photos_ordered
             if isinstance(pi, int) and 0 <= pi < len(photos_ordered):
-                data, _c = onedrive.get_photo_content_cached(
+                pdata, _c = onedrive.get_photo_content_cached(
                     photos_ordered[pi].onedrive_item_id
                 )
-                dims = _image_display_size(data) if data else None
+                dims = _image_display_size(pdata) if pdata else None
             else:
                 dims = None
         except Exception:  # noqa: BLE001 — 크기 조회 실패는 관대(경계 검증은 이미 통과)
@@ -5736,16 +5879,17 @@ def _register_routes(app: Flask):
             if abs(aspect - _BLOG_CROP_ASPECT) > 0.03 * _BLOG_CROP_ASPECT:
                 return _fail("크롭 비율이 4:3이 아니야.", 400)
 
-        # 경계로 한 번 더 클램프 후 저장(edited_text는 손대지 않음).
+        # 경계로 한 번 더 클램프 후 저장(edited_text는 손대지 않음). 전체 blocks
+        # 스키마를 다시 써 넣어 옛 스키마 후기도 첫 저장에 blocks로 넘어간다.
         x = max(0.0, min(1.0, x))
         y = max(0.0, min(1.0, y))
         w = max(0.0, min(1.0 - x, w))
         h = max(0.0, min(1.0 - y, h))
-        sections[idx]["crop"] = [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
-        review.ai_json = json.dumps(ai_data, ensure_ascii=False)
+        blocks[idx]["crop"] = [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
+        review.ai_json = json.dumps(data, ensure_ascii=False)
         db.session.commit()
         if is_ajax:
-            return jsonify(ok=True, crop=sections[idx]["crop"])
+            return jsonify(ok=True, crop=blocks[idx]["crop"])
         flash("사진 위치를 저장했어.", "success")
         return redirect(url_for("review_detail", rid=review.id))
 
