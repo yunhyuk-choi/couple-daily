@@ -13,9 +13,11 @@ never with shell=True), so user answer text is treated purely as data. The CLI
 is invoked as a plain argv list.
 """
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 
 CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
 # Vision (reading an image off disk) is markedly slower than a text prompt on
@@ -386,6 +388,95 @@ def caption_image(image_path):
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] image captioning failed: {e}", file=sys.stderr)
         return None
+
+
+# suggest_crop이 임시파일로 떨굴 때 허용하는 확장자(claude Read가 여는 포맷).
+_CROP_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+
+
+def _normalize_crop_box(data):
+    """claude가 준 dict를 정규화 바운딩박스 [x,y,w,h](0..1)로 (순수/오프라인).
+
+    x/y/w/h를 float로 강제·0..1 클램프하고, 박스가 경계를 넘으면 w/h를 줄여 안으로
+    집어넣는다. w·h가 0 이하가 되면 못 쓰는 것으로 보고 None. claude 없이 가짜
+    dict로 바로 단위 테스트할 수 있게 분리했다.
+    """
+    if not isinstance(data, dict):
+        return None
+    try:
+        x = float(data.get("x"))
+        y = float(data.get("y"))
+        w = float(data.get("w"))
+        h = float(data.get("h"))
+    except (TypeError, ValueError):
+        return None
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0, w))
+    h = max(0.0, min(1.0, h))
+    if x + w > 1.0:
+        w = 1.0 - x
+    if y + h > 1.0:
+        h = 1.0 - y
+    if w <= 0.0 or h <= 0.0:
+        return None
+    return [x, y, w, h]
+
+
+def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg"):
+    """사진에서 '이 단락이 말하는 대상'이 담긴 가장 중요한 영역의 정규화 바운딩박스.
+
+    캡셔너와 '똑같은' 방식(임시파일 + ``claude -p`` 비전)으로 이미지를 claude에
+    보여주고, 랜드스케이프 크롭이 전경에 둬야 할 핵심 영역 [x,y,w,h](0..1, 폭/높이
+    기준)를 strict JSON으로 받는다. ``subject_hint``는 해당 섹션의 소제목+본문 일부
+    (무엇에 관한 단락인지)다. 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함).
+
+    동시성: 호출부(백그라운드 워커)가 캡션과 '같은' _CAPTION_SEM으로 직렬화한다 —
+    여기서는 세마포어를 잡지 않는다(_run_claude에도 추가하지 않는다).
+    ``target_aspect``는 프롬프트 참고용 힌트로만 넘긴다(강제 비율은 결정론적
+    ``compute_crop_rect``가 처리).
+    """
+    if not image_bytes:
+        return None
+    tmp_path = None
+    try:
+        suffix = ext if ext in _CROP_IMAGE_EXTS else ".jpg"
+        fd, tmp_path = tempfile.mkstemp(prefix="cd_crop_", suffix=suffix)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(image_bytes)
+
+        hint = (subject_hint or "").strip()[:400] or "(설명 없음)"
+        try:
+            aspect_txt = f"{float(target_aspect):.3g}"
+        except (TypeError, ValueError):
+            aspect_txt = "1.333"
+        prompt = (
+            f"다음 경로의 이미지 파일을 읽어서 보고 답해줘: {tmp_path}\n\n"
+            "너는 블로그 후기에 넣을 사진을 가로형(landscape)으로 자를 때, 어떤 부분을 "
+            "남겨야 할지 정해주는 도우미야. 이 사진이 실릴 단락은 아래 내용에 관한 "
+            "거야:\n"
+            f"[단락 주제] {hint}\n\n"
+            "이 단락이 말하는 '대상(주인공)'이 잘린 사진에서 가운데·전경에 오도록, "
+            "반드시 남겨야 할 가장 중요한 영역을 정규화 바운딩박스로 알려줘. 좌표는 "
+            "0~1 사이의 상대값이야: x·w는 사진 '가로폭' 기준, y·h는 '세로높이' 기준. "
+            "x=왼쪽에서의 시작, y=위에서의 시작, w=폭, h=높이. 대상이 화면 대부분을 "
+            "차지하면 큰 박스, 한쪽에 몰려 있으면 그 쪽으로 치우친 박스를 줘. "
+            f"참고로 최종 크롭 비율은 대략 {aspect_txt}:1(가로:세로)이 될 거야.\n\n"
+            "출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+            '{"x": 0.1, "y": 0.35, "w": 0.8, "h": 0.45}'
+        )
+        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT)
+        data = _extract_json(raw)
+        return _normalize_crop_box(data)
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        print(f"[ai] suggest_crop failed: {e}", file=sys.stderr)
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

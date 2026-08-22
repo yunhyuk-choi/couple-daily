@@ -91,6 +91,7 @@ DEFAULT_APP_NAME = os.environ.get("APP_NAME", "우리의 하루")
 try:  # pragma: no cover - 환경에 따라 분기
     from io import BytesIO as _BytesIO
     from PIL import Image as _PILImage  # type: ignore
+    from PIL import ImageOps as _PILImageOps  # type: ignore
 
     try:
         import pillow_heif as _pillow_heif  # type: ignore
@@ -101,6 +102,7 @@ try:  # pragma: no cover - 환경에 따라 분기
     _HEIC_OK = True
 except Exception:  # noqa: BLE001 - Pillow 자체가 없으면 변환 전체 비활성
     _PILImage = None  # type: ignore
+    _PILImageOps = None  # type: ignore
     _HEIC_OK = False
     log.info("app: Pillow 미탑재 — HEIC→JPEG 변환 비활성(원본 서빙)")
 
@@ -121,6 +123,108 @@ def _heic_to_jpeg(data):
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
         log.warning("HEIC→JPEG 변환 실패 — 원본 바이트로 폴백", exc_info=True)
         return None
+
+
+# 블로그 서빙 이미지 긴 변 상한(px) — 고화질이되 원본만큼 크지 않게.
+_BLOG_IMG_MAX_EDGE = 1280
+# 블로그 후기 이미지 크롭 목표 가로세로비(가로/세로). 4:3. 3/2·16/9로 자유 교체.
+_BLOG_CROP_ASPECT = 4 / 3
+
+
+def _image_display_size(data):
+    """이미지 바이트의 '표시 기준'(EXIF 방향 반영) (w, h)를 돌려준다. 실패 시 None.
+
+    compute_crop_rect가 쓸 실제 픽셀 크기 — claude가 본 것과 같은 방향으로 맞춘다.
+    """
+    if not _HEIC_OK or not _PILImage or not data:
+        return None
+    try:
+        with _PILImage.open(_BytesIO(data)) as im:
+            img = _PILImageOps.exif_transpose(im)
+            return (int(img.width), int(img.height))
+    except Exception:  # noqa: BLE001 - 손상·비이미지·미지원
+        return None
+
+
+def compute_crop_rect(img_w, img_h, focus_box, target_aspect):
+    """이미지 안에 들어가는 '가장 큰' target_aspect(가로/세로) 직사각형의 정규화
+    크롭 [x, y, w, h]를 돌려준다(x·w는 폭 기준, y·h는 높이 기준 0..1).
+
+    - 반환 직사각형의 '픽셀' 비율은 정확히 target_aspect(=가로/세로).
+    - focus_box(정규화 [x,y,w,h] 또는 None)가 있으면 크롭 중심을 focus 중심에
+      최대한 맞추고 이미지 경계 안으로 클램프한다. None이면 정중앙 크롭
+      (세로 원본이면 위아래를 대칭으로 잘라 가운데 가로 스트립).
+    - 업스케일·비율 왜곡 없음. 항상 경계 안(0<=x, 0<=y, x+w<=1, y+h<=1).
+    """
+    W = max(1.0, float(img_w or 0) or 1.0)
+    H = max(1.0, float(img_h or 0) or 1.0)
+    a = float(target_aspect) if target_aspect else (4 / 3)
+    if a <= 0:
+        a = 4 / 3
+
+    # 이미지 안에 들어가는 가장 큰 a-비율 픽셀 직사각형.
+    if W / H >= a:          # 이미지가 목표보다 넓음 → 높이에 걸림
+        crop_h = H
+        crop_w = a * H
+    else:                   # 이미지가 목표보다 높음(세로) → 폭에 걸림
+        crop_w = W
+        crop_h = W / a
+
+    # 크롭 중심을 focus 중심에 맞춤(없으면 정중앙).
+    if focus_box:
+        try:
+            fx, fy, fw, fh = (float(v) for v in focus_box)
+            cx = (fx + fw / 2.0) * W
+            cy = (fy + fh / 2.0) * H
+        except (TypeError, ValueError):
+            cx, cy = W / 2.0, H / 2.0
+    else:
+        cx, cy = W / 2.0, H / 2.0
+
+    x0 = cx - crop_w / 2.0
+    y0 = cy - crop_h / 2.0
+    # 경계 안으로 클램프.
+    x0 = max(0.0, min(W - crop_w, x0))
+    y0 = max(0.0, min(H - crop_h, y0))
+
+    return [x0 / W, y0 / H, crop_w / W, crop_h / H]
+
+
+def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE):
+    """블로그 서빙용으로 원본 바이트를 (선택적 크롭 →) 다운스케일한 JPEG로.
+
+    EXIF 방향 보정 → crop(정규화 [x,y,w,h], 있으면) → 긴 변 ≤ max_edge(업스케일
+    안 함, 비율 유지) → RGB → JPEG(quality 85, optimize). HEIC도 같은 open으로
+    처리(pillow_heif 등록됨). 어떤 이유로든 실패하면 None(호출부가 원본 폴백해
+    절대 500 안 나게). 저장 원본은 손대지 않는다(메모리 사본만).
+    """
+    if not _HEIC_OK or not _PILImage or not data:
+        return None
+    try:
+        resample = getattr(getattr(_PILImage, "Resampling", _PILImage), "LANCZOS")
+        with _PILImage.open(_BytesIO(data)) as im:
+            img = _PILImageOps.exif_transpose(im)
+            if crop:
+                try:
+                    x, y, w, h = (float(v) for v in crop)
+                except (TypeError, ValueError):
+                    x = None
+                if x is not None and w > 0 and h > 0:
+                    W, H = img.size
+                    left = int(max(0, min(W - 1, round(x * W))))
+                    top = int(max(0, min(H - 1, round(y * H))))
+                    right = int(max(left + 1, min(W, round((x + w) * W))))
+                    bottom = int(max(top + 1, min(H, round((y + h) * H))))
+                    img = img.crop((left, top, right, bottom))
+            img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
+            rgb = img.convert("RGB")
+            out = _BytesIO()
+            rgb.save(out, format="JPEG", quality=85, optimize=True)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
+        log.warning("blog-img 크롭/리사이즈 실패 — 원본 바이트로 폴백", exc_info=True)
+        return None
+
 
 # ---- Kakao OAuth 2.0 config (read from env; never hardcode secrets) ----
 KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY")
@@ -1554,6 +1658,59 @@ _generating_reviews_lock = threading.Lock()
 _generating_reviews: set[int] = set()
 
 
+def _attach_section_crops(result, photos_ordered):
+    """result['sections'] 각 항목에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
+
+    유효 photo_index마다: 원본 바이트 → 표시 크기 → ``ai.suggest_crop``(비전으로
+    '이 단락이 말하는 대상' focus 박스) → ``compute_crop_rect``(결정론적 목표비율)
+    → ``sec['crop']``. suggest_crop이 None이어도 focus=None(중앙 크롭)으로 크롭을
+    저장해 서빙이 항상 랜드스케이프가 되게 한다. 사진당 실패는 그 사진만 크롭 없이
+    넘어간다(전체 실패로 번지지 않게). 각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로
+    직렬화한다(_run_claude에는 세마포어를 두지 않는다). 저장 원본은 손대지 않는다.
+    """
+    if not result or not isinstance(result, dict):
+        return
+    photos_ordered = photos_ordered or []
+    n = len(photos_ordered)
+    for sec in result.get("sections") or []:
+        try:
+            pi = sec.get("photo_index")
+            if not isinstance(pi, int) or pi < 0 or pi >= n:
+                continue
+            p = photos_ordered[pi]
+            try:
+                data, _ctype = onedrive.get_photo_content(p.onedrive_item_id)
+            except onedrive.OneDriveError:
+                log.exception("crop: OneDrive fetch 실패 (photo=%s)", p.id)
+                data = None
+            if not data:
+                continue
+            dims = _image_display_size(data)
+            if not dims:
+                continue  # Pillow 부재/디코드 실패 → 크롭 없이(다운스케일만 서빙)
+            img_w, img_h = dims
+            hint = (
+                (sec.get("heading") or "") + " — " + (sec.get("text") or "")
+            ).strip()
+            name = p.original_name or p.filename or ""
+            ext = os.path.splitext(name)[1].lower()
+            _CAPTION_SEM.acquire()
+            try:
+                focus = ai.suggest_crop(data, hint, _BLOG_CROP_ASPECT, ext=ext)
+            except Exception:  # noqa: BLE001 — 비전 실패는 중앙 크롭으로 폴백
+                log.exception("suggest_crop raised (photo=%s)", p.id)
+                focus = None
+            finally:
+                _CAPTION_SEM.release()
+            rect = compute_crop_rect(img_w, img_h, focus, _BLOG_CROP_ASPECT)
+            sec["crop"] = [round(v, 4) for v in rect]
+        except Exception:  # noqa: BLE001 — 사진당 실패 격리(초안은 계속)
+            log.exception(
+                "section crop 계산 실패 (photo_index=%s)", sec.get("photo_index")
+            )
+            continue
+
+
 def generate_review(app, review_id):
     """백그라운드 워커: 한 BlogReview의 네이버 블로그 초안을 생성한다.
 
@@ -1574,9 +1731,11 @@ def generate_review(app, review_id):
                 prior_ok = review.ai is not None
 
                 # 순서대로 사진 재료(index/caption/tags)를 만든다. 준비된 캡션이
-                # 없는 사진은 caption ""(모델이 지어내지 않게).
+                # 없는 사진은 caption ""(모델이 지어내지 않게). 크롭 계산에도 쓰려고
+                # 순서 리스트를 한 번만 잡아둔다.
+                photos_ordered_list = review.photos_ordered
                 photos_arg = []
-                for i, p in enumerate(review.photos_ordered):
+                for i, p in enumerate(photos_ordered_list):
                     cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
                     photos_arg.append({"index": i, "caption": cap, "tags": p.tags_list})
 
@@ -1600,6 +1759,18 @@ def generate_review(app, review_id):
                         result = None
                 finally:
                     _CAPTION_SEM.release()
+
+                # 각 섹션 사진에 '내용 인지' 크롭을 계산해 result에 심는다(서빙 시
+                # 적용). 크롭 실패는 초안 저장을 막지 않는다(사진당 격리 + 여기서도
+                # 감싼다). suggest_crop은 위 write_review와 같은 _CAPTION_SEM으로
+                # 사진마다 직렬화된다.
+                if result:
+                    try:
+                        _attach_section_crops(result, photos_ordered_list)
+                    except Exception:  # noqa: BLE001 — belt & suspenders
+                        log.exception(
+                            "attach section crops failed (review=%s)", review_id
+                        )
 
                 # 행이 바뀌었을 수 있어 재조회.
                 review = db.session.get(BlogReview, review_id)
@@ -1793,50 +1964,80 @@ def _review_copy_text(review):
 _BLOG_IMG_TTL = int(os.environ.get("BLOG_IMG_TTL_HOURS", "24")) * 3600
 
 
-def _blog_img_sig(photo_id, exp):
+def _crop_str(crop):
+    """정규화 크롭 [x,y,w,h]를 URL·서명용 컴팩트 'x,y,w,h' 문자열로(3자리 반올림).
+
+    쓸 수 없으면 None. url_for로 인코딩하지 않고 이 문자열을 URL에 그대로 붙이므로
+    (쉼표는 쿼리에서 유효), 라우트가 되읽는 값·서명 대상·refresh 재서명이 모두
+    '같은' 문자열이 되어 서명이 어긋나지 않는다.
+    """
+    if not crop:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in crop)
+    except (TypeError, ValueError):
+        return None
+
+    def _f(v):
+        return f"{round(v, 3):g}"
+
+    return f"{_f(x)},{_f(y)},{_f(w)},{_f(h)}"
+
+
+def _blog_img_sig(photo_id, exp, crop_str=None):
     """공개 서명 이미지 URL용 HMAC 토큰(앱 SECRET_KEY 서명, 무상태·DB 컬럼 없음).
 
     id와 만료시각(exp, unix초)을 함께 서명해 토큰이 특정 시점 이후 무효가 되게
-    한다. 토큰이 곧 인가다 — 유효한 서명 + 미만료면 그 사진 하나를 공개로 노출한다.
-    ``blog_img`` 라우트가 constant-time으로 이 값과 대조하고 exp도 검사한다.
+    한다. 크롭이 있으면(``crop_str``) 크롭까지 서명에 포함해 크롭 변조를 막는다.
+    하위호환: 크롭이 없으면 '옛' 문자열 ``blogimg:{id}:{exp}`` 를 그대로 서명하므로
+    이미 발급된 (크롭 없는) URL도 계속 검증된다. 토큰이 곧 인가다 — 유효한 서명 +
+    미만료면 그 사진 하나를 공개로 노출한다.
     """
     secret = current_app.config["SECRET_KEY"]
     if isinstance(secret, str):
         secret = secret.encode("utf-8")
-    msg = f"blogimg:{photo_id}:{exp}".encode("utf-8")
+    if crop_str:
+        msg = f"blogimg:{photo_id}:{exp}:{crop_str}".encode("utf-8")
+    else:
+        msg = f"blogimg:{photo_id}:{exp}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
 
 
-def blog_img_url(photo, external=True):
+def blog_img_url(photo, crop=None, external=True):
     """공개(인증 불필요) 서명 이미지의 절대 https URL — 네이버/독자가 로그인 없이
     가져간다. ``_external=True``라 렌더 호스트 기준 절대 URL이 나온다.
 
-    렌더 시점 기준 ``_BLOG_IMG_TTL`` 초 뒤 만료되는 토큰을 발급한다."""
+    ``crop``(정규화 [x,y,w,h])이 주어지면 ``&c=x,y,w,h``를 붙이고 그 값까지 서명한다
+    (서버가 서빙 시 그 영역으로 크롭). 렌더 시점 기준 ``_BLOG_IMG_TTL`` 초 뒤 만료.
+    """
     exp = int(time.time()) + _BLOG_IMG_TTL
-    return url_for(
-        "blog_img",
-        photo_id=photo.id,
-        e=exp,
-        t=_blog_img_sig(photo.id, exp),
-        _external=external,
-    )
+    crop_str = _crop_str(crop)
+    sig = _blog_img_sig(photo.id, exp, crop_str)
+    url = url_for("blog_img", photo_id=photo.id, e=exp, t=sig, _external=external)
+    if crop_str:
+        # url_for로 넘기지 않고 직접 붙인다(쉼표 인코딩 방지 → 서명 문자열과 일치).
+        url += f"&c={crop_str}"
+    return url
 
 
 # /blog-img/<id> 를 (기존 ?e=..&t=.. 유무와 무관하게) 잡아내는 패턴 — 스킴/호스트
-# 접두와 경로는 보존하고 e·t 쿼리만 새로 교체/추가하기 위한 것. HTML 속성 안에서는
-# ``&``가 ``&amp;``로 이스케이프되므로 두 형태 모두 매칭한다(안 그러면 이미 토큰이
-# 박힌 src를 못 잡고 뒤에 두 번째 쿼리를 붙여 URL을 망가뜨린다).
-_BLOG_IMG_RE = re.compile(r"/blog-img/(\d+)(?:\?e=\d+&(?:amp;)?t=[0-9a-f]+)?")
+# 접두와 경로는 보존하고 e·t(·c) 쿼리만 새로 교체/추가하기 위한 것. HTML 속성
+# 안에서는 ``&``가 ``&amp;``로 이스케이프되므로 두 형태 모두 매칭한다(안 그러면
+# 이미 토큰이 박힌 src를 못 잡고 뒤에 두 번째 쿼리를 붙여 URL을 망가뜨린다).
+# 그룹2 = 선택적 크롭 문자열(x,y,w,h) — refresh가 보존·재서명한다.
+_BLOG_IMG_RE = re.compile(
+    r"/blog-img/(\d+)(?:\?e=\d+&(?:amp;)?t=[0-9a-f]+(?:&(?:amp;)?c=([0-9.,]+))?)?"
+)
 
 
 def _refresh_blog_img_tokens(html):
-    """HTML 안의 모든 ``/blog-img/<id>`` 를 '지금' 기준 신선한 ``?e=&t=`` 로 재작성.
+    """HTML 안의 모든 ``/blog-img/<id>`` 를 '지금' 기준 신선한 ``?e=&t=(&c=)`` 로 재작성.
 
     저장된 edited_text가 옛(이미 만료된) 토큰을 얼려버렸어도, 뷰 시점에 항상
-    유효한 토큰이 들어가게 한다. 스킴/호스트 접두와 ``/blog-img/<id>`` 경로는
-    그대로 두고 e·t 쿼리만 교체/추가한다. blog-img가 아닌 URL·주변 속성은 건드리지
-    않는다(정규식이 /blog-img/<id> 만 매칭). ``blog_img_url``이 애초에 신선한
-    토큰을 내므로 재생성 경로에는 무해·멱등하고, edited_text 경로를 커버한다.
+    유효한 토큰이 들어가게 한다. 스킴/호스트 접두와 ``/blog-img/<id>`` 경로,
+    그리고 ``c=`` 크롭 파라미터는 그대로 보존하고 e·t만 교체하되, 새 토큰은 크롭까지
+    포함해 재서명한다(크롭 URL도 계속 유효). blog-img가 아닌 URL·주변 속성은 건드리지
+    않는다. ``blog_img_url``이 애초에 신선한 토큰을 내므로 재생성 경로에는 무해·멱등.
 
     HTML 속성 컨텍스트라 ``&``는 ``&amp;``로 낸다(빌더의 이스케이프와 일치 →
     재작성 결과를 다시 돌려도 멱등).
@@ -1846,8 +2047,13 @@ def _refresh_blog_img_tokens(html):
 
     def _sub(m):
         pid = int(m.group(1))
+        crop_str = m.group(2)  # 없으면 None
         exp = int(time.time()) + _BLOG_IMG_TTL
-        return f"/blog-img/{pid}?e={exp}&amp;t={_blog_img_sig(pid, exp)}"
+        sig = _blog_img_sig(pid, exp, crop_str)
+        out = f"/blog-img/{pid}?e={exp}&amp;t={sig}"
+        if crop_str:
+            out += f"&amp;c={crop_str}"
+        return out
 
     return _BLOG_IMG_RE.sub(_sub, html)
 
@@ -1956,7 +2162,10 @@ def _review_copy_html(review):
             p = photos[pi]
             cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
             alt = esc(cap or heading or "후기 사진")
-            src = esc(blog_img_url(p))  # 공개 서명 절대 URL(인증 프록시 아님)
+            # 생성 시 저장된 내용 인지 크롭(있으면)을 서명 URL에 실어 서버가 그 영역을
+            # 랜드스케이프로 잘라 서빙한다. 없으면(옛 후기) 크롭 없이 다운스케일만.
+            section_crop = sec.get("crop")
+            src = esc(blog_img_url(p, crop=section_crop))  # 공개 서명 절대 URL
             out.append(
                 f'<p style="text-align:center;margin:14px 0 4px;">'
                 f'<img src="{src}" alt="{alt}" '
@@ -4106,9 +4315,10 @@ def _register_routes(app: Flask):
 
         ``@active_couple_required`` 없음(공개). ``?e=<exp>&t=<sig>``의 만료시각과
         HMAC 토큰을 ``hmac.compare_digest``로 대조하고(불일치/누락/만료 → 404),
-        토큰이 곧 인가라 어느 커플의 Photo든 로드한다. memory_image와 '똑같은'
-        HEIC→JPEG 변환을 재사용한다(non-HEIC는 통과). 방어적으로 변환 실패 →
-        원본 바이트, 조회 실패 → 404.
+        토큰이 곧 인가라 어느 커플의 Photo든 로드한다. 선택적 ``&c=x,y,w,h``(정규화
+        크롭)도 서명에 포함되므로 변조 시 404다. 바이트는 한 경로로 처리한다:
+        (크롭 →) 긴 변 ≤1280px 다운스케일 → JPEG(q85). HEIC도 같은 open으로 처리.
+        Pillow 실패 시 원본 바이트로 폴백(절대 500 안 남). 조회 실패 → 404.
 
         보안: 이 서명 URL은 (만료 전까지) 링크를 가진 누구에게나 그 사진 하나를
         공개로 노출한다 — 이 사진들은 공개 블로그에 게시되는 것이므로 허용된다.
@@ -4120,7 +4330,11 @@ def _register_routes(app: Flask):
             exp = int(request.args.get("e") or "")
         except (ValueError, TypeError):
             abort(404)
-        if not got or not hmac.compare_digest(got, _blog_img_sig(photo_id, exp)):
+        # 선택적 크롭 — 서명에 포함된다. URL에 붙인 원문 그대로 되읽어 서명 대조.
+        crop_str = request.args.get("c") or None
+        if not got or not hmac.compare_digest(
+            got, _blog_img_sig(photo_id, exp, crop_str)
+        ):
             abort(404)
         if exp <= int(time.time()):  # 만료 → 404(존재 누설 방지로 410 대신)
             abort(404)
@@ -4136,18 +4350,19 @@ def _register_routes(app: Flask):
             abort(404)  # OneDrive에서 사라짐
         if not ctype or not ctype.startswith("image/"):
             ctype = _content_type_for(photo.filename or photo.original_name)
-        # memory_image와 동일한 HEIC 판정 — 갤럭시·PC 브라우저가 못 보는 HEIC는
-        # JPEG로 변환해 서빙한다. 변환 실패(_heic_to_jpeg None) 시 원본 폴백.
-        name = photo.original_name or photo.filename or ""
-        ext = os.path.splitext(name)[1].lower()
-        web_ok = ctype in ("image/jpeg", "image/png", "image/webp", "image/gif")
-        is_heic = ctype in ("image/heic", "image/heif") or (
-            ext in (".heic", ".heif") and not web_ok
-        )
-        if is_heic:
-            jpeg = _heic_to_jpeg(data)
-            if jpeg is not None:
-                data, ctype = jpeg, "image/jpeg"
+        # 크롭 파싱(서명이 이미 검증된 값) — 4개 float, 아니면 크롭 없음.
+        crop = None
+        if crop_str:
+            parts = crop_str.split(",")
+            if len(parts) == 4:
+                try:
+                    crop = [float(v) for v in parts]
+                except ValueError:
+                    crop = None
+        # 단일 경로: (크롭 →) 다운스케일 → JPEG. HEIC도 여기서 열린다. 실패 시 원본.
+        processed = _blog_img_process(data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE)
+        if processed is not None:
+            data, ctype = processed, "image/jpeg"
         resp = app.response_class(data, mimetype=ctype)
         # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
         resp.headers["Cache-Control"] = "public, max-age=86400"
