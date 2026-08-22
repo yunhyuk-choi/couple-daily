@@ -1854,9 +1854,11 @@ def _refresh_blog_img_tokens(html):
 
 # 네이버 붙여넣기 폰트(페이스트 테스트용, 스왑 쉬움). 네이버가 이 패밀리 토큰을
 # 인식하면 그 폰트를 적용하고, 못 하면 무해하게 네이버 기본 폰트로 폴백한다.
-# (사용자가 네이버 에디터에서 '바른히피'를 봤다.) 플랫 본문이라 래퍼 <div>를 못
-# 써서, 빌더가 내는 모든 최상위 블록 요소의 인라인 style 맨 앞에 붙인다.
-_NAVER_FONT = "'나눔손글씨 바른히피','NanumBarunHippi',sans-serif"
+# 값은 네이버 에디터가 '나눔바른히피'에 실제로 쓰는 스택 그대로다
+# (--se-nanumbareunhipi-font-family). 이 값이 인라인 style="..." (쌍따옴표) 안에
+# 들어가므로 패밀리명은 반드시 홑따옴표('바른히피')로 감싼다 — 쌍따옴표면 속성이
+# 깨진다. 플랫 본문이라 래퍼 <div>를 못 써서 최상위 블록마다 붙인다.
+_NAVER_FONT = "se-nanumbareunhipi,arial,'바른히피',nanumbareunhipi,sans-serif,Meiryo"
 
 
 def _review_copy_html(review):
