@@ -48,130 +48,106 @@
 </div>
 
 {% elif review.status == 'ready' and review.ai %}
-{% set ai = review.ai %}
-{# 1) 인앱 웹뷰 미리보기 — 블로그처럼 #}
-<article class="review-webview">
-  <h2 class="rv-title">{{ ai.title }}</h2>
-  {% if ai.summary %}<p class="rv-summary">{{ ai.summary }}</p>{% endif %}
-
-  {% if ai.info_block %}
-  <div class="rv-info">
-    <div class="rv-info-head">▶ 핵심 정보</div>
-    <dl>
-      {% for it in ai.info_block %}
-      <div class="rv-info-row"><dt>{{ it.label }}</dt><dd>{{ it.value }}</dd></div>
-      {% endfor %}
-    </dl>
-  </div>
-  {% endif %}
-
-  {% for sec in ai.sections %}
-  <section class="rv-section">
-    {% if sec.heading %}<h3 class="rv-heading">{{ sec.heading }}</h3>{% endif %}
-    {% if sec.text %}<p class="rv-text">{{ sec.text }}</p>{% endif %}
-    {% if sec.photo_index is not none and sec.photo_index < photos|length %}
-    {% set sp = photos[sec.photo_index] %}
-    <figure class="rv-photo">
-      <img src="{{ url_for('memory_image', photo_id=sp.id) }}" loading="lazy"
-           alt="{{ sp.caption or '후기 사진' }}"
-           onload="this.classList.add('loaded'); this.closest('.rv-photo').classList.add('is-loaded')"
-           onerror="this.closest('.rv-photo').classList.add('is-error')" />
-      {% if sp.caption %}<figcaption>{{ sp.caption }}</figcaption>{% endif %}
-    </figure>
-    {% endif %}
-  </section>
-  {% endfor %}
-
-  {% if ai.ratings %}
-  <div class="rv-ratings">
-    <div class="rv-ratings-head">⭐ 별점</div>
-    {% for r in ai.ratings %}
-    <div class="rv-rating-row"><span class="rv-aspect">{{ r.aspect }}</span>{{ stars(r.score) }}</div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if ai.faq %}
-  <div class="rv-faq">
-    <div class="rv-faq-head">❓ 자주 묻는 질문</div>
-    {% for f in ai.faq %}
-    <div class="rv-faq-item">
-      <p class="rv-q">Q. {{ f.q }}</p>
-      <p class="rv-a">A. {{ f.a }}</p>
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if ai.hashtags %}
-  <p class="rv-hashtags">
-    {% for t in ai.hashtags %}<span>{{ t }}</span>{% endfor %}
-  </p>
-  {% endif %}
-</article>
-
-{# 2) 네이버 복사본 — 편집 가능한 텍스트 + 복사/저장 #}
+{# 네이버 붙여넣기용: '편집 가능한 미리보기 = 복사 원본'. 여기서 바로 고치고
+   '복사'하면 서식·사진까지 text/html로 네이버 스마트에디터에 붙는다. #}
 <div class="review-copy-wrap">
   <div class="rv-copy-head">
-    <strong>네이버 복사본</strong>
-    <span class="muted rv-copy-hint">네이버 글쓰기에 붙여넣고, [사진 N] 자리에 사진을 넣어줘.</span>
+    <strong>네이버 블로그 미리보기</strong>
+    <span class="muted rv-copy-hint">여기서 바로 수정할 수 있어. '복사'하면 서식·사진까지 네이버에 붙어.</span>
   </div>
-  <form method="post" action="{{ url_for('review_save_text', rid=review.id) }}" id="copy-form">
-    <textarea id="review-copy" name="text" rows="16" spellcheck="false">{{ copy_text }}</textarea>
-    <div class="rv-copy-actions">
-      <button type="button" class="btn primary sm" id="copy-btn">📋 복사</button>
-      <button type="submit" class="btn ghost sm">저장</button>
-      <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
-            style="margin-left:auto;"
-            onsubmit="return confirm('초안을 다시 만들까? 편집한 복사본은 새 초안으로 바뀌어.');">
-        <button type="submit" class="btn ghost sm">↻ 다시 생성</button>
-      </form>
-    </div>
-  </form>
+  <div id="review-copy" class="rv-editable" contenteditable="true" spellcheck="false">{{ copy_html | safe }}</div>
+  <p class="muted rv-copy-note">사진은 공개 링크로 들어가 있어 — 네이버가 알아서 불러와.</p>
+  <div class="rv-copy-actions">
+    <button type="button" class="btn primary sm" id="copy-btn">📋 복사 (서식 유지)</button>
+    <button type="button" class="btn ghost sm" id="save-btn">저장</button>
+    <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
+          style="margin-left:auto;"
+          onsubmit="return confirm('초안을 다시 만들까? 편집한 내용은 새 초안으로 바뀌어.');">
+      <button type="submit" class="btn ghost sm">↻ 다시 생성</button>
+    </form>
+  </div>
 </div>
 <div class="copy-toast" id="copy-toast" hidden>복사됨!</div>
 
 <script>
 (function () {
   var btn = document.getElementById('copy-btn');
-  var ta = document.getElementById('review-copy');
+  var saveBtn = document.getElementById('save-btn');
+  var box = document.getElementById('review-copy');
   var toast = document.getElementById('copy-toast');
-  var form = document.getElementById('copy-form');
-  if (!btn || !ta) return;
+  var saveUrl = {{ url_for('review_save_text', rid=review.id) | tojson }};
+  if (!btn || !box) return;
   function showToast(msg) {
     if (!toast) return;
     toast.textContent = msg;
     toast.hidden = false;
-    // 강제 리플로우 후 클래스 토글로 페이드 인
-    void toast.offsetWidth;
+    void toast.offsetWidth;  // 강제 리플로우 후 페이드 인
     toast.classList.add('show');
-    setTimeout(function () { toast.classList.remove('show'); toast.hidden = true; }, 1600);
+    setTimeout(function () { toast.classList.remove('show'); toast.hidden = true; }, 1800);
   }
+  function plainText() { return box.innerText || box.textContent || ''; }
   function saveQuiet() {
-    if (!form) return;
     try {
       var fd = new FormData();
-      fd.append('text', ta.value);
-      fetch(form.action, {
+      fd.append('text', box.innerHTML);  // 이제 HTML을 저장
+      fetch(saveUrl, {
         method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
     } catch (e) { /* best-effort */ }
   }
+  function legacyCopy() {
+    // contenteditable 전체 선택 → execCommand('copy')는 리치 텍스트째 복사한다.
+    try {
+      var sel = window.getSelection();
+      var range = document.createRange();
+      range.selectNodeContents(box);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      var ok = document.execCommand('copy');
+      sel.removeAllRanges();
+      if (ok) return true;
+    } catch (e) {}
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(plainText());
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
   btn.addEventListener('click', function () {
-    var text = ta.value;
-    function done() { showToast('복사됨!'); saveQuiet(); }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, function () {
-        ta.focus(); ta.select();
-        try { document.execCommand('copy'); } catch (e) {}
-        done();
+    var html = box.innerHTML;
+    var plain = plainText();
+    function done() { showToast('복사됨! 네이버 글쓰기에 붙여넣어줘 💕'); saveQuiet(); }
+    if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+      var htmlBlob = new Blob([html], { type: 'text/html' });
+      var textBlob = new Blob([plain], { type: 'text/plain' });
+      // (a) 먼저 Blob 값으로 시도.
+      navigator.clipboard.write([
+        new ClipboardItem({ 'text/html': htmlBlob, 'text/plain': textBlob })
+      ]).then(done, function () {
+        // (a') Safari는 ClipboardItem 값이 Promise여야 할 수 있다 — 재시도.
+        navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': Promise.resolve(htmlBlob),
+            'text/plain': Promise.resolve(textBlob)
+          })
+        ]).then(done, function () {
+          // (b) 그래도 안 되면 contenteditable 선택 + execCommand 폴백.
+          if (legacyCopy()) done();
+        });
       });
     } else {
-      ta.focus(); ta.select();
-      try { document.execCommand('copy'); } catch (e) {}
-      done();
+      // (b) ClipboardItem/clipboard.write 미지원 → 레거시 리치 복사.
+      if (legacyCopy()) done();
     }
   });
+  if (saveBtn) {
+    saveBtn.addEventListener('click', function () {
+      saveQuiet();
+      showToast('저장했어 💾');
+    });
+  }
 })();
 </script>
 {% endif %}
