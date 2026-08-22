@@ -153,6 +153,150 @@
   }
 })();
 </script>
+
+{% if crop_sections %}
+<style>
+  .rv-crop-panel { margin-top: 14px; }
+  .rv-crop-panel > summary {
+    cursor: pointer; font-weight: 700; padding: 8px 0; list-style: none;
+  }
+  .rv-crop-panel > summary::-webkit-details-marker { display: none; }
+  .rv-crop-panel > summary::before { content: "▸ "; }
+  .rv-crop-panel[open] > summary::before { content: "▾ "; }
+  .rv-crop-help { margin: 4px 0 12px; }
+  .rv-crop-list { display: flex; flex-direction: column; gap: 18px; }
+  .rv-crop-title { font-weight: 600; margin-bottom: 6px; }
+  .rv-crop-view {
+    position: relative; width: 100%; max-width: 420px; aspect-ratio: 4 / 3;
+    overflow: hidden; border-radius: 10px; background: #f2e9ee;
+    touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none;
+  }
+  .rv-crop-view.grabbing { cursor: grabbing; }
+  .rv-crop-img {
+    position: absolute; top: 0; left: 0; display: block; max-width: none;
+    will-change: transform; user-select: none; -webkit-user-drag: none;
+    pointer-events: none;
+  }
+  .rv-crop-status { font-size: 12px; margin-top: 5px; min-height: 1.1em; }
+</style>
+<details class="rv-crop-panel">
+  <summary>🖼 사진 위치 조정</summary>
+  <p class="muted rv-crop-help">잘린 사진의 위치가 어색하면 드래그해서 보여줄 부분을 맞춰줘. 손을 떼면 저장돼.</p>
+  <div class="rv-crop-list">
+    {% for cs in crop_sections %}
+    <div class="rv-crop-item" data-section="{{ cs.index }}" data-crop="{{ cs.crop | tojson }}">
+      {% if cs.heading %}<div class="rv-crop-title">{{ cs.heading }}</div>{% endif %}
+      <div class="rv-crop-view">
+        <img class="rv-crop-img" src="{{ cs.img_url }}"
+             alt="{{ cs.heading or '후기 사진' }}" draggable="false" />
+      </div>
+      <div class="rv-crop-status muted" aria-live="polite"></div>
+    </div>
+    {% endfor %}
+  </div>
+</details>
+
+<script>
+(function () {
+  var cropUrl = {{ url_for('review_crop_save', rid=review.id) | tojson }};
+  var items = document.querySelectorAll('.rv-crop-item');
+  if (!items.length) return;
+  var TARGET = 4 / 3;
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function round4(v) { return Math.round(v * 10000) / 10000; }
+
+  Array.prototype.forEach.call(items, function (item) {
+    var view = item.querySelector('.rv-crop-view');
+    var img = item.querySelector('.rv-crop-img');
+    var status = item.querySelector('.rv-crop-status');
+    var section = item.getAttribute('data-section');
+    var crop0 = null;
+    try { crop0 = JSON.parse(item.getAttribute('data-crop') || 'null'); } catch (e) {}
+
+    var axis = null;      // 'y' = portrait(세로팬), 'x' = landscape(가로팬), null = 팬 없음
+    var dispW = 0, dispH = 0, vpW = 0, vpH = 0, maxOffset = 0, offset = 0;
+    var dragging = false, startPos = 0, startOffset = 0, pid = null;
+
+    function layout() {
+      vpW = view.clientWidth; vpH = view.clientHeight;
+      var nW = img.naturalWidth, nH = img.naturalHeight;
+      if (!nW || !nH || !vpW || !vpH) return;
+      var ratio = nW / nH;
+      if (ratio < TARGET - 1e-4) {          // 세로 원본 → 폭 채우고 세로 팬
+        axis = 'y';
+        dispW = vpW; dispH = vpW * nH / nW;
+        img.style.width = vpW + 'px'; img.style.height = 'auto';
+        maxOffset = Math.max(0, dispH - vpH);
+        var y = (crop0 && crop0.length === 4) ? crop0[1] : ((maxOffset / 2) / (dispH || 1));
+        offset = clamp(y * dispH, 0, maxOffset);
+      } else if (ratio > TARGET + 1e-4) {   // 가로 원본 → 높이 채우고 가로 팬
+        axis = 'x';
+        dispH = vpH; dispW = vpH * nW / nH;
+        img.style.height = vpH + 'px'; img.style.width = 'auto';
+        maxOffset = Math.max(0, dispW - vpW);
+        var x = (crop0 && crop0.length === 4) ? crop0[0] : ((maxOffset / 2) / (dispW || 1));
+        offset = clamp(x * dispW, 0, maxOffset);
+      } else {                               // 이미 4:3 → 팬 불필요
+        axis = null; dispW = vpW; dispH = vpH; maxOffset = 0; offset = 0;
+        img.style.width = vpW + 'px'; img.style.height = 'auto';
+      }
+      render();
+    }
+    function render() {
+      if (axis === 'y') img.style.transform = 'translateY(' + (-offset) + 'px)';
+      else if (axis === 'x') img.style.transform = 'translateX(' + (-offset) + 'px)';
+      else img.style.transform = 'none';
+    }
+    function currentCrop() {
+      if (axis === 'y') return [0, round4(offset / dispH), 1, round4(vpH / dispH)];
+      if (axis === 'x') return [round4(offset / dispW), 0, round4(vpW / dispW), 1];
+      return [0, 0, 1, 1];
+    }
+    function save() {
+      var crop = currentCrop();
+      var fd = new FormData();
+      fd.append('section', section);
+      fd.append('crop', crop.join(','));
+      if (status) status.textContent = '저장 중…';
+      fetch(cropUrl, {
+        method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      }).then(function (r) { return r.ok ? r.json() : Promise.reject(r); })
+        .then(function (j) { if (status) status.textContent = (j && j.ok) ? '저장됨 ✓' : '저장 실패'; })
+        .catch(function () { if (status) status.textContent = '저장 실패 — 다시 시도해줘'; });
+    }
+
+    if (img.complete) layout();
+    img.addEventListener('load', layout);
+    window.addEventListener('resize', layout);
+
+    view.addEventListener('pointerdown', function (e) {
+      if (axis === null) return;
+      dragging = true; pid = e.pointerId;
+      startPos = (axis === 'y') ? e.clientY : e.clientX;
+      startOffset = offset;
+      view.classList.add('grabbing');
+      try { view.setPointerCapture(e.pointerId); } catch (_) {}
+      e.preventDefault();
+    });
+    view.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      var pos = (axis === 'y') ? e.clientY : e.clientX;
+      offset = clamp(startOffset - (pos - startPos), 0, maxOffset);
+      render();
+      e.preventDefault();
+    });
+    function endDrag() {
+      if (!dragging) return;
+      dragging = false; view.classList.remove('grabbing');
+      try { view.releasePointerCapture(pid); } catch (_) {}
+      save();
+    }
+    view.addEventListener('pointerup', endDrag);
+    view.addEventListener('pointercancel', endDrag);
+  });
+})();
+</script>
+{% endif %}
 {% endif %}
 
 <div class="review-detail-actions">
