@@ -1878,13 +1878,37 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .rv-copy-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 10px; }
 .rv-copy-head strong { color: var(--ink); }
 .rv-copy-hint { font-size: 0.82rem; }
-#review-copy {
-  width: 100%; min-height: 320px; resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.9rem; line-height: 1.65; color: var(--ink);
-  border: 1px solid var(--line); border-radius: 12px; padding: 12px;
-  background: var(--cream);
+/* 편집 가능한 미리보기 = 복사 원본. 블로그 글처럼 읽히게 + 핑크 강조 테두리. */
+.rv-editable {
+  width: 100%; min-height: 320px; box-sizing: border-box;
+  line-height: 1.72; color: var(--ink); word-break: break-word;
+  border: 2px solid var(--pink); border-radius: 14px; padding: 16px 14px;
+  background: var(--card); outline: none;
 }
+.rv-editable:focus { box-shadow: 0 0 0 3px var(--pink-soft); }
+.rv-editable h2 { font-size: 1.3rem; font-weight: 800; margin: 0 0 8px; color: var(--ink); }
+.rv-editable h3 {
+  font-size: 1.06rem; font-weight: 800; color: var(--ink);
+  margin: 18px 0 8px; padding-left: 10px; border-left: 3px solid var(--pink);
+}
+.rv-editable p { margin: 0 0 8px; }
+.rv-editable img {
+  display: block; max-width: 100%; height: auto; border-radius: 12px; margin: 6px 0;
+}
+.rv-editable table {
+  border-collapse: collapse; width: 100%; margin: 6px 0 12px; font-size: 0.92rem;
+}
+.rv-editable th, .rv-editable td {
+  border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top;
+}
+.rv-editable th { background: var(--pink-soft); color: var(--ink); }
+.rv-editable hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+.rv-editable blockquote {
+  margin: 14px 0; padding: 10px 14px; background: var(--cream);
+  border-left: 4px solid var(--pink); border-radius: 10px; color: var(--ink);
+}
+.rv-editable blockquote footer { margin-top: 6px; font-size: 0.84rem; color: var(--muted); }
+.rv-copy-note { font-size: 0.8rem; margin: 8px 0 0; }
 .rv-copy-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 /* 복사됨! 토스트 — 화면 하단 중앙 */
 .copy-toast {
