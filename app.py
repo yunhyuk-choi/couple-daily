@@ -151,8 +151,11 @@ def compute_crop_rect(img_w, img_h, focus_box, target_aspect):
     크롭 [x, y, w, h]를 돌려준다(x·w는 폭 기준, y·h는 높이 기준 0..1).
 
     - 반환 직사각형의 '픽셀' 비율은 정확히 target_aspect(=가로/세로).
-    - focus_box(정규화 [x,y,w,h] 또는 None)가 있으면 크롭 중심을 focus 중심에
-      최대한 맞추고 이미지 경계 안으로 클램프한다. None이면 정중앙 크롭
+    - focus_box(정규화 [x,y,w,h] 또는 None)가 있으면 크롭이 focus 박스를 최대한
+      '통째로 담도록'(CONTAIN) 축마다 독립 배치한다 — 중심만 맞추던 옛 방식은
+      크거나 가장자리에 붙은 대상을 잘랐다. 각 축에서 크롭 길이 L이 focus 구간을
+      담을 만큼 크면 focus를 크롭 안에 완전히 넣고(가능하면 가운데), 못 담으면
+      focus 중심에 맞춘다. 어느 경우든 이미지 경계로 클램프. None이면 정중앙 크롭
       (세로 원본이면 위아래를 대칭으로 잘라 가운데 가로 스트립).
     - 업스케일·비율 왜곡 없음. 항상 경계 안(0<=x, 0<=y, x+w<=1, y+h<=1).
     """
@@ -170,22 +173,40 @@ def compute_crop_rect(img_w, img_h, focus_box, target_aspect):
         crop_w = W
         crop_h = W / a
 
-    # 크롭 중심을 focus 중심에 맞춤(없으면 정중앙).
+    def _place(L, DIM, f0, f1):
+        """축 하나: 길이 L 크롭을 focus 구간 [f0,f1]을 최대한 담도록 배치(픽셀).
+
+        L이 구간을 담을 만큼 크면 focus를 크롭 안에 완전히 넣되 가능하면 가운데
+        (start=focus_center-L/2)로 두고 [f1-L, f0]로 클램프해 '완전 포함'을 보장한다.
+        못 담으면 focus 중심에 맞춘다. 마지막에 이미지 경계 [0, DIM-L]로 클램프.
+        """
+        fc = (f0 + f1) / 2.0
+        if L >= (f1 - f0):
+            start = fc - L / 2.0
+            # focus 전체를 담도록: start ∈ [f1 - L, f0].
+            lo, hi = f1 - L, f0
+            if lo > hi:  # 수치 안전(사실상 L>=폭이면 lo<=hi)
+                lo, hi = hi, lo
+            start = max(lo, min(hi, start))
+        else:
+            start = fc - L / 2.0  # 담을 수 없음 → 중심 맞춤
+        # 이미지 경계로 클램프(항상 in-bounds).
+        return max(0.0, min(DIM - L, start))
+
     if focus_box:
         try:
             fx, fy, fw, fh = (float(v) for v in focus_box)
-            cx = (fx + fw / 2.0) * W
-            cy = (fy + fh / 2.0) * H
+            fx0, fx1 = fx * W, (fx + fw) * W
+            fy0, fy1 = fy * H, (fy + fh) * H
+            x0 = _place(crop_w, W, fx0, fx1)
+            y0 = _place(crop_h, H, fy0, fy1)
         except (TypeError, ValueError):
-            cx, cy = W / 2.0, H / 2.0
+            x0 = max(0.0, min(W - crop_w, W / 2.0 - crop_w / 2.0))
+            y0 = max(0.0, min(H - crop_h, H / 2.0 - crop_h / 2.0))
     else:
-        cx, cy = W / 2.0, H / 2.0
-
-    x0 = cx - crop_w / 2.0
-    y0 = cy - crop_h / 2.0
-    # 경계 안으로 클램프.
-    x0 = max(0.0, min(W - crop_w, x0))
-    y0 = max(0.0, min(H - crop_h, y0))
+        # focus 없음 → 정중앙 크롭.
+        x0 = max(0.0, min(W - crop_w, W / 2.0 - crop_w / 2.0))
+        y0 = max(0.0, min(H - crop_h, H / 2.0 - crop_h / 2.0))
 
     return [x0 / W, y0 / H, crop_w / W, crop_h / H]
 
