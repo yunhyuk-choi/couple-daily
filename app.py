@@ -5523,11 +5523,30 @@ def _register_routes(app: Flask):
         copy_html = _refresh_blog_img_tokens(
             review.edited_text or _review_copy_html(review)
         )
+        # 수동 크롭 조정 UI 재료 — 사진 + 저장된 크롭이 있는 섹션만. 뷰포트에 띄울
+        # '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 그대로 쓴다.
+        crop_sections = []
+        if review.status == "ready" and review.ai:
+            photos_ordered = review.photos_ordered
+            for i, sec in enumerate(review.ai.get("sections") or []):
+                pi = sec.get("photo_index")
+                crop = sec.get("crop")
+                if isinstance(pi, int) and 0 <= pi < len(photos_ordered) and crop:
+                    p = photos_ordered[pi]
+                    crop_sections.append(
+                        {
+                            "index": i,
+                            "heading": (sec.get("heading") or "").strip(),
+                            "img_url": blog_img_url(p),  # 크롭 없는 풀이미지
+                            "crop": crop,
+                        }
+                    )
         return render_template(
             "review_detail.html",
             review=review,
             photos=review.photos_ordered,
             copy_html=copy_html,
+            crop_sections=crop_sections,
         )
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
@@ -5642,6 +5661,92 @@ def _register_routes(app: Flask):
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(ok=True)
         flash("복사본을 저장했어.", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/crop", methods=["POST"])
+    @active_couple_required
+    def review_crop_save(rid):
+        """한 섹션 사진의 '수동 크롭'을 저장한다(사용자가 사진 위치를 직접 조정).
+
+        요청: section(0-based 섹션 인덱스) + crop='x,y,w,h'(정규화). 검증: 4개 float,
+        0..1·경계 안, 픽셀 비율 ≈ 4:3(사진 크기를 알 수 있을 때만 엄격). 통과하면
+        ``sections[i]['crop']``만 갱신해 ai_json에 다시 넣는다 — edited_text는 절대
+        건드리지 않는다(다음 렌더에서 _review_copy_html이 새 크롭을 &c=로 반영).
+        AJAX면 JSON, 아니면 상세로 리다이렉트. cross-couple 404·잘못된 입력 400.
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+        def _fail(msg, code=400):
+            if is_ajax:
+                return jsonify(ok=False, error=msg), code
+            flash(msg, "error")
+            return redirect(url_for("review_detail", rid=rid))
+
+        ai_data = review.ai
+        if not ai_data or not isinstance(ai_data.get("sections"), list):
+            return _fail("아직 초안이 없어.", 400)
+        sections = ai_data["sections"]
+
+        try:
+            idx = int(request.form.get("section", ""))
+        except (ValueError, TypeError):
+            return _fail("잘못된 섹션이야.", 400)
+        if idx < 0 or idx >= len(sections):
+            return _fail("잘못된 섹션이야.", 400)
+
+        parts = (request.form.get("crop") or "").split(",")
+        if len(parts) != 4:
+            return _fail("잘못된 크롭 값이야.", 400)
+        try:
+            x, y, w, h = (float(p) for p in parts)
+        except ValueError:
+            return _fail("잘못된 크롭 값이야.", 400)
+
+        eps = 1e-6
+        if not (
+            all(0.0 - eps <= v <= 1.0 + eps for v in (x, y, w, h))
+            and w > eps
+            and h > eps
+            and x + w <= 1.0 + 1e-3
+            and y + h <= 1.0 + 1e-3
+        ):
+            return _fail("크롭이 이미지 밖으로 나갔어.", 400)
+
+        # 픽셀 비율 검증(사진 크기를 알 수 있을 때만 — onedrive 조회 실패 시 관대).
+        try:
+            pi = sections[idx].get("photo_index")
+            photos_ordered = review.photos_ordered
+            if isinstance(pi, int) and 0 <= pi < len(photos_ordered):
+                data, _c = onedrive.get_photo_content_cached(
+                    photos_ordered[pi].onedrive_item_id
+                )
+                dims = _image_display_size(data) if data else None
+            else:
+                dims = None
+        except Exception:  # noqa: BLE001 — 크기 조회 실패는 관대(경계 검증은 이미 통과)
+            dims = None
+        if dims:
+            W, H = dims
+            denom = h * H
+            aspect = (w * W) / denom if denom else 0.0
+            if abs(aspect - _BLOG_CROP_ASPECT) > 0.03 * _BLOG_CROP_ASPECT:
+                return _fail("크롭 비율이 4:3이 아니야.", 400)
+
+        # 경계로 한 번 더 클램프 후 저장(edited_text는 손대지 않음).
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.0, min(1.0 - x, w))
+        h = max(0.0, min(1.0 - y, h))
+        sections[idx]["crop"] = [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
+        review.ai_json = json.dumps(ai_data, ensure_ascii=False)
+        db.session.commit()
+        if is_ajax:
+            return jsonify(ok=True, crop=sections[idx]["crop"])
+        flash("사진 위치를 저장했어.", "success")
         return redirect(url_for("review_detail", rid=review.id))
 
     # ---- Web Push subscription management ----
