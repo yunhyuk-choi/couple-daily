@@ -1852,15 +1852,6 @@ def _refresh_blog_img_tokens(html):
     return _BLOG_IMG_RE.sub(_sub, html)
 
 
-# 네이버 붙여넣기 폰트(페이스트 테스트용, 스왑 쉬움). 네이버가 이 패밀리 토큰을
-# 인식하면 그 폰트를 적용하고, 못 하면 무해하게 네이버 기본 폰트로 폴백한다.
-# 값은 네이버 에디터가 '나눔바른히피'에 실제로 쓰는 스택 그대로다
-# (--se-nanumbareunhipi-font-family). 이 값이 인라인 style="..." (쌍따옴표) 안에
-# 들어가므로 패밀리명은 반드시 홑따옴표('바른히피')로 감싼다 — 쌍따옴표면 속성이
-# 깨진다. 플랫 본문이라 래퍼 <div>를 못 써서 최상위 블록마다 붙인다.
-_NAVER_FONT = "se-nanumbareunhipi,arial,'바른히피',nanumbareunhipi,sans-serif,Meiryo"
-
-
 def _review_copy_html(review):
     """review.ai(JSON) → 네이버 스마트에디터 ONE에 그대로 붙여넣는 HTML 본문.
 
@@ -1878,11 +1869,9 @@ def _review_copy_html(review):
         return str(escape(str(v or "").strip()))
 
     # --- 감성 후기 v2 팔레트/스타일(빌더가 고정 — AI는 색을 못 낸다) ---------
-    # 네이버 폰트를 모든 최상위 블록 인라인 style 맨 앞에 붙인다(페이스트 테스트).
-    FONT = f"font-family:{_NAVER_FONT};"
     HR = '<hr style="border:0;border-top:1px solid #e5e5e5;margin:26px 0;">'
-    CENTER = f'style="{FONT}text-align:center;margin:0 0 6px;"'   # 본문 한 줄
-    H3 = (f'style="{FONT}text-align:center;font-size:17px;font-weight:800;'
+    CENTER = 'style="text-align:center;margin:0 0 6px;"'          # 본문 한 줄
+    H3 = ('style="text-align:center;font-size:17px;font-weight:800;'
           'color:#222;margin:6px 0 14px;"')
     # 소제목 장식 이모지 — 빌더가 섹션 인덱스로 순환(AI가 못 고른다).
     MOTIFS = ["☕️", "🍰", "📷", "🌿", "🍽️", "🤍"]
@@ -1914,7 +1903,7 @@ def _review_copy_html(review):
             _emph_html(t.strip()) for t in title.replace("\r\n", "\n").split("\n") if t.strip()
         )
         out.append(
-            f'<h2 style="{FONT}text-align:center;font-size:20px;font-weight:800;'
+            '<h2 style="text-align:center;font-size:20px;font-weight:800;'
             f'line-height:1.5;color:#222;margin:6px 0 22px;">{title_html}</h2>'
         )
 
@@ -1928,16 +1917,16 @@ def _review_copy_html(review):
         if "방문" in label and ("날짜" in label or "일" in label):
             continue  # 실제 계산값으로 대체 → AI값 무시
         out.append(
-            f'<p style="{FONT}text-align:center;margin:2px 0;line-height:2;">'
+            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
             f'<b>{esc(label)}</b> : {esc(value)}</p>'
         )
     if visit_ymd:
         out.append(
-            f'<p style="{FONT}text-align:center;margin:2px 0;line-height:2;">'
+            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
             f'<b>방문 날짜</b> : {esc(visit_ymd)}</p>'
         )
     out.append(
-        f'<p style="{FONT}text-align:center;color:#e64980;font-weight:700;'
+        '<p style="text-align:center;color:#e64980;font-weight:700;'
         'letter-spacing:1px;margin:12px 0 2px;">✱ 내돈내산 데이트 후기 ✱</p>'
     )
 
@@ -1956,7 +1945,7 @@ def _review_copy_html(review):
         out.append(HR)
         motif = MOTIFS[idx % len(MOTIFS)]
         out.append(
-            f'<p style="{FONT}text-align:center;color:#c4c4c4;letter-spacing:3px;'
+            '<p style="text-align:center;color:#c4c4c4;letter-spacing:3px;'
             f'margin:22px 0 8px;">· · · {motif} · · ·</p>'
         )
         if heading:
@@ -1969,7 +1958,7 @@ def _review_copy_html(review):
             alt = esc(cap or heading or "후기 사진")
             src = esc(blog_img_url(p))  # 공개 서명 절대 URL(인증 프록시 아님)
             out.append(
-                f'<p style="{FONT}text-align:center;margin:14px 0 4px;">'
+                f'<p style="text-align:center;margin:14px 0 4px;">'
                 f'<img src="{src}" alt="{alt}" '
                 'style="max-width:100%;border-radius:10px;"></p>'
             )
@@ -1984,18 +1973,18 @@ def _review_copy_html(review):
             aspect = (r.get("aspect") or "").strip()
             rs = max(0, min(10, int(r.get("score") or 0)))
             rows.append(
-                f'<tr><td style="{FONT}padding:9px;">{esc(aspect)}</td>'
-                f'<td style="{FONT}padding:9px;">{_star_bar(rs)} ({rs}/10)</td></tr>'
+                f'<tr><td style="padding:9px;">{esc(aspect)}</td>'
+                f'<td style="padding:9px;">{_star_bar(rs)} ({rs}/10)</td></tr>'
             )
         rows.append(
-            f'<tr><td style="{FONT}padding:9px;"><b>총점</b></td>'
-            f'<td style="{FONT}padding:9px;"><b>{_star_bar(score)} ({score}/10)</b></td></tr>'
+            f'<tr><td style="padding:9px;"><b>총점</b></td>'
+            f'<td style="padding:9px;"><b>{_star_bar(score)} ({score}/10)</b></td></tr>'
         )
         out.append(
-            f'<table border="1" style="{FONT}border-collapse:collapse;width:100%;'
+            '<table border="1" style="border-collapse:collapse;width:100%;'
             'font-size:14.5px;text-align:center;">'
-            f'<tr style="background:#faf3f6;"><th style="{FONT}padding:9px;">항목</th>'
-            f'<th style="{FONT}padding:9px;">별점</th></tr>' + "".join(rows) + "</table>"
+            '<tr style="background:#faf3f6;"><th style="padding:9px;">항목</th>'
+            '<th style="padding:9px;">별점</th></tr>' + "".join(rows) + "</table>"
         )
 
     # 7) 구분선 + 한줄 총평(가운데) + 방문월 footer(실제 날짜).
@@ -2010,7 +1999,7 @@ def _review_copy_html(review):
         closing = "다녀온 진짜 후기였어요.<br>좋은 데이트 되시길 추천드려요 🤍"
     foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
     out.append(
-        f'<blockquote style="{FONT}border:0;text-align:center;font-size:16px;'
+        '<blockquote style="border:0;text-align:center;font-size:16px;'
         f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
         '<span style="display:block;color:#aaa;font-size:13px;'
         f'margin-top:8px;">{foot}</span></blockquote>'
@@ -2023,8 +2012,8 @@ def _review_copy_html(review):
         a = (f.get("a") or "").strip()
         if not q or not a:
             continue
-        faq_out.append(f'<p style="{FONT}margin:2px 0;"><b>Q. {esc(q)}</b></p>')
-        faq_out.append(f'<p style="{FONT}margin:2px 0 12px;">A. {esc(a)}</p>')
+        faq_out.append(f'<p style="margin:2px 0;"><b>Q. {esc(q)}</b></p>')
+        faq_out.append(f'<p style="margin:2px 0 12px;">A. {esc(a)}</p>')
     if faq_out:
         out.append(HR)
         out.append(f'<h3 {H3}>자주 묻는 질문</h3>')
@@ -2036,7 +2025,7 @@ def _review_copy_html(review):
         joined = " ".join(esc(t) for t in hashtags)
         out.append(HR)
         out.append(
-            f'<p style="{FONT}text-align:center;color:#e0559b;font-weight:600;'
+            '<p style="text-align:center;color:#e0559b;font-weight:600;'
             f'margin:6px 0;">{joined}</p>'
         )
 
