@@ -1960,7 +1960,7 @@ def _review_copy_html(review):
             out.append(
                 f'<p style="text-align:center;margin:14px 0 4px;">'
                 f'<img src="{src}" alt="{alt}" '
-                'style="max-width:100%;border-radius:10px;"></p>'
+                'style="max-width:100%;height:auto;border-radius:10px;"></p>'
             )
 
     # 6) 별점 표(타깃 스타일).
