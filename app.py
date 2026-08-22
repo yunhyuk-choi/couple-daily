@@ -1661,6 +1661,49 @@ def _star_bar(score):
     return "★" * full + "⯪" * half + "☆" * empty
 
 
+# --- 감성 후기 v2 인라인 강조 토큰 ------------------------------------------
+# AI는 색을 직접 내지 않고 아래 가벼운 토큰으로 '단어만' 감싼다. 빌더가 고정
+# 팔레트의 인라인 <span>으로 바꿔 일관성을 강제한다(AI-slop·색남발 방지).
+#   **굵게**     → <b>            (반드시 * 보다 먼저 파싱)
+#   *핑크*       → 감정·상호·핵심어 (#e64980)
+#   `파랑`       → 가격·주차·시간 등 팩트 (#1c7ed6)
+#   ==형광펜==   → 배경 하이라이트 (#ffec99)
+# 항상 escape(구조/스크립트 주입 차단) '먼저' 하고, 그 위에 토큰만 span으로
+# 치환한다. HTML escape는 * ` = 를 건드리지 않으므로 토큰은 그대로 남아 매칭된다.
+# 매칭 안 되는 기호는 이스케이프된 원문 그대로 남는다.
+_EMPH_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_EMPH_PINK_RE = re.compile(r"\*(.+?)\*", re.DOTALL)
+_EMPH_BLUE_RE = re.compile(r"`(.+?)`", re.DOTALL)
+_EMPH_MARK_RE = re.compile(r"==(.+?)==", re.DOTALL)
+
+
+def _emph_html(v):
+    """한 줄 텍스트를 HTML-escape 후 강조 토큰을 인라인 span으로 치환한다."""
+    s = str(escape(str(v or "")))
+    s = _EMPH_BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", s)
+    s = _EMPH_PINK_RE.sub(
+        lambda m: f'<span style="color:#e64980;font-weight:700;">{m.group(1)}</span>', s
+    )
+    s = _EMPH_BLUE_RE.sub(
+        lambda m: f'<span style="color:#1c7ed6;font-weight:700;">{m.group(1)}</span>', s
+    )
+    s = _EMPH_MARK_RE.sub(
+        lambda m: f'<span style="background-color:#ffec99;font-weight:600;">{m.group(1)}</span>',
+        s,
+    )
+    return s
+
+
+def _strip_emph(v):
+    """강조 토큰을 벗겨 순수 텍스트로(text/plain 폴백용)."""
+    s = str(v or "")
+    s = _EMPH_BOLD_RE.sub(lambda m: m.group(1), s)
+    s = _EMPH_PINK_RE.sub(lambda m: m.group(1), s)
+    s = _EMPH_BLUE_RE.sub(lambda m: m.group(1), s)
+    s = _EMPH_MARK_RE.sub(lambda m: m.group(1), s)
+    return s
+
+
 def _review_copy_text(review):
     """review.ai(JSON) → 네이버에 그대로 붙여넣는 '플레인 텍스트' 블록.
 
@@ -1679,7 +1722,7 @@ def _review_copy_text(review):
 
     lines = []
     title = (ai_data.get("title") or "").strip()
-    summary = (ai_data.get("summary") or "").strip()
+    summary = _strip_emph((ai_data.get("summary") or "").strip())
     if title:
         lines.append(title)
         lines.append("")
@@ -1700,7 +1743,7 @@ def _review_copy_text(review):
 
     for sec in ai_data.get("sections") or []:
         heading = (sec.get("heading") or "").strip()
-        text = (sec.get("text") or "").strip()
+        text = _strip_emph((sec.get("text") or "").strip())
         if not heading and not text:
             continue
         lines.append("")
@@ -1825,50 +1868,89 @@ def _review_copy_html(review):
     def esc(v):
         return str(escape(str(v or "").strip()))
 
-    photos = review.photos_ordered
-    out = []
-    SPACER = "<p><br></p>"  # 스마트에디터는 margin을 무시 → 빈 문단으로 간격을 준다.
+    # --- 감성 후기 v2 팔레트/스타일(빌더가 고정 — AI는 색을 못 낸다) ---------
+    HR = '<hr style="border:0;border-top:1px solid #e5e5e5;margin:26px 0;">'
+    CENTER = 'style="text-align:center;margin:0 0 6px;"'          # 본문 한 줄
+    H3 = ('style="text-align:center;font-size:17px;font-weight:800;'
+          'color:#222;margin:6px 0 14px;"')
+    # 소제목 장식 이모지 — 빌더가 섹션 인덱스로 순환(AI가 못 고른다).
+    MOTIFS = ["☕️", "🍰", "📷", "🌿", "🍽️", "🤍"]
 
+    def center_lines(raw):
+        """줄바꿈(\\n)으로 나눈 각 줄을 강조 적용된 가운데 <p>로."""
+        chunks = []
+        for ln in str(raw or "").replace("\r\n", "\n").split("\n"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            chunks.append(f'<p {CENTER}>{_emph_html(ln)}</p>')
+        return chunks
+
+    photos = review.photos_ordered
+    score = max(0, min(10, int(review.overall_score or 0)))
+
+    # 실제 방문 날짜(AI가 아닌 리뷰 날짜에서 계산 — footer와 같은 원천).
+    created = review.created_at
+    visit_ymd = f"{created.year}년 {created.month}월" if created else ""
+    visit_foot = created.strftime("%Y. %m") if created else ""
+
+    out = []
+
+    # 1) 제목(가운데). 줄바꿈은 <br>로.
     title = (ai_data.get("title") or "").strip()
     if title:
-        out.append(f"<h2>{esc(title)}</h2>")
+        title_html = "<br>".join(
+            _emph_html(t.strip()) for t in title.replace("\r\n", "\n").split("\n") if t.strip()
+        )
+        out.append(
+            '<h2 style="text-align:center;font-size:20px;font-weight:800;'
+            f'line-height:1.5;color:#222;margin:6px 0 22px;">{title_html}</h2>'
+        )
 
-    # 요약/한줄평 + 총점 별점. 한줄평은 <b>로 강조.
-    score = max(0, min(10, int(review.overall_score or 0)))
-    stars = f"{_star_bar(score)} ({score}/10)"
-    summary = (ai_data.get("summary") or "").strip()
-    if summary:
-        out.append(f"<p><b>{esc(summary)}</b><br>⭐ {stars}</p>")
-    else:
-        out.append(f"<p>⭐ {stars}</p>")
-    out.append(SPACER)
-
-    # info_block → 검증된 컴포넌트인 표로(헤더행 "정보").
-    info_rows = []
+    # 2) 헤더 정보 블록(표 아님, 가운데 줄들). AI info_block의 '방문 날짜'는 버리고
+    #    시스템이 계산한 실제 방문 날짜를 쓴다. 끝에 핑크 내돈내산 라인.
     for it in ai_data.get("info_block") or []:
         label = (it.get("label") or "").strip()
         value = (it.get("value") or "").strip()
-        if label and value:
-            info_rows.append(
-                f"<tr><td><b>{esc(label)}</b></td><td>{esc(value)}</td></tr>"
-            )
-    if info_rows:
+        if not label or not value:
+            continue
+        if "방문" in label and ("날짜" in label or "일" in label):
+            continue  # 실제 계산값으로 대체 → AI값 무시
         out.append(
-            '<table border="1" style="border-collapse:collapse;">'
-            '<tr><th colspan="2">정보</th></tr>' + "".join(info_rows) + "</table>"
+            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
+            f'<b>{esc(label)}</b> : {esc(value)}</p>'
         )
-        out.append(SPACER)
+    if visit_ymd:
+        out.append(
+            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
+            f'<b>방문 날짜</b> : {esc(visit_ymd)}</p>'
+        )
+    out.append(
+        '<p style="text-align:center;color:#e64980;font-weight:700;'
+        'letter-spacing:1px;margin:12px 0 2px;">✱ 내돈내산 데이트 후기 ✱</p>'
+    )
 
-    # 본문 섹션 — 제목 + 문단, photo_index면 그 사진을 공개 URL <img>로 삽입.
-    for sec in ai_data.get("sections") or []:
+    # 3) 구분선.
+    out.append(HR)
+
+    # 4) 인트로 = summary를 가운데 짧은 줄들로.
+    out.extend(center_lines(ai_data.get("summary")))
+
+    # 5) 섹션 — 모티프 라인 + <h3> + 가운데 줄들 + 사진(공개 URL) + 구분선.
+    for idx, sec in enumerate(ai_data.get("sections") or []):
         heading = (sec.get("heading") or "").strip()
         text = (sec.get("text") or "").strip()
         if not heading and not text:
             continue
+        out.append(HR)
+        motif = MOTIFS[idx % len(MOTIFS)]
+        out.append(
+            '<p style="text-align:center;color:#c4c4c4;letter-spacing:3px;'
+            f'margin:22px 0 8px;">· · · {motif} · · ·</p>'
+        )
         if heading:
-            out.append(f"<h3>{esc(heading)}</h3>")
-        if text:
-            out.append(f"<p>{esc(text)}</p>")
+            out.append(f'<h3 {H3}>{esc(heading)}</h3>')
+        out.extend(center_lines(text))
         pi = sec.get("photo_index")
         if isinstance(pi, int) and 0 <= pi < len(photos):
             p = photos[pi]
@@ -1876,66 +1958,76 @@ def _review_copy_html(review):
             alt = esc(cap or heading or "후기 사진")
             src = esc(blog_img_url(p))  # 공개 서명 절대 URL(인증 프록시 아님)
             out.append(
-                f'<img src="{src}" width="600" height="400" alt="{alt}">'
+                f'<p style="text-align:center;margin:14px 0 4px;">'
+                f'<img src="{src}" alt="{alt}" '
+                'style="max-width:100%;border-radius:10px;"></p>'
             )
-            out.append(SPACER)
 
-    # 별점 표 — 총평 앞에 구분선. 항목/별점 헤더 + 항목별 행 + 총점 행.
+    # 6) 별점 표(타깃 스타일).
     ratings = ai_data.get("ratings") or []
-    if ratings:
-        out.append("<hr>")
+    valid_ratings = [r for r in ratings if (r.get("aspect") or "").strip()]
+    if valid_ratings:
+        out.append(HR)
         rows = []
-        for r in ratings:
+        for r in valid_ratings:
             aspect = (r.get("aspect") or "").strip()
-            if not aspect:
-                continue
             rs = max(0, min(10, int(r.get("score") or 0)))
             rows.append(
-                f"<tr><td>{esc(aspect)}</td>"
-                f"<td>{_star_bar(rs)} ({rs}/10)</td></tr>"
+                f'<tr><td style="padding:9px;">{esc(aspect)}</td>'
+                f'<td style="padding:9px;">{_star_bar(rs)} ({rs}/10)</td></tr>'
             )
         rows.append(
-            f"<tr><td><b>총점</b></td>"
-            f"<td>{_star_bar(score)} ({score}/10)</td></tr>"
+            f'<tr><td style="padding:9px;"><b>총점</b></td>'
+            f'<td style="padding:9px;"><b>{_star_bar(score)} ({score}/10)</b></td></tr>'
         )
         out.append(
-            '<table border="1" style="border-collapse:collapse;">'
-            '<tr><th>항목</th><th>별점</th></tr>' + "".join(rows) + "</table>"
+            '<table border="1" style="border-collapse:collapse;width:100%;'
+            'font-size:14.5px;text-align:center;">'
+            '<tr style="background:#faf3f6;"><th style="padding:9px;">항목</th>'
+            '<th style="padding:9px;">별점</th></tr>' + "".join(rows) + "</table>"
         )
-        out.append(SPACER)
 
-    # FAQ (AEO용).
-    faq = ai_data.get("faq") or []
+    # 7) 구분선 + 한줄 총평(가운데) + 방문월 footer(실제 날짜).
+    out.append(HR)
+    topic = (review.topic or "").strip()
+    if topic:
+        closing = (
+            f"{esc(topic)} 다녀온 진짜 후기였어요.<br>"
+            "여기 고민 중이라면 한 번 가보시길 추천드려요 🤍"
+        )
+    else:
+        closing = "다녀온 진짜 후기였어요.<br>좋은 데이트 되시길 추천드려요 🤍"
+    foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
+    out.append(
+        '<blockquote style="border:0;text-align:center;font-size:16px;'
+        f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
+        '<span style="display:block;color:#aaa;font-size:13px;'
+        f'margin-top:8px;">{foot}</span></blockquote>'
+    )
+
+    # 8) 구분선 + FAQ(좌측 정렬).
     faq_out = []
-    for f in faq:
+    for f in ai_data.get("faq") or []:
         q = (f.get("q") or "").strip()
         a = (f.get("a") or "").strip()
         if not q or not a:
             continue
-        faq_out.append(f"<p><b>Q. {esc(q)}</b></p><p>A. {esc(a)}</p>")
+        faq_out.append(f'<p style="margin:2px 0;"><b>Q. {esc(q)}</b></p>')
+        faq_out.append(f'<p style="margin:2px 0 12px;">A. {esc(a)}</p>')
     if faq_out:
-        out.append("<h3>자주 묻는 질문</h3>")
+        out.append(HR)
+        out.append(f'<h3 {H3}>자주 묻는 질문</h3>')
         out.extend(faq_out)
-        out.append(SPACER)
 
-    # 마무리/방문월 — 검증된 blockquote(footer가 인용 라인이 된다).
-    created = review.created_at
-    month = created.strftime("%Y.%m") if created else ""
-    topic = (review.topic or "").strip()
-    closing = (
-        f"{esc(topic)} 다녀온 기록이야. 좋은 데이트 되길 💕"
-        if topic
-        else "좋은 데이트 되길 💕"
-    )
-    out.append(
-        f"<blockquote>{closing}<footer>{esc(month)} 방문</footer></blockquote>"
-    )
-
-    # 해시태그 — 포인트 컬러로.
+    # 9) 구분선 + 해시태그(가운데, 핑크).
     hashtags = [str(t).strip() for t in (ai_data.get("hashtags") or []) if str(t).strip()]
     if hashtags:
         joined = " ".join(esc(t) for t in hashtags)
-        out.append(f'<p><span style="color:#ff5f45">{joined}</span></p>')
+        out.append(HR)
+        out.append(
+            '<p style="text-align:center;color:#e0559b;font-weight:600;'
+            f'margin:6px 0;">{joined}</p>'
+        )
 
     return "\n".join(out)
 
