@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import tempfile
@@ -1744,25 +1745,68 @@ def _review_copy_text(review):
     return "\n".join(lines).strip() + "\n"
 
 
-def _blog_img_sig(photo_id):
+# 공개 서명 이미지 URL의 유효기간(초). 네이버는 붙여넣기/발행 시 이미지를 자기
+# 서버로 재호스팅하므로 짧은 창이면 충분하다 — 영원히 공개로 두지 않는다.
+_BLOG_IMG_TTL = int(os.environ.get("BLOG_IMG_TTL_HOURS", "24")) * 3600
+
+
+def _blog_img_sig(photo_id, exp):
     """공개 서명 이미지 URL용 HMAC 토큰(앱 SECRET_KEY 서명, 무상태·DB 컬럼 없음).
 
-    토큰이 곧 인가다 — 유효한 서명이 있으면 그 사진 하나를 공개로 노출한다.
-    ``blog_img`` 라우트가 constant-time으로 이 값과 대조한다.
+    id와 만료시각(exp, unix초)을 함께 서명해 토큰이 특정 시점 이후 무효가 되게
+    한다. 토큰이 곧 인가다 — 유효한 서명 + 미만료면 그 사진 하나를 공개로 노출한다.
+    ``blog_img`` 라우트가 constant-time으로 이 값과 대조하고 exp도 검사한다.
     """
     secret = current_app.config["SECRET_KEY"]
     if isinstance(secret, str):
         secret = secret.encode("utf-8")
-    msg = f"blogimg:{photo_id}".encode("utf-8")
+    msg = f"blogimg:{photo_id}:{exp}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
 
 
 def blog_img_url(photo, external=True):
     """공개(인증 불필요) 서명 이미지의 절대 https URL — 네이버/독자가 로그인 없이
-    가져간다. ``_external=True``라 렌더 호스트 기준 절대 URL이 나온다."""
+    가져간다. ``_external=True``라 렌더 호스트 기준 절대 URL이 나온다.
+
+    렌더 시점 기준 ``_BLOG_IMG_TTL`` 초 뒤 만료되는 토큰을 발급한다."""
+    exp = int(time.time()) + _BLOG_IMG_TTL
     return url_for(
-        "blog_img", photo_id=photo.id, t=_blog_img_sig(photo.id), _external=external
+        "blog_img",
+        photo_id=photo.id,
+        e=exp,
+        t=_blog_img_sig(photo.id, exp),
+        _external=external,
     )
+
+
+# /blog-img/<id> 를 (기존 ?e=..&t=.. 유무와 무관하게) 잡아내는 패턴 — 스킴/호스트
+# 접두와 경로는 보존하고 e·t 쿼리만 새로 교체/추가하기 위한 것. HTML 속성 안에서는
+# ``&``가 ``&amp;``로 이스케이프되므로 두 형태 모두 매칭한다(안 그러면 이미 토큰이
+# 박힌 src를 못 잡고 뒤에 두 번째 쿼리를 붙여 URL을 망가뜨린다).
+_BLOG_IMG_RE = re.compile(r"/blog-img/(\d+)(?:\?e=\d+&(?:amp;)?t=[0-9a-f]+)?")
+
+
+def _refresh_blog_img_tokens(html):
+    """HTML 안의 모든 ``/blog-img/<id>`` 를 '지금' 기준 신선한 ``?e=&t=`` 로 재작성.
+
+    저장된 edited_text가 옛(이미 만료된) 토큰을 얼려버렸어도, 뷰 시점에 항상
+    유효한 토큰이 들어가게 한다. 스킴/호스트 접두와 ``/blog-img/<id>`` 경로는
+    그대로 두고 e·t 쿼리만 교체/추가한다. blog-img가 아닌 URL·주변 속성은 건드리지
+    않는다(정규식이 /blog-img/<id> 만 매칭). ``blog_img_url``이 애초에 신선한
+    토큰을 내므로 재생성 경로에는 무해·멱등하고, edited_text 경로를 커버한다.
+
+    HTML 속성 컨텍스트라 ``&``는 ``&amp;``로 낸다(빌더의 이스케이프와 일치 →
+    재작성 결과를 다시 돌려도 멱등).
+    """
+    if not html:
+        return html
+
+    def _sub(m):
+        pid = int(m.group(1))
+        exp = int(time.time()) + _BLOG_IMG_TTL
+        return f"/blog-img/{pid}?e={exp}&amp;t={_blog_img_sig(pid, exp)}"
+
+    return _BLOG_IMG_RE.sub(_sub, html)
 
 
 def _review_copy_html(review):
@@ -3968,18 +4012,25 @@ def _register_routes(app: Flask):
     def blog_img(photo_id):
         """공개(인증 불필요) 서명 이미지 — 네이버/독자가 로그인 없이 사진을 가져간다.
 
-        ``@active_couple_required`` 없음(공개). ``?t=<sig>``의 HMAC 토큰을
-        ``hmac.compare_digest``로 대조하고(불일치/누락 → 404), 토큰이 곧 인가라
-        어느 커플의 Photo든 로드한다. memory_image와 '똑같은' HEIC→JPEG 변환을
-        재사용한다(non-HEIC는 통과). 방어적으로 변환 실패 → 원본 바이트, 조회
-        실패 → 404.
+        ``@active_couple_required`` 없음(공개). ``?e=<exp>&t=<sig>``의 만료시각과
+        HMAC 토큰을 ``hmac.compare_digest``로 대조하고(불일치/누락/만료 → 404),
+        토큰이 곧 인가라 어느 커플의 Photo든 로드한다. memory_image와 '똑같은'
+        HEIC→JPEG 변환을 재사용한다(non-HEIC는 통과). 방어적으로 변환 실패 →
+        원본 바이트, 조회 실패 → 404.
 
-        보안: 이 서명 URL은 링크를 가진 누구에게나 그 사진 하나를 공개로 노출한다
-        — 이 사진들은 공개 블로그에 게시되는 것이므로 허용된다. 추측 불가한 유효
-        HMAC 토큰이 있어야만 도달 가능하다.
+        보안: 이 서명 URL은 (만료 전까지) 링크를 가진 누구에게나 그 사진 하나를
+        공개로 노출한다 — 이 사진들은 공개 블로그에 게시되는 것이므로 허용된다.
+        추측 불가한 유효 HMAC 토큰 + 미만료여야만 도달 가능하다. 만료 시에도 410이
+        아닌 404를 써 존재 여부를 흘리지 않는다.
         """
         got = request.args.get("t") or ""
-        if not got or not hmac.compare_digest(got, _blog_img_sig(photo_id)):
+        try:
+            exp = int(request.args.get("e") or "")
+        except (ValueError, TypeError):
+            abort(404)
+        if not got or not hmac.compare_digest(got, _blog_img_sig(photo_id, exp)):
+            abort(404)
+        if exp <= int(time.time()):  # 만료 → 404(존재 누설 방지로 410 대신)
             abort(404)
         photo = db.session.get(Photo, photo_id)  # 토큰이 인가 — 커플 불문
         if photo is None:
@@ -5138,8 +5189,12 @@ def _register_routes(app: Flask):
         if review is None or review.couple_id != u.couple_id:
             abort(404)
         # 네이버 복사본: 사용자가 편집한 게 있으면 그걸(이제 HTML), 없으면 생성
-        # 초안에서 HTML을 조립. edited_text는 이제 HTML을 담는다.
-        copy_html = review.edited_text or _review_copy_html(review)
+        # 초안에서 HTML을 조립. edited_text는 이제 HTML을 담는다. 뷰 시점에 이미지
+        # 토큰을 신선하게 재발급해, 저장본이 옛(만료) 토큰을 얼렸어도 지금 복사한
+        # 게 동작하게 한다(_review_copy_html은 이미 신선하나 멱등해 무해).
+        copy_html = _refresh_blog_img_tokens(
+            review.edited_text or _review_copy_html(review)
+        )
         return render_template(
             "review_detail.html",
             review=review,
