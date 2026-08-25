@@ -36,21 +36,40 @@ FALLBACK_QUESTIONS = [
 ]
 
 
+def _claude_argv(allow_web: bool = False) -> list:
+    """``claude -p`` argv를 만든다(권한 플래그 포함). 단위 테스트로 argv만 검증 가능.
+
+    권한 정책: 이 앱의 claude 콜은 전부 '사용자가 미리 전권을 승인한' 자동화 동작이다
+    (사용자 자신의 사진·임시파일을 읽어 캡션/크롭을 만든다). 비대화형 ``-p`` 모드에선
+    권한 프롬프트에 답할 수 없어, 필요한 도구를 반드시 ``--allowedTools``로 미리
+    허용해야 한다. 그래서 매 호출에 읽기 계열(Read/Glob/Grep)을 항상 allow-list한다
+    — 비전 프롬프트가 임시 이미지 파일을 Read하도록 시키는데, 허용 안 하면
+    "권한이 없어서 열람이 거부됐어요"로 거부된다.
+
+    ``--dangerously-skip-permissions``/``--permission-mode bypassPermissions``는 쓰지
+    않는다: Render는 root로 도는데 Claude Code가 root에서 그 플래그들을 거부해 모든
+    claude 콜이 깨진다. ``--allowedTools``는 root에서도 동작하고 필요한 권한만 준다.
+    ``allow_web=True``면 WebSearch/WebFetch도 추가로 허용한다(팝업 웹검색 경로).
+    """
+    tools = ["Read", "Glob", "Grep"]
+    if allow_web:
+        tools += ["WebSearch", "WebFetch"]
+    return ["claude", "-p", "--allowedTools", *tools]
+
+
 def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
                 allow_web: bool = False) -> str:
     """Run `claude -p`, feeding the prompt via stdin. Returns raw stdout text.
 
-    ``allow_web=True`` grants the CLI web tools (``--allowedTools WebSearch
-    WebFetch``) so the prompt can search the live web. Default False keeps the
-    existing behavior UNCHANGED — used ONLY by the popup fetcher, nowhere else.
-    (프로덕션의 claude(CLAUDE_CODE_OAUTH_TOKEN)가 WebSearch를 허용해야 팝업이
-    실제로 채워진다 — 이 플래그로 동작함을 검증했다.)
+    읽기 계열 도구(Read/Glob/Grep)는 매 호출에 미리 허용된다(``_claude_argv`` 참고) —
+    비전 프롬프트가 임시 이미지를 Read할 때 비대화형 모드에서 거부되지 않게 한다.
+    ``allow_web=True``면 WebSearch/WebFetch까지 허용해 라이브 웹 검색을 쓴다(팝업
+    페처 전용). 요청 경로의 데일리 질문 콜에도 안전하다(도구를 안 쓰면 그만 —
+    여기에 세마포어·블로킹을 추가하지 않는다).
 
     Raises RuntimeError on non-zero exit / timeout / missing binary.
     """
-    argv = ["claude", "-p"]
-    if allow_web:
-        argv += ["--allowedTools", "WebSearch", "WebFetch"]
+    argv = _claude_argv(allow_web)
     try:
         proc = subprocess.run(
             argv,
