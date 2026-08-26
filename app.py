@@ -2136,6 +2136,30 @@ def blog_img_url(photo, crop=None, external=True):
     return url
 
 
+def _review_export_sig(rid):
+    """리뷰 익스포트 URL용 HMAC 토큰(앱 SECRET_KEY 서명, 무상태). blog-img와 같은
+    패턴이되 용도 문자열이 다르다(``reviewexport:{rid}``) — 토큰이 곧 인가라
+    로그인 없이(네이버 글쓰기 페이지의 userscript가 CORS로) 이 리뷰의 공개
+    데이터(제목·blocks·공개 이미지 URL)를 읽게 한다. 만료는 없다(공개 데이터라
+    링크 재사용이 무해). ``blog_img_url``이 내는 이미지 URL 자체는 여전히 만료 토큰."""
+    secret = current_app.config["SECRET_KEY"]
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    msg = f"reviewexport:{rid}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def review_export_url(review, external=True):
+    """리뷰 익스포트 엔드포인트의 서명 절대 URL. 상세 페이지의 '네이버로 보내기'
+    버튼이 클립보드에 복사하고, userscript가 그걸 fetch한다."""
+    return url_for(
+        "review_export",
+        rid=review.id,
+        t=_review_export_sig(review.id),
+        _external=external,
+    )
+
+
 # /blog-img/<id> 를 (기존 ?e=..&t=.. 유무와 무관하게) 잡아내는 패턴 — 스킴/호스트
 # 접두와 경로는 보존하고 e·t(·c) 쿼리만 새로 교체/추가하기 위한 것. HTML 속성
 # 안에서는 ``&``가 ``&amp;``로 이스케이프되므로 두 형태 모두 매칭한다(안 그러면
@@ -4521,6 +4545,10 @@ def _register_routes(app: Flask):
         resp = app.response_class(data, mimetype=ctype)
         # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
         resp.headers["Cache-Control"] = "public, max-age=86400"
+        # CORS: 네이버 글쓰기 페이지의 userscript가 이 (이미 공개인) 이미지 바이트를
+        # fetch해 네이버 이미지 호스팅으로 재업로드할 수 있게 한다. 이미 서명 토큰으로
+        # 게이팅된 공개 데이터라 * 허용이 안전하다.
+        resp.headers["Access-Control-Allow-Origin"] = "*"
         return resp
 
     @app.route("/memories/<int:photo_id>/thumb")
@@ -5680,12 +5708,19 @@ def _register_routes(app: Flask):
                         "crop": blk.get("crop") or [0.0, 0.0, 1.0, 1.0],
                     }
                 )
+        # '네이버로 보내기' — userscript가 fetch할 서명 익스포트 URL(ready일 때만).
+        export_url = (
+            review_export_url(review)
+            if (review.status == "ready" and review.ai)
+            else None
+        )
         return render_template(
             "review_detail.html",
             review=review,
             photos=review.photos_ordered,
             copy_html=copy_html,
             crop_sections=crop_sections,
+            export_url=export_url,
         )
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
@@ -5892,6 +5927,60 @@ def _register_routes(app: Flask):
             return jsonify(ok=True, crop=blocks[idx]["crop"])
         flash("사진 위치를 저장했어.", "success")
         return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/api/review-export/<int:rid>")
+    def review_export(rid):
+        """서명 토큰으로 게이팅된 CORS JSON 익스포트 — 네이버 글쓰기 페이지의
+        userscript(1st-party)가 이 리뷰의 공개 데이터를 읽어 사진을 네이버 이미지
+        호스팅으로 재업로드하는 데 쓴다. 우리 앱 오리진은 네이버 엔드포인트를 못
+        부르므로(CORS/쿠키), 스크립트가 네이버 페이지에서 돌고 이 엔드포인트로 재료를
+        받는다.
+
+        로그인 불필요(토큰이 곧 인가, blog-img와 동일 정책). 토큰 불일치/누락 → 404.
+        리뷰가 없거나 아직 ready가 아니면 404. 노출 데이터는 전부 이미 공개(blog-img)다.
+        JSON: {title, blocks(_ensure_blocks 원본), images[{block_index,url,alt}],
+        copy_html(현재 빌더 출력, 외부 이미지 URL 포함)}. images[].url은 크롭 반영된
+        공개 절대 blog-img URL이라, 스크립트가 네이버 업로드 후 copy_html의 그 src를
+        네이버 URL로 치환하면 된다. 이 라우트에만 CORS 헤더를 단다(전역 CORS 아님)."""
+        got = request.args.get("t") or ""
+        if not got or not hmac.compare_digest(got, _review_export_sig(rid)):
+            abort(404)
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.status != "ready" or not review.ai:
+            abort(404)
+
+        data = _ensure_blocks(review.ai) or {"title": "", "blocks": [], "hashtags": []}
+        photos = review.photos_ordered
+        images = []
+        for i, blk in enumerate(data.get("blocks") or []):
+            if not isinstance(blk, dict) or blk.get("type") != "image":
+                continue
+            pi = blk.get("photo_index")
+            if not (isinstance(pi, int) and 0 <= pi < len(photos)):
+                continue
+            p = photos[pi]
+            cap = (p.caption or "").strip() if p.caption_status == "ready" else ""
+            images.append(
+                {
+                    "block_index": i,
+                    "url": blog_img_url(p, crop=blk.get("crop")),  # 크롭 반영 공개 URL
+                    "alt": cap or "후기 사진",
+                }
+            )
+        # copy_html은 뷰 시점 신선 토큰으로(상세 페이지와 동일). 스크립트는 여기의
+        # 각 <img src>를 네이버 업로드 URL로 치환한다.
+        copy_html = _refresh_blog_img_tokens(_review_copy_html(review))
+
+        payload = jsonify(
+            title=data.get("title") or "",
+            blocks=data.get("blocks") or [],
+            images=images,
+            copy_html=copy_html,
+        )
+        # 이 라우트에만 CORS 허용(전역 아님). 공개 데이터 + 서명 토큰 게이팅이라 안전.
+        payload.headers["Access-Control-Allow-Origin"] = "*"
+        payload.headers["Access-Control-Allow-Methods"] = "GET"
+        return payload
 
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")

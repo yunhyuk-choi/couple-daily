@@ -59,6 +59,10 @@
   <p class="muted rv-copy-note">사진은 공개 링크로 들어가 있어 — 네이버가 알아서 불러와.</p>
   <div class="rv-copy-actions">
     <button type="button" class="btn primary sm" id="copy-btn">📋 복사 (서식 유지)</button>
+    {% if export_url %}
+    <button type="button" class="btn ghost sm" id="export-btn"
+            data-export-url="{{ export_url }}">📤 네이버로 보내기</button>
+    {% endif %}
     <button type="button" class="btn ghost sm" id="save-btn">저장</button>
     <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
           style="margin-left:auto;"
@@ -149,6 +153,24 @@
     saveBtn.addEventListener('click', function () {
       saveQuiet();
       showToast('저장했어 💾');
+    });
+  }
+  // 📤 네이버로 보내기 — 서명 익스포트 URL을 클립보드에 복사한다. 네이버 글쓰기
+  // 페이지에서 userscript(🖼 우리 후기 사진 올리기)가 이 URL을 읽어 사진을
+  // 네이버 이미지 호스팅으로 재업로드하고, 네이버 URL로 치환한 본문을 만든다.
+  var exportBtn = document.getElementById('export-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', function () {
+      var url = exportBtn.getAttribute('data-export-url') || '';
+      var msg = '네이버 글쓰기 페이지에서 스크립트 버튼을 눌러줘';
+      function ok() { showToast(msg); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(ok, function () {
+          window.prompt('이 링크를 복사해서 스크립트에 붙여줘', url);
+        });
+      } else {
+        window.prompt('이 링크를 복사해서 스크립트에 붙여줘', url);
+      }
     });
   }
 })();
