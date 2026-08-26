@@ -59,10 +59,7 @@
   <p class="muted rv-copy-note">사진은 공개 링크로 들어가 있어 — 네이버가 알아서 불러와.</p>
   <div class="rv-copy-actions">
     <button type="button" class="btn primary sm" id="copy-btn">📋 복사 (서식 유지)</button>
-    {% if export_url %}
-    <button type="button" class="btn ghost sm" id="export-btn"
-            data-export-url="{{ export_url }}">📤 네이버로 보내기</button>
-    {% endif %}
+    <button type="button" class="btn ghost sm" id="export-btn">📤 네이버로 보내기</button>
     <button type="button" class="btn ghost sm" id="save-btn">저장</button>
     <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
           style="margin-left:auto;"
@@ -155,22 +152,68 @@
       showToast('저장했어 💾');
     });
   }
-  // 📤 네이버로 보내기 — 서명 익스포트 URL을 클립보드에 복사한다. 네이버 글쓰기
-  // 페이지에서 userscript(🖼 우리 후기 사진 올리기)가 이 URL을 읽어 사진을
-  // 네이버 이미지 호스팅으로 재업로드하고, 네이버 URL로 치환한 본문을 만든다.
+  // 📤 네이버로 보내기 — 미리보기(#review-copy)의 HTML + 각 이미지의 바이트를
+  // base64 data URI로 담은 '자급식' 페이로드(JSON)를 클립보드(text/plain)에 복사한다.
+  // 네이버 글쓰기 페이지에서 '📷 사진 올리기' 즐겨찾기(북마클릿)를 누르면, 이 페이로드를
+  // 읽어 사진을 네이버 이미지 호스팅에 올리고 URL을 치환한 본문을 만든다. 북마클릿은
+  // 우리 앱을 절대 fetch하지 않는다(네이버 페이지 CSP가 우리 오리진 connect를 막을 수
+  // 있어서) — 필요한 재료를 여기서 통째로 넘긴다.
   var exportBtn = document.getElementById('export-btn');
   if (exportBtn) {
     exportBtn.addEventListener('click', function () {
-      var url = exportBtn.getAttribute('data-export-url') || '';
-      var msg = '네이버 글쓰기 페이지에서 스크립트 버튼을 눌러줘';
-      function ok() { showToast(msg); }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).then(ok, function () {
-          window.prompt('이 링크를 복사해서 스크립트에 붙여줘', url);
-        });
-      } else {
-        window.prompt('이 링크를 복사해서 스크립트에 붙여줘', url);
-      }
+      exportBtn.disabled = true;
+      showToast('사진 담는 중… 잠깐만');
+      buildExportPayload().then(function (payload) {
+        var text = JSON.stringify(payload);
+        function done() {
+          showToast("복사됨 — 네이버 글쓰기에서 '📷 사진 올리기' 즐겨찾기(북마클릿)를 눌러줘");
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () {
+            window.prompt('이 값을 복사해서 북마클릿에 넘겨줘', text);
+          });
+        } else {
+          window.prompt('이 값을 복사해서 북마클릿에 넘겨줘', text);
+        }
+      }).catch(function (e) {
+        showToast('사진 담기 실패 — 잠시 후 다시 시도해줘');
+        try { console.error('[export] payload build failed', e); } catch (_) {}
+      }).then(function () { exportBtn.disabled = false; });
+    });
+  }
+
+  // 미리보기 HTML + 각 <img> 바이트(data URI)를 담은 페이로드를 만든다.
+  function buildExportPayload() {
+    var copyHtml = box.innerHTML;
+    var imgs = box.querySelectorAll('img');
+    var jobs = [];
+    var seen = {};
+    Array.prototype.forEach.call(imgs, function (im) {
+      var src = im.getAttribute('src') || '';   // copy_html에 나타난 그대로의 src
+      if (!src || seen[src]) return;
+      seen[src] = true;
+      // 우리 앱의 same-origin /blog-img — CORS 불필요.
+      jobs.push(
+        fetch(src, { credentials: 'same-origin' })
+          .then(function (r) {
+            if (!r.ok) throw new Error('img fetch ' + r.status);
+            return r.blob();
+          })
+          .then(blobToDataUri)
+          .then(function (dataUri) { return { src: src, dataUri: dataUri }; })
+      );
+    });
+    return Promise.all(jobs).then(function (images) {
+      return { copy_html: copyHtml, images: images };
+    });
+  }
+
+  function blobToDataUri(blob) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(fr.error || new Error('read fail')); };
+      fr.readAsDataURL(blob);
     });
   }
 })();
