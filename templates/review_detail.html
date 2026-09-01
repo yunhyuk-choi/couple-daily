@@ -68,6 +68,11 @@
     </form>
   </div>
 </div>
+{% if doc_data %}
+{# 정식(네이버 내부이미지) 삽입용 구조화 데이터 — 북마클릿의 '정식 삽입' 버튼이
+   setDocumentData로 네이티브 문서를 조립할 때 쓴다. #}
+<script type="application/json" id="cd-doc-data">{{ doc_data | tojson }}</script>
+{% endif %}
 <div class="copy-toast" id="copy-toast" hidden>복사됨!</div>
 
 <script>
@@ -185,6 +190,12 @@
   // 미리보기 HTML + 각 <img> 바이트(data URI)를 담은 페이로드를 만든다.
   function buildExportPayload() {
     var copyHtml = box.innerHTML;
+    // 정식 삽입용 구조화 데이터(있으면) — 북마클릿이 setDocumentData로 조립할 재료.
+    var doc = null;
+    try {
+      var docEl = document.getElementById('cd-doc-data');
+      if (docEl) doc = JSON.parse(docEl.textContent || 'null');
+    } catch (e) { doc = null; }
     var imgs = box.querySelectorAll('img');
     var jobs = [];
     var seen = {};
@@ -204,7 +215,7 @@
       );
     });
     return Promise.all(jobs).then(function (images) {
-      return { copy_html: copyHtml, images: images };
+      return { copy_html: copyHtml, images: images, doc: doc };
     });
   }
 

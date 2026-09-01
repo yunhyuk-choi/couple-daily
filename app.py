@@ -5661,6 +5661,12 @@ def _register_routes(app: Flask):
         # _ensure_blocks로 통일해 블록 인덱스가 crop-save와 일치하게 한다. 뷰포트에
         # 띄울 '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 쓴다.
         crop_sections = []
+        # 정식(네이버 내부이미지) 삽입용 구조화 데이터 — 북마클릿이 setDocumentData로
+        # 네이티브 문서를 조립할 수 있게, 준비된 후기의 블록/제목/방문날짜/해시태그/총점을
+        # 페이지에 JSON으로 심는다(cd-doc-data). image 블록엔 copy_html에 나온 것과 같은
+        # blog-img 좌표를 담은 __src를 붙여, 북마클릿이 그 이미지의 업로드 결과와 매칭한다
+        # (토큰 e/t는 뷰마다 갱신되나, 매칭은 photo id + 크롭으로 하므로 무해).
+        doc_data = None
         if review.status == "ready" and review.ai:
             data = _ensure_blocks(review.ai)
             blocks = (data or {}).get("blocks") or []
@@ -5672,20 +5678,35 @@ def _register_routes(app: Flask):
                 if not (isinstance(pi, int) and 0 <= pi < len(photos_ordered)):
                     continue
                 p = photos_ordered[pi]
+                crop = blk.get("crop") or [0.0, 0.0, 1.0, 1.0]
                 crop_sections.append(
                     {
                         "index": i,  # 블록 인덱스(crop-save가 target)
                         "heading": _crop_hint_for_image(blocks, i)[:40],
                         "img_url": blog_img_url(p),  # 크롭 없는 풀이미지
-                        "crop": blk.get("crop") or [0.0, 0.0, 1.0, 1.0],
+                        "crop": crop,
                     }
                 )
+                # copy_html의 이미지 src와 같은 좌표(=크롭 적용) URL을 블록에 부착.
+                blk["__src"] = blog_img_url(p, crop=blk.get("crop"))
+            created = review.created_at
+            visit_ymd = f"{created.year}년 {created.month}월" if created else ""
+            visit_foot = created.strftime("%Y. %m") if created else ""
+            doc_data = {
+                "title": (data or {}).get("title") or "",
+                "visitDate": visit_ymd,
+                "visitFoot": visit_foot,
+                "overallScore": review.overall_score,
+                "hashtags": (data or {}).get("hashtags") or [],
+                "blocks": blocks,
+            }
         return render_template(
             "review_detail.html",
             review=review,
             photos=review.photos_ordered,
             copy_html=copy_html,
             crop_sections=crop_sections,
+            doc_data=doc_data,
         )
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
