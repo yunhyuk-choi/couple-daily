@@ -130,6 +130,33 @@ _BLOG_IMG_MAX_EDGE = 1280
 # 블로그 후기 이미지 크롭 목표 가로세로비(가로/세로). 4:3. 3/2·16/9로 자유 교체.
 _BLOG_CROP_ASPECT = 4 / 3
 
+# 가공완료(crop+downscale+JPEG) 블로그 이미지 바이트 캐시. (photo,crop,quality)당
+# 결과가 불변이라 무효화 불필요. 히트 시 OneDrive 호출·_blog_img_process를 모두
+# 건너뛰어 재방문/재export가 즉시다. onedrive.py 캐시와 같은 만료/축출 패턴.
+_BLOG_PROC_CACHE_TTL = 6 * 3600  # seconds (~6h)
+_BLOG_PROC_CACHE_MAX = 200
+_blog_proc_cache = {}  # key: (photo_id, crop_str, mode) -> (jpeg_bytes, expiry)
+
+
+def _blog_proc_cache_get(key):
+    """가공완료 캐시 조회 — 유효(미만료) 히트면 바이트, 아니면 None."""
+    hit = _blog_proc_cache.get(key)
+    if hit and time.time() < hit[1]:
+        return hit[0]
+    return None
+
+
+def _blog_proc_cache_put(key, data):
+    """가공완료 캐시 저장 — 삽입 전 만료·최고령 항목을 축출해 메모리 상한 유지."""
+    now = time.time()
+    if len(_blog_proc_cache) >= _BLOG_PROC_CACHE_MAX:
+        for k in [k for k, v in _blog_proc_cache.items() if v[1] <= now]:
+            _blog_proc_cache.pop(k, None)
+        if len(_blog_proc_cache) >= _BLOG_PROC_CACHE_MAX:
+            oldest = min(_blog_proc_cache, key=lambda k: _blog_proc_cache[k][1])
+            _blog_proc_cache.pop(oldest, None)
+    _blog_proc_cache[key] = (data, now + _BLOG_PROC_CACHE_TTL)
+
 
 def _image_display_size(data):
     """이미지 바이트의 '표시 기준'(EXIF 방향 반영) (w, h)를 돌려준다. 실패 시 None.
@@ -2300,8 +2327,12 @@ def _review_copy_html(review):
             a = (it.get("a") or "").strip()
             if not q or not a:
                 continue
-            faq_out.append(f'<p style="margin:2px 0;"><b>Q. {esc(q)}</b></p>')
-            faq_out.append(f'<p style="margin:2px 0 12px;">A. {esc(a)}</p>')
+            faq_out.append(
+                f'<p style="text-align:center;margin:2px 0;"><b>Q. {esc(q)}</b></p>'
+            )
+            faq_out.append(
+                f'<p style="text-align:center;margin:2px 0 12px;">A. {esc(a)}</p>'
+            )
         if faq_out:
             add_hr()
             out.append(f'<h3 {H3}>자주 묻는 질문</h3>')
@@ -4496,6 +4527,14 @@ def _register_routes(app: Flask):
             abort(404)
         if exp <= int(time.time()):  # 만료 → 404(존재 누설 방지로 410 대신)
             abort(404)
+        hq = bool(request.args.get("hq"))
+        # 가공완료 캐시 히트면 OneDrive·재인코딩 없이 즉시 반환((photo,crop,mode) 불변).
+        proc_key = (photo_id, crop_str or "", "hq" if hq else "std")
+        cached = _blog_proc_cache_get(proc_key)
+        if cached is not None:
+            resp = app.response_class(cached, mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
         photo = db.session.get(Photo, photo_id)  # 토큰이 인가 — 커플 불문
         if photo is None:
             abort(404)
@@ -4521,7 +4560,7 @@ def _register_routes(app: Flask):
         # hq(네이버 export용): 다운스케일 없이 원본 해상도(EXIF·crop만) + q95.
         # hq는 서명 대상이 아니라(위 검증은 t/e/c만 대조) 서명된 URL에 &hq=1을
         # 덧붙여도 그대로 통과한다.
-        if request.args.get("hq"):
+        if hq:
             processed = _blog_img_process(data, crop=crop, max_edge=None, quality=95)
         else:
             processed = _blog_img_process(
@@ -4529,6 +4568,7 @@ def _register_routes(app: Flask):
             )
         if processed is not None:
             data, ctype = processed, "image/jpeg"
+            _blog_proc_cache_put(proc_key, processed)  # 가공 성공분만 캐시
         resp = app.response_class(data, mimetype=ctype)
         # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
         resp.headers["Cache-Control"] = "public, max-age=86400"

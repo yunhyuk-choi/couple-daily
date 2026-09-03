@@ -56,16 +56,16 @@ _reconnect_needed = False
 # the fetched BYTES (not a download URL): personal-OneDrive pre-auth download
 # URLs expire very quickly, so a cached URL would 401 — but cached bytes are
 # always a valid response. Kept brief; the browser also caches via Cache-Control.
-_BYTES_CACHE_TTL = 60  # seconds
-_BYTES_CACHE_MAX = 24  # cap entries so memory can't grow unbounded
+_BYTES_CACHE_TTL = 1800  # seconds
+_BYTES_CACHE_MAX = 64  # cap entries so memory can't grow unbounded
 _bytes_cache: dict[str, tuple[bytes, str, float]] = {}
 
 # per-(item,size) THUMBNAIL-BYTES cache for the gallery grid. Thumbnails are
 # tiny (a few KB), so we can cache more of them and for longer than full bytes.
 # Same rationale as _bytes_cache: cache the decoded bytes (the Graph thumbnail
 # `url` is a short-lived CDN link that would 401 if reused).
-_THUMB_CACHE_TTL = 600  # seconds
-_THUMB_CACHE_MAX = 64
+_THUMB_CACHE_TTL = 3600  # seconds
+_THUMB_CACHE_MAX = 192
 _thumb_cache: dict[tuple[str, str], tuple[bytes, str, float]] = {}
 
 
