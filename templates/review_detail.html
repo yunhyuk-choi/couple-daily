@@ -203,9 +203,13 @@
       var src = im.getAttribute('src') || '';   // copy_html에 나타난 그대로의 src
       if (!src || seen[src]) return;
       seen[src] = true;
+      // 바이트는 hq(원본 해상도)로 가져온다 — 네이버엔 고화질이 붙게. 단, payload의
+      // src 필드는 원본 서명 URL(hq 없음) 그대로 둔다(북마클릿 키/순서 불변). hq는
+      // 서명 대상이 아니라 서명된 URL에 &hq=1을 덧붙여도 통과한다.
+      var hqSrc = src + (src.indexOf('?') === -1 ? '?' : '&') + 'hq=1';
       // 우리 앱의 same-origin /blog-img — CORS 불필요.
       jobs.push(
-        fetch(src, { credentials: 'same-origin' })
+        fetch(hqSrc, { credentials: 'same-origin' })
           .then(function (r) {
             if (!r.ok) throw new Error('img fetch ' + r.status);
             return r.blob();

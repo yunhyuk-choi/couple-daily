@@ -125,8 +125,8 @@ def _heic_to_jpeg(data):
         return None
 
 
-# 블로그 서빙 이미지 긴 변 상한(px) — 고화질이되 원본만큼 크지 않게.
-_BLOG_IMG_MAX_EDGE = 2048
+# 블로그 서빙 이미지 긴 변 상한(px) — 앱 미리보기는 가볍게. 네이버 export만 hq(원본)로.
+_BLOG_IMG_MAX_EDGE = 1280
 # 블로그 후기 이미지 크롭 목표 가로세로비(가로/세로). 4:3. 3/2·16/9로 자유 교체.
 _BLOG_CROP_ASPECT = 4 / 3
 
@@ -211,13 +211,14 @@ def compute_crop_rect(img_w, img_h, focus_box, target_aspect):
     return [x0 / W, y0 / H, crop_w / W, crop_h / H]
 
 
-def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE):
+def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
     """블로그 서빙용으로 원본 바이트를 (선택적 크롭 →) 다운스케일한 JPEG로.
 
     EXIF 방향 보정 → crop(정규화 [x,y,w,h], 있으면) → 긴 변 ≤ max_edge(업스케일
-    안 함, 비율 유지) → RGB → JPEG(quality 92, optimize). HEIC도 같은 open으로
-    처리(pillow_heif 등록됨). 어떤 이유로든 실패하면 None(호출부가 원본 폴백해
-    절대 500 안 나게). 저장 원본은 손대지 않는다(메모리 사본만).
+    안 함, 비율 유지) → RGB → JPEG(quality, optimize). ``max_edge`` 가 falsy(None/0)
+    면 다운스케일 자체를 건너뛴다 — 네이버 export용 hq(원본 해상도, EXIF·crop만).
+    HEIC도 같은 open으로 처리(pillow_heif 등록됨). 어떤 이유로든 실패하면 None
+    (호출부가 원본 폴백해 절대 500 안 나게). 저장 원본은 손대지 않는다(메모리 사본만).
     """
     if not _HEIC_OK or not _PILImage or not data:
         return None
@@ -237,10 +238,11 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE):
                     right = int(max(left + 1, min(W, round((x + w) * W))))
                     bottom = int(max(top + 1, min(H, round((y + h) * H))))
                     img = img.crop((left, top, right, bottom))
-            img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
+            if max_edge:
+                img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
             rgb = img.convert("RGB")
             out = _BytesIO()
-            rgb.save(out, format="JPEG", quality=92, optimize=True)
+            rgb.save(out, format="JPEG", quality=quality, optimize=True)
             return out.getvalue()
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
         log.warning("blog-img 크롭/리사이즈 실패 — 원본 바이트로 폴백", exc_info=True)
@@ -4472,8 +4474,9 @@ def _register_routes(app: Flask):
         HMAC 토큰을 ``hmac.compare_digest``로 대조하고(불일치/누락/만료 → 404),
         토큰이 곧 인가라 어느 커플의 Photo든 로드한다. 선택적 ``&c=x,y,w,h``(정규화
         크롭)도 서명에 포함되므로 변조 시 404다. 바이트는 한 경로로 처리한다:
-        (크롭 →) 긴 변 ≤1280px 다운스케일 → JPEG(q85). HEIC도 같은 open으로 처리.
-        Pillow 실패 시 원본 바이트로 폴백(절대 500 안 남). 조회 실패 → 404.
+        (크롭 →) 긴 변 ≤1280px 다운스케일 → JPEG(q92). ``&hq=1``(서명 무관)이면
+        다운스케일 없이 원본 해상도 + q95로 낸다(네이버 export용). HEIC도 같은
+        open으로 처리. Pillow 실패 시 원본 바이트로 폴백(절대 500 안 남). 조회 실패 → 404.
 
         보안: 이 서명 URL은 (만료 전까지) 링크를 가진 누구에게나 그 사진 하나를
         공개로 노출한다 — 이 사진들은 공개 블로그에 게시되는 것이므로 허용된다.
@@ -4515,7 +4518,15 @@ def _register_routes(app: Flask):
                 except ValueError:
                     crop = None
         # 단일 경로: (크롭 →) 다운스케일 → JPEG. HEIC도 여기서 열린다. 실패 시 원본.
-        processed = _blog_img_process(data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE)
+        # hq(네이버 export용): 다운스케일 없이 원본 해상도(EXIF·crop만) + q95.
+        # hq는 서명 대상이 아니라(위 검증은 t/e/c만 대조) 서명된 URL에 &hq=1을
+        # 덧붙여도 그대로 통과한다.
+        if request.args.get("hq"):
+            processed = _blog_img_process(data, crop=crop, max_edge=None, quality=95)
+        else:
+            processed = _blog_img_process(
+                data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE, quality=92
+            )
         if processed is not None:
             data, ctype = processed, "image/jpeg"
         resp = app.response_class(data, mimetype=ctype)
