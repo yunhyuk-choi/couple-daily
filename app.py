@@ -126,7 +126,7 @@ def _heic_to_jpeg(data):
 
 
 # 블로그 서빙 이미지 긴 변 상한(px) — 고화질이되 원본만큼 크지 않게.
-_BLOG_IMG_MAX_EDGE = 1280
+_BLOG_IMG_MAX_EDGE = 2048
 # 블로그 후기 이미지 크롭 목표 가로세로비(가로/세로). 4:3. 3/2·16/9로 자유 교체.
 _BLOG_CROP_ASPECT = 4 / 3
 
@@ -215,7 +215,7 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE):
     """블로그 서빙용으로 원본 바이트를 (선택적 크롭 →) 다운스케일한 JPEG로.
 
     EXIF 방향 보정 → crop(정규화 [x,y,w,h], 있으면) → 긴 변 ≤ max_edge(업스케일
-    안 함, 비율 유지) → RGB → JPEG(quality 85, optimize). HEIC도 같은 open으로
+    안 함, 비율 유지) → RGB → JPEG(quality 92, optimize). HEIC도 같은 open으로
     처리(pillow_heif 등록됨). 어떤 이유로든 실패하면 None(호출부가 원본 폴백해
     절대 500 안 나게). 저장 원본은 손대지 않는다(메모리 사본만).
     """
@@ -240,7 +240,7 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE):
             img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
             rgb = img.convert("RGB")
             out = _BytesIO()
-            rgb.save(out, format="JPEG", quality=85, optimize=True)
+            rgb.save(out, format="JPEG", quality=92, optimize=True)
             return out.getvalue()
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
         log.warning("blog-img 크롭/리사이즈 실패 — 원본 바이트로 폴백", exc_info=True)
