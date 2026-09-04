@@ -1443,9 +1443,11 @@
     var url = APP_BASE + '/api/naver-export/pending?k=' + encodeURIComponent(EXPORT_KEY);
     diag('자동: pending 조회 ' + url);
     fetch(url, { credentials: 'omit', cache: 'no-store' })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) { return r.json().catch(function () { return null; }); })
       .then(function (pl) {
-        if (!pl || !pl.blocks) { diag('자동: 대기 없음 — 붙여넣기 모드 유지'); return; }
+        // 앱은 무대기/잘못된 키를 200 {pending:false}로 준다(CORS로 막힌 404 회피).
+        // pending:true + blocks 일 때만 자동 진행. 그 외엔 조용히 붙여넣기 모드 유지.
+        if (!pl || !pl.pending || !pl.blocks) { diag('자동: 대기 없음 — 붙여넣기 모드 유지'); return; }
         W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만
         diag('자동: pending rid=' + pl.rid + ' 이미지 ' + ((pl.images || []).length) + '장');
         var win = findSeWin() || W;

@@ -5886,11 +5886,18 @@ def _register_routes(app: Flask):
     def naver_export_pending():
         """공개(로그인 불필요) — export_key가 인가. 대기 중 후기의 자동삽입 페이로드.
 
-        네이버(blog.naver.com) 유저스크립트가 cross-origin으로 부른다 → CORS ``*`` +
-        OPTIONS preflight 허용. 키로 사용자를 찾아 비만료 pending rid가 있으면 payload를
-        내고 슬롯을 삭제(clear-on-serve, 재실행 방지). 없음/만료/잘못된 키 → 404(누설 방지).
-        쿠키 불필요.
+        네이버(blog.naver.com) 유저스크립트가 cross-origin으로 부른다 → **모든 응답 경로**에
+        CORS ``*`` (+ OPTIONS preflight). 키로 사용자를 찾아 비만료 pending rid가 있으면
+        payload(``pending:true``)를 내고 슬롯을 삭제(clear-on-serve). 없음/만료/잘못된 키는
+        404가 아니라 **200 ``{"pending": false}``** 로 낸다 — 브라우저가 CORS로 막힌 404를
+        읽지 못해 fetch가 NetworkError로 reject되던 문제를 피하고, "할 일 없음"을 깔끔히
+        전달한다. 키 유무는 누설하지 않는다(잘못된 키·무대기 모두 pending:false). 쿠키 불필요.
         """
+        def _cors(resp):
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
         if request.method == "OPTIONS":
             resp = app.response_class("", status=204)
             resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -5898,24 +5905,29 @@ def _register_routes(app: Flask):
             resp.headers["Access-Control-Allow-Headers"] = "*"
             resp.headers["Access-Control-Max-Age"] = "86400"
             return resp
+
         key = (request.args.get("k") or "").strip()
-        rid = _naver_export_take(key) if key else None
-        if not rid:
-            abort(404)
-        user = User.query.filter_by(export_key=key).first()
-        review = db.session.get(BlogReview, rid)
-        if user is None or review is None or review.couple_id != user.couple_id:
-            abort(404)
-        doc_data, images = _build_export_payload(review)
-        if not doc_data:
-            abort(404)
-        payload = dict(doc_data)
-        payload["rid"] = rid
-        payload["images"] = images or []
-        resp = jsonify(payload)
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        if not key:  # 진짜 잘못된 요청만 400 — 단, ACAO는 반드시 붙인다.
+            return _cors(jsonify(pending=False, error="missing_key")), 400
+
+        try:
+            rid = _naver_export_take(key)  # clear-on-serve
+            if rid:
+                user = User.query.filter_by(export_key=key).first()
+                review = db.session.get(BlogReview, rid)
+                if user is not None and review is not None and review.couple_id == user.couple_id:
+                    doc_data, images = _build_export_payload(review)
+                    if doc_data:
+                        payload = dict(doc_data)
+                        payload["pending"] = True
+                        payload["rid"] = rid
+                        payload["images"] = images or []
+                        return _cors(jsonify(payload))
+        except Exception:  # noqa: BLE001 — 어떤 실패든 CORS 붙은 응답으로(누설·NetworkError 방지)
+            db.session.rollback()
+            log.exception("naver-export pending 처리 실패")
+        # 무대기 / 잘못된 키 / 만료 / 내부 실패 → 200 {"pending": false} (+ACAO)
+        return _cors(jsonify(pending=False))
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
     @active_couple_required
