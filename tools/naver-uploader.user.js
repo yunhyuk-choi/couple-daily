@@ -1448,47 +1448,79 @@
         // 앱은 무대기/잘못된 키를 200 {pending:false}로 준다(CORS로 막힌 404 회피).
         // pending:true + blocks 일 때만 자동 진행. 그 외엔 조용히 붙여넣기 모드 유지.
         if (!pl || !pl.pending || !pl.blocks) { diag('자동: 대기 없음 — 붙여넣기 모드 유지'); return; }
-        W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만
-        diag('자동: pending rid=' + pl.rid + ' 이미지 ' + ((pl.images || []).length) + '장');
-        var win = findSeWin() || W;
-        var Sm = win && win.SmartEditor;
-        var ed = getEditorInstance();
-        if (!ed || typeof ed.getDocumentData !== 'function' || typeof ed.setDocumentData !== 'function') {
-          diag('자동 중단: 에디터 못 찾음 — 붙여넣기 모드'); W.__cdAutoRan = false; return;
-        }
+        W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만(폴이 스택되지 않게)
+        // clear-on-serve라 페이로드를 '지금' 캡처해 둔다(에디터 대기 중 슬롯이 비어도 무관).
         var doc = {
           title: pl.title, visitDate: pl.visitDate, visitFoot: pl.visitFoot,
           overallScore: pl.overallScore, hashtags: pl.hashtags, blocks: pl.blocks
         };
-        // 이미지 바이트는 hq(원본)로 받아 '에디터 렐름' File로 만든다(cross-realm 안전).
-        var RB = (win && win.Blob) || Blob;
-        var RF = (win && win.File) || File;
         var images = Array.isArray(pl.images) ? pl.images : [];
-        if (!images.length) { runCore(u, win, Sm, ed, doc, [], []); return; }
-        setStatus(u, '자동 업로드 중… (이미지 받는 중 0/' + images.length + ')');
-        var got = 0;
-        var jobs = images.map(function (im, i) {
-          return fetch(im.url, { cache: 'no-store' })
-            .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.arrayBuffer(); })
-            .then(function (buf) {
-              var blob = new RB([buf], { type: 'image/jpeg' });
-              var f;
-              try { f = new RF([blob], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
-              catch (e) { f = blob; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
-              got++; setStatus(u, '자동 업로드 중… (이미지 받는 중 ' + got + '/' + images.length + ')');
-              return { f: f, src: im.src };
-            });
-        });
-        Promise.all(jobs).then(function (arr) {
-          var files = [], fileSrcs = [];
-          arr.forEach(function (o) { files.push(o.f); fileSrcs.push(o.src); });
-          diag('자동: 이미지 ' + files.length + '장 준비 → 업로드');
-          runCore(u, win, Sm, ed, doc, files, fileSrcs);
-        }).catch(function (e) {
-          diag('자동 이미지 준비 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
-          setStatus(u, '자동 실패 — 아래에 페이로드 붙여넣고 🅢 정식 삽입', true);
-          W.__cdAutoRan = false;
-        });
+        diag('자동: pending rid=' + pl.rid + ' 이미지 ' + images.length + '장');
+
+        // 에디터/업로더가 늦게 뜨는 레이스 — 즉시 중단하지 않고 준비될 때까지 폴링.
+        function editorReady() {
+          var win = findSeWin() || W;
+          var Sm = win && win.SmartEditor;
+          var ed = getEditorInstance();
+          var ok = !!(ed &&
+            typeof ed.getDocumentData === 'function' &&
+            typeof ed.setDocumentData === 'function' &&
+            ed._videoUploadService && ed._videoUploadService._imageUploadService &&
+            Sm && Sm.COMMAND && Sm.COMMAND.IMAGE);
+          return ok ? { win: win, Sm: Sm, ed: ed } : null;
+        }
+
+        function proceed(ctx) {
+          var win = ctx.win, Sm = ctx.Sm, ed = ctx.ed;
+          // 이미지 바이트는 hq(원본)로 받아 '에디터 렐름' File로 만든다(cross-realm 안전).
+          var RB = (win && win.Blob) || Blob;
+          var RF = (win && win.File) || File;
+          if (!images.length) { runCore(u, win, Sm, ed, doc, [], []); return; }
+          setStatus(u, '자동 업로드 중… (이미지 받는 중 0/' + images.length + ')');
+          var got = 0;
+          var jobs = images.map(function (im, i) {
+            return fetch(im.url, { cache: 'no-store' })
+              .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.arrayBuffer(); })
+              .then(function (buf) {
+                var blob = new RB([buf], { type: 'image/jpeg' });
+                var f;
+                try { f = new RF([blob], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
+                catch (e) { f = blob; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
+                got++; setStatus(u, '자동 업로드 중… (이미지 받는 중 ' + got + '/' + images.length + ')');
+                return { f: f, src: im.src };
+              });
+          });
+          Promise.all(jobs).then(function (arr) {
+            var files = [], fileSrcs = [];
+            arr.forEach(function (o) { files.push(o.f); fileSrcs.push(o.src); });
+            diag('자동: 이미지 ' + files.length + '장 준비 → 업로드');
+            runCore(u, win, Sm, ed, doc, files, fileSrcs);
+          }).catch(function (e) {
+            diag('자동 이미지 준비 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
+            setStatus(u, '자동 실패 — 아래에 페이로드 붙여넣고 🅢 정식 삽입', true);
+          });
+        }
+
+        var ctx0 = editorReady();
+        if (ctx0) { proceed(ctx0); return; }
+        // 폴링: 500ms 간격 최대 ~60초. 준비되면 진행, 타임아웃이면 붙여넣기 폴백.
+        diag('자동: 에디터 준비 대기…');
+        setStatus(u, '자동: 에디터 준비 대기…');
+        var waited = 0, WAIT_MAX = 60000;
+        var wiv = setInterval(function () {
+          waited += 500;
+          var ctx;
+          try { ctx = editorReady(); } catch (e) { ctx = null; }
+          if (ctx) {
+            clearInterval(wiv);
+            diag('자동: 에디터 준비됨 — 진행');
+            proceed(ctx);
+          } else if (waited >= WAIT_MAX) {
+            clearInterval(wiv);
+            diag('자동 중단: 에디터 준비 안 됨(타임아웃) — 붙여넣기 모드');
+            setStatus(u, '에디터 준비 안 됨 — 수동 붙여넣기로 진행', true);
+          }
+        }, 500);
       })
       .catch(function (e) {
         diag('자동 pending 조회 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
