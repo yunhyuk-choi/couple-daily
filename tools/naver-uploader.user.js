@@ -30,6 +30,10 @@
   var SESSION_KEY_URL =
     'https://platform.editor.naver.com/api/blogpc001/v1/photo-uploader/session-key';
   var SESSION_KEY_MATCH = 'session-key';      // 요청/응답 URL 매칭 힌트(넓게)
+  // v2 자동화: 앱 오리진 + 개인 export 키(설정 화면에서 복사해 최초 1회 저장).
+  var APP_BASE = 'https://couple-daily.onrender.com';
+  var EXPORT_KEY = '';
+  try { EXPORT_KEY = window.localStorage.getItem('cd_export_key') || ''; } catch (e) {}
   // ========================================================================
 
   var L = function () {
@@ -1215,12 +1219,17 @@
     }
     diag('업로드 대상 파일 ' + files.length + '장 (렐름=' + (win === W ? 'self' : 'iframe') + ')');
 
+    runCore(u, win, Sm, ed, p.doc, files, fileSrcs);
+  }
+
+  // v1(붙여넣기)·v2(자동)가 공유하는 코어: 준비된 doc/files로 네이티브 업로드+setDocumentData.
+  function runCore(u, win, Sm, ed, doc, files, fileSrcs) {
     u.go.disabled = true;
     var metaByBlockSrc = {};
 
     function buildAndSet(label) {
       try {
-        var comps = buildComponents(p.doc, metaByBlockSrc);
+        var comps = buildComponents(doc, metaByBlockSrc);
         var got = Object.keys(metaByBlockSrc).length;
         diag('컴포넌트 ' + comps.length + '개 생성 (이미지 ' + got + '/' + files.length + ')');
         var d = ed.getDocumentData();
@@ -1396,6 +1405,94 @@
     });
   }
 
+  // --------- v2 자동화(붙여넣기 없이) ---------
+  // 키가 없을 때 오버레이에 한 번 입력칸을 띄운다 → localStorage 저장 후 자동.
+  function addKeyInput(u) {
+    try {
+      if (document.getElementById('cd-key-row')) return;
+      var wrap = el('div', 'margin-top:10px;border-top:1px solid #eee;padding-top:8px;');
+      wrap.id = 'cd-key-row';
+      wrap.appendChild(el('div', 'color:#444;font-size:12px;margin-bottom:6px;',
+        '자동 업로드 키(앱 설정 화면에서 복사) — 최초 1회만 입력하면 이후 자동'));
+      var row = el('div', 'display:flex;gap:8px;');
+      var kin = el('input',
+        'flex:1;min-width:0;border:1px solid #ccc;border-radius:8px;padding:8px;font-size:12px;');
+      kin.setAttribute('placeholder', '내보내기 키 붙여넣기');
+      var save = el('button',
+        'background:#e64980;color:#fff;border:0;border-radius:8px;padding:9px 14px;' +
+        'font-weight:700;cursor:pointer;', '저장');
+      save.addEventListener('click', function () {
+        var v = (kin.value || '').trim();
+        if (!v) return;
+        try { window.localStorage.setItem('cd_export_key', v); } catch (e) {}
+        EXPORT_KEY = v;
+        if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
+        setStatus(u, '키 저장됨 — 자동 확인 중…');
+        runAuto(u);
+      });
+      row.appendChild(kin); row.appendChild(save);
+      wrap.appendChild(row);
+      u.ov.appendChild(wrap);
+    } catch (e) { diag('키 입력칸 실패: ' + e); }
+  }
+
+  // 앱에 세워둔 '대기(pending)' 후기를 꺼내 붙여넣기 없이 자동 삽입한다.
+  // 키가 인가(공개 API). 대기 없음/에러면 조용히 v1 붙여넣기 오버레이로 남는다.
+  function runAuto(u) {
+    if (W.__cdAutoRan || !EXPORT_KEY) return;
+    var url = APP_BASE + '/api/naver-export/pending?k=' + encodeURIComponent(EXPORT_KEY);
+    diag('자동: pending 조회 ' + url);
+    fetch(url, { credentials: 'omit', cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (pl) {
+        if (!pl || !pl.blocks) { diag('자동: 대기 없음 — 붙여넣기 모드 유지'); return; }
+        W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만
+        diag('자동: pending rid=' + pl.rid + ' 이미지 ' + ((pl.images || []).length) + '장');
+        var win = findSeWin() || W;
+        var Sm = win && win.SmartEditor;
+        var ed = getEditorInstance();
+        if (!ed || typeof ed.getDocumentData !== 'function' || typeof ed.setDocumentData !== 'function') {
+          diag('자동 중단: 에디터 못 찾음 — 붙여넣기 모드'); W.__cdAutoRan = false; return;
+        }
+        var doc = {
+          title: pl.title, visitDate: pl.visitDate, visitFoot: pl.visitFoot,
+          overallScore: pl.overallScore, hashtags: pl.hashtags, blocks: pl.blocks
+        };
+        // 이미지 바이트는 hq(원본)로 받아 '에디터 렐름' File로 만든다(cross-realm 안전).
+        var RB = (win && win.Blob) || Blob;
+        var RF = (win && win.File) || File;
+        var images = Array.isArray(pl.images) ? pl.images : [];
+        if (!images.length) { runCore(u, win, Sm, ed, doc, [], []); return; }
+        setStatus(u, '자동 업로드 중… (이미지 받는 중 0/' + images.length + ')');
+        var got = 0;
+        var jobs = images.map(function (im, i) {
+          return fetch(im.url, { cache: 'no-store' })
+            .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.arrayBuffer(); })
+            .then(function (buf) {
+              var blob = new RB([buf], { type: 'image/jpeg' });
+              var f;
+              try { f = new RF([blob], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
+              catch (e) { f = blob; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
+              got++; setStatus(u, '자동 업로드 중… (이미지 받는 중 ' + got + '/' + images.length + ')');
+              return { f: f, src: im.src };
+            });
+        });
+        Promise.all(jobs).then(function (arr) {
+          var files = [], fileSrcs = [];
+          arr.forEach(function (o) { files.push(o.f); fileSrcs.push(o.src); });
+          diag('자동: 이미지 ' + files.length + '장 준비 → 업로드');
+          runCore(u, win, Sm, ed, doc, files, fileSrcs);
+        }).catch(function (e) {
+          diag('자동 이미지 준비 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
+          setStatus(u, '자동 실패 — 아래에 페이로드 붙여넣고 🅢 정식 삽입', true);
+          W.__cdAutoRan = false;
+        });
+      })
+      .catch(function (e) {
+        diag('자동 pending 조회 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
+      });
+  }
+
   // --------- 부팅(유저스크립트: 자동 실행) ---------
   // 최상위 프레임에서만 오버레이를 띄운다(서브프레임 중복 방지). 에디터 iframe은
   // 최상위의 프레임-워크(patchEverything/findSeWin)가 same-origin으로 커버한다.
@@ -1436,6 +1533,15 @@
     catch (e) { diag('탐색 예외: ' + e); }
   });
   L('오버레이 준비됨. URL=', location.href);
+
+  // v2: 키가 있으면 앱의 대기 후기를 붙여넣기 없이 자동 삽입 시도. 없으면 키 입력칸.
+  // 실패/대기없음이면 위 v1 붙여넣기 오버레이가 그대로 폴백으로 남는다.
+  if (EXPORT_KEY) {
+    setStatus(u, '자동 확인 중… (앱에서 📤 누르고 이 페이지를 열면 자동 삽입돼)');
+    runAuto(u);
+  } else {
+    addKeyInput(u);
+  }
   }
 
   // 글쓰기 페이지에서만 자동으로 뜨게 — 그 외 네이버 페이지에선 잠잠(dormant).

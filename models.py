@@ -59,6 +59,15 @@ def run_startup_migrations():
                     "startup migration: failed adding users.profile_image_url"
                 )
 
+        # 1c) add export_key (네이버 업로더 유저스크립트 인증 토큰) if missing.
+        if "export_key" not in cols:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN export_key VARCHAR"))
+                log.info("startup migration: added users.export_key")
+            except Exception:  # noqa: BLE001
+                log.exception("startup migration: failed adding users.export_key")
+
         # 2) drop NOT NULL on email / password_hash so Kakao users can exist.
         #    SQLite cannot ALTER a column's nullability in place; older SQLite
         #    DBs keep NOT NULL, but Kakao rows simply never touch those columns
@@ -228,6 +237,9 @@ class User(db.Model):
     is_admin = db.Column(db.Boolean, default=False, nullable=False)
     # 'approved' (space creator or accepted partner) | 'pending' (awaiting approval)
     status = db.Column(db.String(16), default="approved", nullable=False)
+    # 네이버 업로더 유저스크립트(공개 pending API) 인증용 개인 토큰. 없으면 최초
+    # 접근 시 생성한다. URL-safe(~24자). 추가는 run_startup_migrations가 ALTER로 반영.
+    export_key = db.Column(db.String(32), unique=True, nullable=True, index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     answers = db.relationship("Answer", backref="user", lazy="dynamic")

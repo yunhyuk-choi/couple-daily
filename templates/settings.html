@@ -71,9 +71,50 @@
     · iOS/Safari: 공유 버튼 → "홈 화면에 추가"
   </p>
 </div>
+
+{% if me and me.export_key %}
+<div class="card">
+  <h2 class="small">네이버 업로더 키</h2>
+  <p class="muted small">
+    후기를 네이버에 <strong>자동</strong>으로 올리려면, 이 키를 네이버 업로더
+    유저스크립트에 <strong>최초 1회</strong> 붙여넣어. (설치법: 리포의
+    <code>tools/NAVER-UPLOADER-INSTALL.md</code>)
+  </p>
+  <div class="stack-sm" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <input type="text" id="export-key" value="{{ me.export_key }}" readonly
+           style="flex:1;min-width:180px;font-family:monospace;" />
+    <button class="btn ghost" type="button" id="export-key-copy">복사</button>
+  </div>
+  <p class="muted small" id="export-key-msg" aria-live="polite"></p>
+  <form method="post" class="stack-sm"
+        onsubmit="return confirm('키를 재발급하면 기존 유저스크립트는 새 키로 다시 붙여넣어야 해. 계속할까?');">
+    <input type="hidden" name="rotate_export_key" value="1" />
+    <button class="btn ghost" type="submit">키 재발급</button>
+  </form>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+<script>
+(function () {
+  var inp = document.getElementById('export-key');
+  var btn = document.getElementById('export-key-copy');
+  var msg = document.getElementById('export-key-msg');
+  if (!inp || !btn) return;
+  btn.addEventListener('click', function () {
+    function ok() { if (msg) { msg.textContent = '복사됨 ✓'; setTimeout(function () { msg.textContent = ''; }, 1800); } }
+    try { inp.focus(); inp.select(); } catch (e) {}
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(inp.value).then(ok, function () {
+        try { document.execCommand('copy'); ok(); } catch (e) {}
+      });
+    } else {
+      try { document.execCommand('copy'); ok(); } catch (e) {}
+    }
+  });
+})();
+</script>
 {% if push_enabled %}
 <script>
 (function () {

@@ -158,6 +158,39 @@ def _blog_proc_cache_put(key, data):
     _blog_proc_cache[key] = (data, now + _BLOG_PROC_CACHE_TTL)
 
 
+# 네이버 자동 export(v2) PENDING 슬롯 — 사용자 export_key → {rid, exp}. 앱에서 📤를
+# 누르면(mark) 슬롯을 세우고, 유저스크립트가 공개 pending API로 꺼내 간다(서브 시 삭제).
+# DB 컬럼 대신 모듈 dict(캐시 패턴). TTL 15분, 상한으로 메모리 폭주 방지.
+_NAVER_EXPORT_TTL = 900  # seconds
+_NAVER_EXPORT_MAX = 500
+_naver_export_pending = {}  # export_key -> (rid, expiry)
+
+
+def _naver_export_put(key, rid):
+    """pending 슬롯 세팅 — 삽입 전 만료·최고령 축출로 상한 유지."""
+    now = time.time()
+    if len(_naver_export_pending) >= _NAVER_EXPORT_MAX:
+        for k in [k for k, v in _naver_export_pending.items() if v[1] <= now]:
+            _naver_export_pending.pop(k, None)
+        if len(_naver_export_pending) >= _NAVER_EXPORT_MAX:
+            oldest = min(_naver_export_pending, key=lambda k: _naver_export_pending[k][1])
+            _naver_export_pending.pop(oldest, None)
+    _naver_export_pending[key] = (rid, now + _NAVER_EXPORT_TTL)
+
+
+def _naver_export_take(key):
+    """pending 슬롯 꺼내며 삭제(clear-on-serve, 재실행 방지). 없거나 만료면 None."""
+    if not key:
+        return None
+    hit = _naver_export_pending.pop(key, None)
+    if not hit:
+        return None
+    rid, exp = hit
+    if time.time() >= exp:
+        return None
+    return rid
+
+
 def _image_display_size(data):
     """이미지 바이트의 '표시 기준'(EXIF 방향 반영) (w, h)를 돌려준다. 실패 시 None.
 
@@ -2201,6 +2234,74 @@ def _refresh_blog_img_tokens(html):
         return out
 
     return _BLOG_IMG_RE.sub(_sub, html)
+
+
+def _gen_export_key():
+    """유저스크립트 인증용 URL-safe 토큰(~24자)."""
+    return secrets.token_urlsafe(18)
+
+
+def _ensure_export_key(u):
+    """사용자에게 export_key가 없으면 생성·저장(유니크 충돌 시 재시도). 값을 반환."""
+    if getattr(u, "export_key", None):
+        return u.export_key
+    for _ in range(5):
+        cand = _gen_export_key()
+        u.export_key = cand
+        try:
+            db.session.commit()
+            return cand
+        except IntegrityError:
+            db.session.rollback()
+            u = db.session.get(User, u.id)
+            if getattr(u, "export_key", None):
+                return u.export_key
+    return getattr(u, "export_key", None)
+
+
+def _hq(url):
+    """서명 blog-img URL에 &hq=1(원본 해상도)을 붙인다 — 유저스크립트가 풀해상도로 가져가게."""
+    if not url:
+        return url
+    return url + ("&" if "?" in url else "?") + "hq=1"
+
+
+def _build_export_payload(review):
+    """준비된 후기 → (doc_data, images). cd-doc-data(온페이지)와 공개 pending API 공용.
+
+    image 블록엔 hq blog-img URL을 ``__src``로 붙이고, ``images``는 ``{src,url}``(둘 다
+    hq)로 낸다. 유저스크립트는 ``images[i].url``로 풀해상도 바이트를 받아 파일을 만들고,
+    ``images[i].src``↔블록 ``__src``를 iK(사진 id+크롭)로 매칭한다(쿼리/토큰 무시라 hq 무해).
+    준비 안 됐으면 (None, None).
+    """
+    if not (review.status == "ready" and review.ai):
+        return None, None
+    data = _ensure_blocks(review.ai)
+    blocks = (data or {}).get("blocks") or []
+    photos_ordered = review.photos_ordered
+    images = []
+    for blk in blocks:
+        if not isinstance(blk, dict) or blk.get("type") != "image":
+            continue
+        pi = blk.get("photo_index")
+        if not (isinstance(pi, int) and 0 <= pi < len(photos_ordered)):
+            continue
+        p = photos_ordered[pi]
+        hq = _hq(blog_img_url(p, crop=blk.get("crop")))
+        blk["__src"] = hq
+        images.append({"src": hq, "url": hq})
+    created = review.created_at
+    visit_ymd = f"{created.year}년 {created.month}월" if created else ""
+    visit_foot = created.strftime("%Y. %m") if created else ""
+    doc_data = {
+        "title": (data or {}).get("title") or "",
+        "visitDate": visit_ymd,
+        "visitFoot": visit_foot,
+        "overallScore": review.overall_score,
+        "hashtags": (data or {}).get("hashtags") or [],
+        "blocks": blocks,
+    }
+    return doc_data, images
 
 
 def _review_copy_html(review):
@@ -4534,6 +4635,9 @@ def _register_routes(app: Flask):
         if cached is not None:
             resp = app.response_class(cached, mimetype="image/jpeg")
             resp.headers["Cache-Control"] = "public, max-age=86400"
+            # 네이버(blog.naver.com) 유저스크립트가 hq 바이트를 cross-origin fetch하므로
+            # 공개 서명 URL엔 CORS 허용을 붙인다(이미 공개 링크라 안전).
+            resp.headers["Access-Control-Allow-Origin"] = "*"
             return resp
         photo = db.session.get(Photo, photo_id)  # 토큰이 인가 — 커플 불문
         if photo is None:
@@ -4572,6 +4676,8 @@ def _register_routes(app: Flask):
         resp = app.response_class(data, mimetype=ctype)
         # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
         resp.headers["Cache-Control"] = "public, max-age=86400"
+        # 네이버 유저스크립트의 cross-origin hq fetch 허용(공개 서명 URL이라 안전).
+        resp.headers["Access-Control-Allow-Origin"] = "*"
         return resp
 
     @app.route("/memories/<int:photo_id>/thumb")
@@ -5135,6 +5241,13 @@ def _register_routes(app: Flask):
     def settings():
         u = current_user()
         if request.method == "POST":
+            # 네이버 업로더 유저스크립트 키 재발급(선택).
+            if request.form.get("rotate_export_key"):
+                u.export_key = None
+                db.session.commit()
+                _ensure_export_key(u)
+                flash("네이버 업로더 키를 재발급했어. 유저스크립트에 다시 붙여넣어줘.", "ok")
+                return redirect(url_for("settings"))
             new_name = (request.form.get("app_name") or "").strip()
             new_display = (request.form.get("display_name") or "").strip()
             if new_name:
@@ -5144,6 +5257,8 @@ def _register_routes(app: Flask):
             db.session.commit()
             flash("설정을 저장했어.", "ok")
             return redirect(url_for("settings"))
+        # 네이버 업로더(유저스크립트)용 개인 키 — 최초 표시 시 생성. 템플릿은 me.export_key.
+        _ensure_export_key(u)
         return render_template(
             "settings.html", current_app_name=Setting.get("app_name", DEFAULT_APP_NAME)
         )
@@ -5712,16 +5827,14 @@ def _register_routes(app: Flask):
         # _ensure_blocks로 통일해 블록 인덱스가 crop-save와 일치하게 한다. 뷰포트에
         # 띄울 '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 쓴다.
         crop_sections = []
-        # 정식(네이버 내부이미지) 삽입용 구조화 데이터 — 북마클릿이 setDocumentData로
-        # 네이티브 문서를 조립할 수 있게, 준비된 후기의 블록/제목/방문날짜/해시태그/총점을
-        # 페이지에 JSON으로 심는다(cd-doc-data). image 블록엔 copy_html에 나온 것과 같은
-        # blog-img 좌표를 담은 __src를 붙여, 북마클릿이 그 이미지의 업로드 결과와 매칭한다
-        # (토큰 e/t는 뷰마다 갱신되나, 매칭은 photo id + 크롭으로 하므로 무해).
-        doc_data = None
-        if review.status == "ready" and review.ai:
-            data = _ensure_blocks(review.ai)
-            blocks = (data or {}).get("blocks") or []
+        # 정식(네이버 내부이미지) 삽입용 구조화 데이터 — cd-doc-data와 공개 pending API가
+        # 같은 빌더(_build_export_payload)를 쓴다. image 블록엔 hq blog-img __src가 붙는다
+        # (온페이지 붙여넣기 흐름은 iK=사진 id+크롭으로 매칭해 hq 여부 무관). 크롭 UI용
+        # crop_sections는 그 블록들에서 파생한다(블록 인덱스가 crop-save와 일치).
+        doc_data, _export_images = _build_export_payload(review)
+        if doc_data:
             photos_ordered = review.photos_ordered
+            blocks = doc_data["blocks"]
             for i, blk in enumerate(blocks):
                 if not isinstance(blk, dict) or blk.get("type") != "image":
                     continue
@@ -5738,19 +5851,6 @@ def _register_routes(app: Flask):
                         "crop": crop,
                     }
                 )
-                # copy_html의 이미지 src와 같은 좌표(=크롭 적용) URL을 블록에 부착.
-                blk["__src"] = blog_img_url(p, crop=blk.get("crop"))
-            created = review.created_at
-            visit_ymd = f"{created.year}년 {created.month}월" if created else ""
-            visit_foot = created.strftime("%Y. %m") if created else ""
-            doc_data = {
-                "title": (data or {}).get("title") or "",
-                "visitDate": visit_ymd,
-                "visitFoot": visit_foot,
-                "overallScore": review.overall_score,
-                "hashtags": (data or {}).get("hashtags") or [],
-                "blocks": blocks,
-            }
         return render_template(
             "review_detail.html",
             review=review,
@@ -5759,6 +5859,63 @@ def _register_routes(app: Flask):
             crop_sections=crop_sections,
             doc_data=doc_data,
         )
+
+    # ---- 네이버 자동 export(v2) ----
+    @app.route("/api/naver-export/mark/<int:rid>", methods=["POST"])
+    @active_couple_required
+    def naver_export_mark(rid):
+        """앱에서 📤 누를 때 호출 — 이 후기를 '대기(pending)' 슬롯에 세운다.
+
+        요청자 커플 소유 + ready 후기만. 사용자 export_key(없으면 생성)에 {rid,exp}를
+        바인딩한다. 유저스크립트가 공개 pending API로 이 rid를 꺼내 자동 삽입한다.
+        same-origin 인증 요청(로그인 필요). 클립보드 복사는 프런트에서 별도 폴백.
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        if not (review.status == "ready" and review.ai):
+            return jsonify(ok=False, error="not_ready"), 409
+        key = _ensure_export_key(u)
+        if not key:
+            return jsonify(ok=False, error="no_key"), 500
+        _naver_export_put(key, rid)
+        return jsonify(ok=True)
+
+    @app.route("/api/naver-export/pending", methods=["GET", "OPTIONS"])
+    def naver_export_pending():
+        """공개(로그인 불필요) — export_key가 인가. 대기 중 후기의 자동삽입 페이로드.
+
+        네이버(blog.naver.com) 유저스크립트가 cross-origin으로 부른다 → CORS ``*`` +
+        OPTIONS preflight 허용. 키로 사용자를 찾아 비만료 pending rid가 있으면 payload를
+        내고 슬롯을 삭제(clear-on-serve, 재실행 방지). 없음/만료/잘못된 키 → 404(누설 방지).
+        쿠키 불필요.
+        """
+        if request.method == "OPTIONS":
+            resp = app.response_class("", status=204)
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "*"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+            return resp
+        key = (request.args.get("k") or "").strip()
+        rid = _naver_export_take(key) if key else None
+        if not rid:
+            abort(404)
+        user = User.query.filter_by(export_key=key).first()
+        review = db.session.get(BlogReview, rid)
+        if user is None or review is None or review.couple_id != user.couple_id:
+            abort(404)
+        doc_data, images = _build_export_payload(review)
+        if not doc_data:
+            abort(404)
+        payload = dict(doc_data)
+        payload["rid"] = rid
+        payload["images"] = images or []
+        resp = jsonify(payload)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
     @active_couple_required

@@ -82,6 +82,7 @@
   var box = document.getElementById('review-copy');
   var toast = document.getElementById('copy-toast');
   var saveUrl = {{ url_for('review_save_text', rid=review.id) | tojson }};
+  var markUrl = {{ url_for('naver_export_mark', rid=review.id) | tojson }};
   if (!btn || !box) return;
   function showToast(msg) {
     if (!toast) return;
@@ -168,6 +169,14 @@
     exportBtn.addEventListener('click', function () {
       exportBtn.disabled = true;
       showToast('사진 담는 중… 잠깐만');
+      // v2 자동화: 서버에 '이 후기 대기' 슬롯을 세운다(유저스크립트가 네이버에서 꺼내 자동
+      // 삽입). same-origin 인증 POST. 실패해도 아래 클립보드(v1 폴백)는 그대로 동작.
+      try {
+        fetch(markUrl, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        }).catch(function () {});
+      } catch (e) {}
       buildExportPayload().then(function (payload) {
         var text = JSON.stringify(payload);
         function done() {
