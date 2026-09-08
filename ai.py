@@ -1193,7 +1193,7 @@ def write_review(topic, location, prose, overall_score, photos):
         "금지, 이 후기만의 각도로 매번 다르게. 단 아래 [도입]·[정보 위치]·[마무리] "
         "흐름은 지켜. 사용할 수 있는 블록:\n"
         '  - {"type":"para","text":"본문(짧은 줄 \\n)"}\n'
-        '  - {"type":"heading","text":"검색어형 소제목"}\n'
+        '  - {"type":"heading","text":"소제목"}\n'
         '  - {"type":"image","photo_index":0}\n'
         '  - {"type":"info","items":[{"label":"분위기","value":".."}]}\n'
         '  - {"type":"ratings","items":[{"aspect":"분위기","score":9}]}\n'
@@ -1206,9 +1206,12 @@ def write_review(topic, location, prose, overall_score, photos):
         "(독자가 궁금할 질문) → (c) 창작자 반응 최소 1회(\"저도 처음엔 몰랐어요\") → "
         "(d) 궁금증으로 마무리.\n\n"
         "[본문 전개]\n"
-        "- heading(소제목)은 '문장형이되 검색어를 품게'(하이브리드). 예: '주차 되나요? "
-        "— 가는 길부터 정리'. 개수 3개 안팎. 소제목 형식을 매번 똑같이(예: 다 '— '로 "
-        "잇기) 하지 말고 변주해(질문형·명사구형 섞기).\n"
+        "- 소제목(heading)은 그 섹션을 '검색해서 찾을 만한 말'로 요약하되, 동시에 "
+        "'읽고 싶게' 만드는 궁금증·감정을 한 줄에 자연스럽게 녹여. 정해진 틀·부호"
+        "(대시 '—' 등)를 쓰지 말고, 그 섹션 내용에서 가장 자연스럽게 나오는 표현으로"
+        "(질문형·정보요약·감성 등 그때그때 다르게). 낚시성·똑같은 형식 반복 금지. "
+        "개수 3개 안팎, 그중 최소 1~2개엔 장소·메뉴 키워드가 자연스럽게 들어가게"
+        "(전부 강제하진 마).\n"
         "- 각 섹션은 단순 설명 나열 말고 [설명 → 반응 → 정보 → 의문 → 공감]을 "
         "자연스럽게 반복.\n"
         "- 작성자 생각·감정을 글 전체에 최소 4회 이상(\"솔직히 놀랐어요\",\"저희는 이게 "
@@ -1246,7 +1249,7 @@ def write_review(topic, location, prose, overall_score, photos):
         '  "title": "검색 의도를 담은 포스트 제목",\n'
         '  "blocks": [ {"type":"para","text":"한 줄 결론"}, '
         '{"type":"para","text":"상황\\n문제제기\\n반응\\n궁금증"}, '
-        '{"type":"heading","text":"검색어형 소제목"}, '
+        '{"type":"heading","text":"소제목"}, '
         '{"type":"para","text":"짧은 줄들 \\n 로"}, {"type":"image","photo_index":0}, '
         '{"type":"info","items":[{"label":"분위기","value":".."}]}, '
         '{"type":"ratings","items":[{"aspect":"분위기","score":9}]}, '
