@@ -1,0 +1,6 @@
+# 테스트 전용 의존성. 프로덕션 이미지는 requirements.txt만 설치한다
+# (Render 무료티어 512MB — 런타임에 필요 없는 건 넣지 않는다).
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests -q
+-r requirements.txt
+pytest>=8.0

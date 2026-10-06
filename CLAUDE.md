@@ -47,7 +47,13 @@
   개발은 `python app.py`(SQLite·debug), 프로덕션은 `gunicorn app:app`.
 - **`models.py`** — SQLAlchemy: `Couple`·`User`·`DailyQuestion`·`Answer`·`Setting`·
   `MonthlyReport`(캐시된 월간 정성 인사이트) 등.
-- **`ai.py`** — `claude` CLI 래퍼. `generate_daily_question`, `generate_monthly_qualitative`.
+- **`ai.py`** — `claude` CLI 래퍼. `generate_daily_question`, `generate_monthly_qualitative`,
+  `write_review`(블로그 후기). 긴 생성 프롬프트는 `ai.load_prompt(<이름>)`로 **파일에서** 읽는다.
+- **`prompts/`** — 파일로 분리한 생성 프롬프트(`blog-review.md`). **글 품질 튜닝은 여기서** 한다
+  — 파이썬을 안 건드린다. 파일 맨 위 사람용 머리말은 첫 `---`까지 잘려 나가고, `{{...}}`
+  자리만 런타임에 치환된다.
+- **`tests/`** — pytest(네트워크·`claude` 없이 돈다 — 임시 SQLite + `_run_claude` 가짜).
+  `pip install -r requirements-dev.txt` 후 `python -m pytest tests -q`.
 - **`insights.py`** — 정량 지표 (DB 집계). **점수화·궁합% 금지**, 정직한 카운트만.
 - **`templates/`** — `base.html` + 화면별. **파일명은 정상**(옛 래퍼의 `intex.html` 오타는 제거됨).
 - **`static/`** — `style.css`(핑크 테마)·`sw.js`(서비스 워커)·`emoji/`(Fluent, MIT)·`icons/`(PWA).

@@ -1856,6 +1856,9 @@ def generate_review(app, review_id):
                 location = review.location
                 prose = review.prose
                 overall = review.overall_score
+                # v2 '재료' 칸(선택 입력). 빈 칸은 dict에 안 들어가고 프롬프트에서도
+                # 통째로 빠진다 — 옛 후기(컬럼 NULL)는 {}라 v1과 같은 입력이 된다.
+                details = review.details
 
                 # 캡션·채점·추천과 '같은' 세마포어로 claude 콜을 직렬화. claude가
                 # 터져도 실패로만 취급(스레드를 죽이지 못하게).
@@ -1863,7 +1866,8 @@ def generate_review(app, review_id):
                 try:
                     try:
                         result = ai.write_review(
-                            topic, location, prose, overall, photos_arg
+                            topic, location, prose, overall, photos_arg,
+                            details=details,
                         )
                     except Exception:  # noqa: BLE001
                         log.exception(
@@ -2045,7 +2049,11 @@ def _review_copy_text(review):
 
     자유형 blocks를 순서대로 평문화한다. 이미지는 네이버에 붙여넣을 수 없으니
     사진 자리에는 ``[사진 N] — 캡션`` 마커를 둔다(사진 순서대로 1부터 번호).
-    강조 토큰은 제거. 초안이 없으면 "".
+    강조 토큰은 제거(v2는 애초에 강조를 쓰지 않지만, 옛 후기에는 남아 있다).
+
+    v2 스키마는 para/heading/image/quote + 시스템이 붙이는 ratings 하나뿐이다.
+    ``info``(요약표)·``faq``(고정 Q&A) 분기는 **옛 후기 호환용으로만** 남겨 둔다 —
+    새 초안에는 더 이상 나오지 않는다. 초안이 없으면 "".
     """
     data = _ensure_blocks(review.ai)
     if not data:
@@ -2100,6 +2108,8 @@ def _review_copy_text(review):
                 lines.append("▶ 핵심 정보")
                 lines.extend(rows)
         elif t == "ratings":
+            # v2: 표도, '⭐ 별점' 머리글도 쓰지 않는다 — 사용자가 매긴 총점 한 줄.
+            # ('전체 만족도'는 v2가 붙이는 총점 항목이라 '총점'으로 적는다.)
             rows = []
             for it in (blk.get("items") or []):
                 if not isinstance(it, dict):
@@ -2108,10 +2118,11 @@ def _review_copy_text(review):
                 if not aspect:
                     continue
                 rs = max(0, min(10, int(it.get("score") or 0)))
-                rows.append(f"· {aspect} {_star_bar(rs)} ({rs}/10)")
+                if aspect == "전체 만족도":
+                    aspect = "총점"
+                rows.append(f"{aspect} {_star_bar(rs)} ({rs}/10)")
             if rows:
                 lines.append("")
-                lines.append("⭐ 별점")
                 lines.extend(rows)
         elif t == "faq":
             rows = []
@@ -2366,8 +2377,9 @@ def _review_copy_html(review):
     # 2) 시스템 헤더 — 실제 방문 날짜 + 핑크 내돈내산 라인(항상, 위치 고정).
     if visit_ymd:
         out.append(
+            # 볼드 금지(v2) — 시스템 헤더도 평문으로.
             f'<p style="text-align:center;margin:2px 0;line-height:2;">'
-            f'<b>방문 날짜</b> : {esc(visit_ymd)}</p>'
+            f'방문 날짜 : {esc(visit_ymd)}</p>'
         )
     out.append(
         '<p style="text-align:center;color:#e64980;font-weight:700;'
@@ -2387,14 +2399,21 @@ def _review_copy_html(review):
             if "방문" in label and ("날짜" in label or "일" in label):
                 continue  # 방문 날짜는 시스템 헤더가 담당 → AI값 무시(중복·지어냄 방지)
             rows.append(
+                # 볼드 금지(v2). info 블록은 이제 생성되지 않고 옛 후기에만 남아 있다.
                 f'<p style="text-align:center;margin:2px 0;line-height:2;">'
-                f'<b>{esc(label)}</b> : {esc(value)}</p>'
+                f'{esc(label)} : {esc(value)}</p>'
             )
         if rows:
             add_hr()
             out.extend(rows)
 
     def render_ratings(items):
+        """별점을 **표가 아니라 평문 줄**로 낸다 (v2).
+
+        gf-blog 규율이 요약표·장단점표를 금지하고 네이버 발행 본문에서 표를 쓰지
+        말라고 한다. 별점 자체는 사용자가 직접 매긴 값이라 남기되, 표 대신 한 줄로
+        적는다. 옛 후기의 항목별 별점(AI가 만들던 값)도 같은 평문 줄로 그린다.
+        """
         rows = []
         for it in items or []:
             if not isinstance(it, dict):
@@ -2403,21 +2422,18 @@ def _review_copy_html(review):
             if not aspect:
                 continue
             rs = max(0, min(10, int(it.get("score") or 0)))
+            if aspect == "전체 만족도":
+                continue  # 바로 아래 '총점' 줄과 같은 값이라 중복
             rows.append(
-                f'<tr><td style="padding:9px;">{esc(aspect)}</td>'
-                f'<td style="padding:9px;">{_star_bar(rs)} ({rs}/10)</td></tr>'
+                f'<p style="text-align:center;margin:2px 0;line-height:2;">'
+                f'{esc(aspect)} {_star_bar(rs)} ({rs}/10)</p>'
             )
         rows.append(
-            f'<tr><td style="padding:9px;"><b>총점</b></td>'
-            f'<td style="padding:9px;"><b>{_star_bar(score)} ({score}/10)</b></td></tr>'
+            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
+            f'총점 {_star_bar(score)} ({score}/10)</p>'
         )
         add_hr()
-        out.append(
-            '<table border="1" style="border-collapse:collapse;width:100%;'
-            'font-size:14.5px;text-align:center;">'
-            '<tr style="background:#faf3f6;"><th style="padding:9px;">항목</th>'
-            '<th style="padding:9px;">별점</th></tr>' + "".join(rows) + "</table>"
-        )
+        out.extend(rows)
 
     def render_faq(items):
         faq_out = []
@@ -2429,7 +2445,7 @@ def _review_copy_html(review):
             if not q or not a:
                 continue
             faq_out.append(
-                f'<p style="text-align:center;margin:2px 0;"><b>Q. {esc(q)}</b></p>'
+                f'<p style="text-align:center;margin:2px 0;">Q. {esc(q)}</p>'
             )
             faq_out.append(
                 f'<p style="text-align:center;margin:2px 0 12px;">A. {esc(a)}</p>'
@@ -2498,16 +2514,16 @@ def _review_copy_html(review):
             render_quote(blk.get("text"))
             has_quote = True
 
-    # 4) quote 블록이 없으면 마무리 총평(주제 기반)을 붙여 방문월 footer를 보장.
+    # 4) quote 블록이 없으면 마무리 한 줄을 붙여 방문월 footer를 보장.
+    #    v2: "한 번 가보시길 추천드려요" 류 확언을 뺐다 — 코호트 23편에 그런 확언이
+    #    한 건도 없고, 끝은 대부분 "변동될 수 있으니 방문 전 확인" 안내로 맺는다.
     if not has_quote:
         topic = (review.topic or "").strip()
+        tail = "운영시간과 메뉴는 변동될 수 있으니 방문 전 최신 정보를 확인해 주세요."
         if topic:
-            closing = (
-                f"{esc(topic)} 다녀온 진짜 후기였어요.<br>"
-                "여기 고민 중이라면 한 번 가보시길 추천드려요 🤍"
-            )
+            closing = f"{esc(topic)} 다녀온 후기였어요.<br>{tail}"
         else:
-            closing = "다녀온 진짜 후기였어요.<br>좋은 데이트 되시길 추천드려요 🤍"
+            closing = f"다녀온 후기였어요.<br>{tail}"
         add_hr()
         foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
         out.append(
@@ -5724,6 +5740,33 @@ def _register_routes(app: Flask):
                 out.append(i)
         return out
 
+    def _parse_review_details(src):
+        """폼에서 v2 '재료' 칸 8개를 파싱해 ``{필드: 값|''}`` dict로.
+
+        전부 **선택 입력**이라 빈 칸은 ``''``로 둔다(저장 시 None = '모른다'). 길이는
+        컬럼 정의에 맞춰 자른다 — 폼이 maxlength를 걸지만 서버에서도 강제한다.
+        키 순서는 ``BlogReview.DETAIL_FIELDS``(= 글의 흐름 순서)를 따른다.
+        """
+        limits = {
+            "visited_when": 100,
+            "visit_reason": 300,
+            "access_note": 300,
+            "waiting": 200,
+            "order_items": 2000,
+            "highlight": 300,
+            "downside": 300,
+            "researched": 2000,
+        }
+        return {
+            f: (src.get(f) or "").strip()[: limits[f]]
+            for f in BlogReview.DETAIL_FIELDS
+        }
+
+    def _apply_review_details(review, details):
+        """파싱된 재료 dict를 모델에 반영(빈 문자열은 NULL로 — '모른다'와 같은 뜻)."""
+        for f in BlogReview.DETAIL_FIELDS:
+            setattr(review, f, (details.get(f) or "").strip() or None)
+
     def _review_form_error(u, form, editing=None):
         """작성/수정 폼을 입력값을 유지한 채 다시 렌더(유효성 오류 경로)."""
         return render_template(
@@ -5772,6 +5815,8 @@ def _register_routes(app: Flask):
         if score is not None:
             score = max(0, min(10, score))
 
+        details = _parse_review_details(request.form)
+
         # 폼 상태(오류 시 재렌더용) — 파싱된 값들을 그대로 담는다.
         form = {
             "topic": topic,
@@ -5779,6 +5824,7 @@ def _register_routes(app: Flask):
             "prose": prose,
             "overall_score": score if score is not None else 0,
             "photo_ids": photo_ids,
+            **details,
         }
         if not topic:
             flash("주제/장소를 입력해줘.", "error")
@@ -5800,6 +5846,7 @@ def _register_routes(app: Flask):
             photo_ids=json.dumps(photo_ids) if photo_ids else None,
             status="pending",  # (P2) 바로 백그라운드 초안 생성으로.
         )
+        _apply_review_details(review, details)
         db.session.add(review)
         db.session.commit()
         # (P2) 백그라운드로 네이버 블로그 초안 생성을 시작한다(요청 경로 아님).
@@ -5945,6 +5992,8 @@ def _register_routes(app: Flask):
                 "prose": review.prose,
                 "overall_score": review.overall_score,
                 "photo_ids": review.photo_ids_list,
+                # v2 재료 칸 — 옛 후기는 전부 빈 칸으로 열린다(컬럼이 NULL).
+                **{f: (getattr(review, f, None) or "") for f in BlogReview.DETAIL_FIELDS},
             }
             return render_template(
                 "review_form.html",
@@ -5964,12 +6013,15 @@ def _register_routes(app: Flask):
         if score is not None:
             score = max(0, min(10, score))
 
+        details = _parse_review_details(request.form)
+
         form = {
             "topic": topic,
             "location": location or "",
             "prose": prose,
             "overall_score": score if score is not None else 0,
             "photo_ids": photo_ids,
+            **details,
         }
         if not topic:
             flash("주제/장소를 입력해줘.", "error")
@@ -5986,6 +6038,7 @@ def _register_routes(app: Flask):
         review.prose = prose
         review.overall_score = score
         review.photo_ids = json.dumps(photo_ids) if photo_ids else None
+        _apply_review_details(review, details)
         # 입력이 바뀌었으니 초안을 새로 뽑는다 — pending으로 되돌리고 편집본은
         # 비워(새 초안이 복사본으로 보이게) 백그라운드 재생성을 시작한다.
         review.status = "pending"
@@ -6041,6 +6094,46 @@ def _register_routes(app: Flask):
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(ok=True)
         flash("복사본을 저장했어.", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/title", methods=["POST"])
+    @active_couple_required
+    def review_pick_title(rid):
+        """제목 후보 중 하나를 최종 제목으로 고른다(ai_json.title 교체).
+
+        v2는 AI가 '타깃 한 문장 → 후보 3개(서로 다른 구조) → 선정 + 이유'를 내므로
+        사람이 화면에서 바꿔 고를 수 있어야 한다. 요청: ``index`` = title_candidates의
+        0-based 인덱스. 후보가 없거나 범위 밖이면 400.
+
+        초안(ai_json)만 고치고 **편집본(edited_text)은 비운다** — 편집본은 옛 제목이
+        박힌 HTML이라 그대로 두면 화면 제목과 초안이 어긋난다(프런트가 편집본이 있을
+        때만 confirm을 띄운다). cross-couple은 404.
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        data = review.ai
+        cands = (data or {}).get("title_candidates") or []
+        try:
+            idx = int((request.form.get("index") or "").strip())
+        except (ValueError, TypeError):
+            idx = -1
+        if not isinstance(cands, list) or not (0 <= idx < len(cands)):
+            abort(400)
+        picked = cands[idx]
+        new_title = ""
+        if isinstance(picked, dict):
+            new_title = (picked.get("title") or "").strip()
+        elif isinstance(picked, str):
+            new_title = picked.strip()
+        if not new_title:
+            abort(400)
+        data["title"] = new_title
+        review.ai_json = json.dumps(data, ensure_ascii=False)
+        review.edited_text = None
+        db.session.commit()
+        flash("제목을 바꿨어. 미리보기도 새 제목으로 다시 만들었어 ✏️", "success")
         return redirect(url_for("review_detail", rid=review.id))
 
     @app.route("/reviews/<int:rid>/crop", methods=["POST"])
