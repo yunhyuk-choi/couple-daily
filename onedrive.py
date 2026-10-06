@@ -419,3 +419,166 @@ def list_folder():
         return r.json().get("value", [])
     except requests.RequestException as e:
         raise OneDriveError(f"list request failed: {e}") from e
+
+
+# --------------------------------------------------------------------------- #
+# 동영상 — 사진과 같은 폴더에 보관하되 **바이트는 절대 통째로 메모리에 올리지 않는다**
+# --------------------------------------------------------------------------- #
+# 사진은 ≤50MB를 bytes 로 읽어 한 번에 PUT 해도 됐다. 동영상은 같은 상한이어도
+# Render 무료티어(512MB · 0.1 CPU)에서 "업로드 바이트 + 요청 버퍼 + 파이썬 힙"이
+# 겹치면 위험하다. 그래서 동영상은 **업로드 세션(청크 PUT)** 으로 올리고,
+# 내려줄 때도 **스트리밍(Range 통과)** 으로 흘린다. 어느 경로에도 전체 바이트를
+# 담는 변수가 없다.
+#
+# ⛔ 동영상은 ``_bytes_cache`` 에 넣지 않는다 — 수십 MB짜리를 캐시하면 그 캐시 하나가
+#    워커를 죽인다. 사진 캐시의 상한(64개)은 수백 KB짜리를 전제로 잡힌 수치다.
+
+# Graph 업로드 세션 규약: 마지막 청크를 제외한 모든 청크는 320 KiB의 배수여야 한다.
+_CHUNK = 320 * 1024 * 10  # 3.2 MiB — 메모리 상한이자 PUT 한 번의 크기
+UPLOAD_TIMEOUT = 120  # 청크 PUT 은 파일 PUT 보다 더 오래 걸릴 수 있다
+
+
+def upload_stream(stream, size, filename):
+    """파일류 객체를 ``couple-daily/<unique-name>`` 으로 **청크 업로드**한다.
+
+    Graph 업로드 세션(``createUploadSession``)을 열고 ``Content-Range`` 를 붙여
+    조각조각 PUT 한다. 한 번에 메모리에 올라오는 것은 ``_CHUNK`` 바이트뿐이라
+    50MB짜리 영상을 올려도 워커 메모리는 3MB대에서 평평하다.
+
+    ``size`` 는 **정확한 총 바이트** 여야 한다(Content-Range 의 분모). 반환은
+    ``upload_photo`` 와 같은 ``(item_id, stored_name)`` 이고, 실패는 OneDriveError.
+    """
+    if size <= 0:
+        raise OneDriveError("upload stream has no bytes")
+    try:
+        _ensure_folder()
+        name = _safe_unique_name(filename or "video")
+        r = requests.post(
+            f"{GRAPH_BASE}/me/drive/root:/{FOLDER}/{name}:/createUploadSession",
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+            json={"item": {"@microsoft.graph.conflictBehavior": "rename"}},
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code not in (200, 201):
+            raise OneDriveError(f"upload session failed (status={r.status_code})")
+        upload_url = r.json().get("uploadUrl")
+        if not upload_url:
+            raise OneDriveError("upload session returned no uploadUrl")
+
+        sent = 0
+        item = None
+        while sent < size:
+            chunk = stream.read(min(_CHUNK, size - sent))
+            if not chunk:
+                break
+            first, last = sent, sent + len(chunk) - 1
+            # uploadUrl 은 이미 인증된 URL이다 — Bearer 를 붙이지 않는다(붙이면 거부).
+            cr = requests.put(
+                upload_url,
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {first}-{last}/{size}",
+                },
+                data=chunk,
+                timeout=UPLOAD_TIMEOUT,
+            )
+            if cr.status_code in (200, 201):
+                item = cr.json()
+            elif cr.status_code != 202:
+                # 실패하면 세션을 지워 OneDrive 에 반쪽 파일을 남기지 않는다.
+                try:
+                    requests.delete(upload_url, timeout=HTTP_TIMEOUT)
+                except requests.RequestException:
+                    pass
+                raise OneDriveError(f"chunk upload failed (status={cr.status_code})")
+            sent += len(chunk)
+
+        if sent != size:
+            try:
+                requests.delete(upload_url, timeout=HTTP_TIMEOUT)
+            except requests.RequestException:
+                pass
+            raise OneDriveError(f"upload truncated ({sent}/{size} bytes)")
+        if not item or not item.get("id"):
+            raise OneDriveError("upload returned no item id")
+        return item["id"], item.get("name") or name
+    except OneDriveError:
+        raise
+    except requests.RequestException as e:
+        raise OneDriveError(f"upload request failed: {e}") from e
+
+
+def open_range(item_id, range_header=None):
+    """아이템 바이트를 **스트리밍으로** 연다 (Range 통과).
+
+    ``GET /me/drive/items/<id>/content`` 는 신선한 pre-auth CDN 링크로 302 하고,
+    ``requests`` 가 그 리다이렉트를 따라간다(크로스 호스트 홉에서 Authorization 은
+    떨어지지만 ``Range`` 는 유지된다 — 목적지는 이미 인증된 URL이다).
+
+    반환: ``(status, headers, response)``. ``response`` 는 ``stream=True`` 상태라
+    **호출자가 ``iter_content`` 로 흘리고 반드시 ``close()`` 해야 한다.** 아이템이
+    없으면 ``(404, {}, None)``.
+
+    ⚠️ 응답 바이트를 여기서 읽지 않는다 — 읽는 순간 50MB가 메모리에 올라온다.
+    """
+    headers = dict(_auth_headers())
+    if range_header:
+        headers["Range"] = range_header
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
+            headers=headers,
+            timeout=HTTP_TIMEOUT,
+            stream=True,
+        )
+    except requests.RequestException as e:
+        raise OneDriveError(f"range request failed: {e}") from e
+    if r.status_code == 404:
+        r.close()
+        return 404, {}, None
+    if r.status_code not in (200, 206):
+        status = r.status_code
+        r.close()
+        raise OneDriveError(f"range fetch failed (status={status})")
+    return r.status_code, r.headers, r
+
+
+def probe_direct_cors(item_id, origin):
+    """**실측**: 이 아이템의 OneDrive 직접 다운로드 URL을 브라우저가 Canvas 로
+    읽을 수 있는가? — 즉 CDN 이 ``Access-Control-Allow-Origin`` 을 주는가.
+
+    후보 (a)(Microsoft CDN 직접 스트리밍, 서버 비용 0)를 **주장이 아니라 측정으로**
+    가르기 위한 함수다. 다운로드 URL에 ``Origin`` 헤더를 붙여 1바이트만 요청하고,
+    돌아온 응답 헤더에서 ACAO 와 206(Range) 지원을 본다.
+
+    ⚠️ 반환값에 **URL을 절대 담지 않는다** — pre-auth 다운로드 URL 자체가
+    자격증명이다(쿼리에 토큰이 박혀 있다). 담는 것은 판정과 헤더 값뿐이다.
+
+    반환: ``{"ok": bool, "acao": str|None, "range": bool, "status": int}`` 또는
+    조회조차 못 했으면 ``None``.
+    """
+    try:
+        url = get_download_url(item_id)
+    except OneDriveError:
+        return None
+    if not url:
+        return None
+    try:
+        r = requests.get(
+            url,
+            headers={"Origin": origin, "Range": "bytes=0-0"},
+            timeout=HTTP_TIMEOUT,
+            stream=True,
+        )
+    except requests.RequestException:
+        return None
+    try:
+        acao = r.headers.get("Access-Control-Allow-Origin")
+        return {
+            "ok": bool(acao and acao in ("*", origin)),
+            "acao": acao,
+            "range": r.status_code == 206,
+            "status": r.status_code,
+        }
+    finally:
+        r.close()

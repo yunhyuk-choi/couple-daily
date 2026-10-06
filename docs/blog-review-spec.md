@@ -238,6 +238,7 @@ v2에서 바뀐 것:
 | POST | `/reviews/<rid>/save-text` | `review_save_text` | (P2) 편집한 네이버 복사본 저장 |
 | POST | `/reviews/<rid>/thumbnail` | `review_thumbnail_generate` | (Step 4) 썸네일 카피 (재)생성 — 백그라운드 |
 | POST | `/reviews/<rid>/thumbnail/state` | `review_thumbnail_state` | (Step 4) 고른 후보·줄인 문구·쓸 사진·**렌더 측정값** 저장(서버가 넘침 재판정) |
+| POST | `/reviews/<rid>/gif/state` | `review_gif_state` | (Step 5) 고른 영상·구간·프리셋 + **브라우저가 보고한 결과/진단** 저장(서버가 용량 재판정) |
 | POST | `/reviews/<rid>/delete` | `review_delete` | 삭제 → 목록 |
 
 - cross-couple rid → 404.
@@ -500,3 +501,160 @@ gf-blog `render.py` 의 두 assert 를 **같은 식으로** 유지한다:
 `tests/test_thumbnail.py` — 네트워크·`claude` 없이 돈다. 템플릿 수치 보존 · 카피 정규화 ·
 넘침 재판정(클라이언트 주장 무시) · **초안 생성 경로 격리** · 라우트 커플 스코프 ·
 화면 렌더 · 렌더러에 폰트 축소 코드가 없음을 검증한다.
+
+## 13. Step 5 — 동영상 → GIF (노선 2 Step 5)
+
+네이버 맛집 글에 넣을 **움직이는 한 컷**을 만든다. gf-blog 에는 이 기능이 없다
+(MOV 에서 '대표 프레임' 정지 이미지를 뽑는 언급만 있고 ffmpeg 도 GIF 코드도 없다) —
+**가져올 자산 없이 새로 만든 것**이다. 썸네일(§12)과 같은 철학으로 간다.
+
+### 13.1 선행 판단 — 서버에 ffmpeg 를 올리지 않는다
+
+| | |
+|---|---|
+| 프로덕션 | Render 무료티어 **512MB · 0.1 CPU** |
+| 베이스 이미지 | `python:3.12-slim` — **ffmpeg 없음** |
+| 설치하면 | 이미지가 수백 MB 불고, 0.1 CPU 에서 480p 3초 인코딩도 요청 타임아웃을 넘는다 |
+
+→ **변환은 브라우저가 한다.** 썸네일이 Chromium 대신 사용자의 브라우저에 DOM+Canvas
+렌더를 맡긴 것과 **같은 판단**이고, 브라우저에는 이미 OS 하드웨어 디코더가 있으니
+공짜로 쓰는 게 맞다. 서버가 하는 일은 세 가지뿐이다:
+
+1. 프리셋·한도를 **단일 원천**으로 내려보낸다 (`gifmaker.spec()`).
+2. 원본 바이트를 **Range(206)로 흘린다** (`/videos/<id>/stream`).
+3. 브라우저가 보고한 결과를 **다시 판정한다** (`gifmaker.evaluate_result`).
+
+회귀 테스트가 이 판단을 못박는다 — `gifmaker.py`·`app.py`·`onedrive.py` 어디에도
+ffmpeg 를 실행하는 코드가 없고 `Dockerfile`·`requirements.txt` 도 설치하지 않는다.
+
+### 13.2 영상 바이트를 브라우저에 어떻게 넘기나 — (a) 직접 vs (b) 프록시
+
+| | (a) OneDrive 직접 | (b) 앱 프록시 |
+|---|---|---|
+| 비용 | 서버 대역폭 0 (Microsoft CDN) | 서버가 중계 |
+| Canvas 픽셀 읽기 | **CDN 이 `Access-Control-Allow-Origin` 을 줘야 한다.** 없으면 캔버스가 오염돼 프레임 추출이 *아예* 막힌다 | same-origin 이라 taint 없음 |
+| seek | 다운로드 URL 이 206 을 줘야 한다 | 우리가 Range 를 중계한다 |
+| 자격증명 | 다운로드 URL은 쿼리에 토큰이 박힌 **자격증명**이다 — DOM 에 흘러간다 | 노출 없음 |
+
+**주장하지 않고 잰다.** `/videos/<id>/source` 가 `onedrive.probe_direct_cors` 로 실제
+다운로드 URL 에 `Origin` 을 붙여 1바이트를 받아 보고, **ACAO 가 있고 206 도 되면 (a)**,
+아니면 **(b)** 를 고른다. 결과는 `videos.cors_probe` 에 남아 영상당 한 번만 잰다.
+ACAO 가 없으면 **다운로드 URL 을 내보내지 않는다** — 쓰지도 못할 자격증명을 흘릴
+이유가 없다. 이 리포에 이미 기록된 실측("personal-OneDrive pre-auth 다운로드 URL 은
+거의 즉시 만료된다" — `onedrive.py` `_bytes_cache` 주석)도 (b) 쪽을 가리킨다.
+
+⚠️ 이 앱의 이미지 프록시에는 **Range 처리가 없었다**(206 응답 0건). 영상은 seek 이
+필수라 그대로 쓸 수 없어 `/videos/<id>/stream` 을 새로 열었다. Range 헤더는 **그대로
+OneDrive 로 전달**하고 돌아온 206 을 중계한다 — 서버가 구간을 직접 자르지 않으므로
+파싱 버그로 엉뚱한 바이트를 줄 일이 없고, 전체를 받아 쪼갤 필요도 없다. 응답은
+제너레이터라 **한 번에 256KB만** 메모리에 있다.
+
+### 13.3 보관 — 사진과 같은 OneDrive, 다른 테이블
+
+영상은 버리지 않고 OneDrive `couple-daily` 폴더에 보관한다(사용자 결정). 다만
+`photos` 가 아니라 **`videos` 테이블**이다 — 사진 경로에는 자동 캡션(vision)·EXIF·
+블로그 서명 URL·썸네일 프록시가 줄줄이 달려 있고, 0.1 CPU 워커에 50MB 영상을 먹이는
+길을 아예 만들지 않는 게 요점이다. 브랜드-뉴 테이블이라 `db.create_all()` 이 만든다
+(ALTER 마이그레이션은 `blog_reviews.gif_json` 하나뿐).
+
+업로드는 **청크 스트림**이다(`onedrive.upload_stream` — Graph 업로드 세션, 3.2MiB
+청크). 사진처럼 `file.read()` 로 통째로 읽지 않으므로 50MB 영상을 올려도 워커 메모리는
+평평하다.
+
+### 13.4 디코딩은 2단 — 네이티브 우선, 실패하면 그때 WASM
+
+브라우저는 자체 코덱이 아니라 **OS 코덱을 빌려 쓴다.** 아이폰 MOV(HEVC) 기준:
+
+| 기기 | 코덱 출처 | 타는 경로 |
+|---|---|---|
+| 아이폰 Safari | iOS 네이티브 HEVC | ① 네이티브 |
+| 맥북 | macOS 시스템 HEVC | ① 네이티브 |
+| 갤럭시 (Android Chrome) | 플랫폼 하드웨어 디코더 | ① 네이티브 |
+| 윈도우 데스크톱 | **HEVC Video Extensions 가 깔려 있어야 한다** | 있으면 ①, 없으면 ② |
+
+즉 **구멍은 윈도우 한 경우뿐**이다. 그래서 ②(ffmpeg.wasm 코어, 약 32MB)는 기본 경로가
+아니라 **폴백**이고, ①이 실패한 것이 *확인된 뒤에만* 로드한다(lazy). 되는 기기에
+32MB 다운로드와 느린 디코딩을 물리는 건 손해다. 위 표는 분기 설명이고, **실제 판정은
+`static/gif.js` 의 진단 코드가 그 기기에서 직접 한다.**
+
+* ① 네이티브 — `<video>` seek → Canvas `drawImage` → `getImageData`.
+* ② 폴백 — `@ffmpeg/core` **ESM 빌드를 우리 모듈 워커에서 직접 import** 해 rawvideo
+  RGBA 프레임을 뽑는다. 감싸개(`@ffmpeg/ffmpeg`)는 쓰지 않는다(§13.7 실측 참조).
+
+**GIF 인코더는 두 경로가 공유한다** — 그래야 결과가 같다. 인코더(`gifenc`)는 *주 경로*라
+CDN 이 아니라 `static/vendor/` 에 사본으로 둔다(테스트가 sha256 으로 무결성을 본다).
+폴백 코어 32MB 는 담을 수 없어 CDN 이고, **못 받으면 조용히 깨지는 대신 기능을 막고
+말한다**(`loader-failed`) — 썸네일이 Pretendard 를 못 받으면 렌더를 거부한 것과 같다.
+
+### 13.5 조용한 실패를 만들지 않는다
+
+이 기능의 최악의 실패 모드는 **에러 없이 빈 프레임**이다. 그래서 모든 실패에 이름이
+있고(`gifmaker.DIAG_CODES`) 화면이 그 이름으로 말하며, 상태에 저장된다:
+
+| 코드 | 화면이 하는 말 |
+|---|---|
+| `native-ok` | 이 기기가 바로 디코딩해 — 빠른 경로 |
+| `wasm-ok` | 네이티브로 안 돼서 브라우저 안 디코더로 만들어. 처음 한 번 약 32MB, 더 느려 |
+| `decode-failed` | 이 기기에서는 이 영상을 디코딩할 수 없어 |
+| `tainted` | 픽셀을 읽을 수 없어 (CORS) |
+| `blank-frames` | 디코더가 에러 없이 빈 화면만 내고 있어 |
+| `loader-failed` | 폴백 디코더를 내려받지 못했어 — GIF 만들기를 막았어 |
+| `no-video` | 고를 영상이 없어 |
+
+판정은 **재서** 한다: 메타데이터 로드 성공 여부 · `video.error.code` · `getImageData`
+가 던지는가 · 뽑은 프레임이 전부 단색인가(`isUniform`). 32MB 다운로드와 느린 디코딩은
+진행률 없이는 멈춘 것처럼 보이므로 진행 바와 단계별 문구를 함께 낸다.
+
+### 13.6 용량 가드 — 넘치면 **막는다. 몰래 깎지 않는다**
+
+GIF 는 프레임마다 256색이라 480p 3초가 수 MB까지 간다. 썸네일의 넘침 검증과 **같은
+철학**이다:
+
+* 한도 `MAX_GIF_BYTES = 8MB`. 넘으면 **내려받기를 막고** "길이를 줄여줘"라고 말한다.
+* **자동으로 색·fps·크기를 낮추는 경로가 코드에 없다.** 줄이는 건 사람이고, 프리셋을
+  낮추는 것도 사람이 고른다.
+* 만들기 전에는 *예상* 용량을 보여 주되(화면·서버가 같은 계수를 쓴다), **판정은 언제나
+  실측**이다 — 인코딩이 끝난 실제 바이트 수로 가른다.
+* 클라이언트가 보낸 `ok` 주장은 읽지 않는다. 서버가 `bytes <= MAX_GIF_BYTES` 를 다시
+  계산한다(`gifmaker.evaluate_result`).
+
+길이 상한은 `MAX_DURATION = 6초`다. 폴백 디코딩이 느려도 견딜 만한 범위와 정합한다.
+
+### 13.7 실측으로 바로잡은 것 (되밟지 말 것)
+
+| 증상 | 원인 | 조치 |
+|---|---|---|
+| `Cannot find module 'blob:…'` | `@ffmpeg/ffmpeg` UMD 는 워커를 webpack 청크로 띄운다. 크로스 오리진 Worker 를 피해 blob 으로 넘기면 `classWorkerURL` 이 **모듈** 워커를 만드는데, 그 안의 코드는 `importScripts` 를 쓴다(모듈 워커엔 없다) | 감싸개를 버리고 **코어 ESM 을 우리 모듈 워커에서 직접 import** |
+| 20프레임 GIF 가 212KB → **4.6MB** | `gifenc` 는 타입드 배열의 `byteOffset/length` 를 보지 않고 **밑의 ArrayBuffer 전체**를 읽는다. WASM 경로 프레임은 한 덩어리 raw 버퍼의 *뷰* 라 프레임마다 영상 전체가 들어갔다 | 두 경로가 만나는 `encode()` 에서 자기 버퍼를 가진 사본으로 정규화 |
+| 12장이어야 할 것이 **4장** | `-ss` 를 `-i` 앞에 두면 빠른(키프레임) 탐색이고, 컨테이너 duration 이 실제보다 짧게 적힌 파일에서 그 길이에 맞춰 잘린다 | `-ss` 를 `-i` **뒤**로(정확 탐색). 몇 초 클립이라 비용이 작다 |
+| 백그라운드 탭에서 "굽는 중… 20/20" 에 영원히 멈춤 | 크롬이 숨은 탭의 `setTimeout` 을 1초→1분으로 조인다 | 프레임 사이 양보를 **MessageChannel** 로 |
+| 네이티브 136 vs 폴백 134 | 우리는 짝수로 내렸고 ffmpeg `scale=W:-2` 는 가장 가까운 짝수로 반올림한다 | 양쪽 다 **가장 가까운 짝수** (`gifmaker.target_height`·`targetSize`) |
+| 네이티브가 메타데이터조차 못 읽으면 폴백도 못 돌았다 | 목표 크기를 `<video>` 해상도에서만 구했다 | 모르면 `scale=W:-2` 가 높이를 정하고 **로그에서 읽는다** — 폴백이 꼭 필요한 기기에서만 죽던 구멍 |
+
+### 13.8 데이터·엔드포인트
+
+| | |
+|---|---|
+| 테이블 | `videos` (brand-new — `db.create_all()`). OneDrive item id + 이름 · 바이트 수 · MIME · `cors_probe`(실측 기록) |
+| 컬럼 | `blog_reviews.gif_json` (TEXT, nullable — `run_startup_migrations()` 가 ADD COLUMN) |
+| 내용 | `settings`(video_id·start·duration·width·fps) · `result`(bytes·width·height·frames·fps·duration·path·ok·over_by) · `diag` · `status` |
+| `POST /videos/upload` | 영상 1개를 **청크 스트림**으로 OneDrive 에 올리고 행 생성 (AJAX) |
+| `GET /videos/<id>/stream` | **Range(206)** 중계. same-origin 이라 Canvas taint 없음 |
+| `GET /videos/<id>/source` | 바이트 경로 (a)/(b) 판정 — 실측 후 행에 캐시 |
+| `POST /videos/<id>/delete` | OneDrive 에서 삭제 + 행 삭제 |
+| `POST /reviews/<rid>/gif/state` | 고른 설정 · **브라우저가 보고한 결과/진단** 저장(서버가 용량 재판정) |
+
+설정이 바뀌면 직전 결과는 버린다 — 옛 용량으로 "통과"라고 말하지 않게
+(썸네일에서 문구가 바뀌면 `render_check` 를 비운 것과 같은 결).
+
+**네이버 발행 연계는 이번 범위가 아니다.** GIF 는 사용자 기기로 내려받는 데까지다
+(썸네일과 동일). 구조는 막지 않았다 — 만든 GIF 는 Blob 이고, 나중에 `/blog-img` 처럼
+업로드·서명 URL 경로를 붙이면 된다.
+
+### 13.9 테스트
+
+`tests/test_gif.py` — 네트워크·`claude` 없이 돈다. 서버 ffmpeg 부재 · 벤더 인코더
+무결성(sha256) · 네이티브 우선 + lazy 폴백 · 프리셋 강제 · 용량 가드(클라이언트 주장
+무시) · 진단 코드 화이트리스트 · 업로드 스트리밍(바이트 통째 읽기 금지) · Range 중계와
+소켓 회수 · 커플 스코프 · (a)/(b) 실측 분기와 **서명 URL 비노출** · **초안 생성 경로
+격리**를 검증한다.

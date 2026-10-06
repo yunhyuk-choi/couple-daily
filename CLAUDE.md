@@ -64,6 +64,18 @@
   자세한 건 `docs/blog-review-spec.md` §12.
 - **`static/thumbnail.js`** — 그 브라우저 렌더러(DOM 미리보기 · `scrollWidth<=clientWidth`
   넘침 assert · `document.fonts.check` · Canvas 1080×1350 래스터).
+- **`gifmaker.py`** — 동영상 → GIF. 프리셋(가로폭·fps)·한도를 **단일 원천**으로 내고,
+  브라우저가 보고한 결과로 **용량을 다시 판정**한다. ⛔ **서버는 픽셀을 만들지 않는다** —
+  Render 무료티어(512MB·0.1 CPU, `python:3.12-slim`)에 ffmpeg 가 없고 올리지도 않는다.
+  넘치면 화질을 몰래 깎지 않고 **내려받기를 막고 길이를 줄이라고 말한다**.
+  영상 원본은 사진과 같은 OneDrive 폴더에 보관하되 **`videos` 테이블**로 분리한다
+  (vision 캡셔너·EXIF·블로그 서명 URL 경로에 50MB 영상이 들어가지 않게).
+  자세한 건 `docs/blog-review-spec.md` §13.
+- **`static/gif.js`** — 그 브라우저 변환기. **네이티브 우선**(`<video>` + Canvas),
+  실패가 확인되면 **그때 비로소** WASM 디코더(ffmpeg 코어 ESM, 약 32MB)를 lazy 로드한다.
+  실패에는 전부 이름이 있다(`gifmaker.DIAG_CODES`) — **조용한 빈 프레임 금지**.
+- **`static/vendor/gifenc.esm.js`** — GIF 인코더 사본(MIT). *주 경로*라 CDN 에 매달지
+  않는다(테스트가 sha256 으로 무결성을 본다). 손으로 고치지 말고 원본 URL 에서 다시 받는다.
 - **`prompts/`** — 파일로 분리한 생성 프롬프트(`blog-review.md`·`keyword-candidates.md`·
   `keyword-select.md`·`thumbnail-copy.md`). **글 품질 튜닝은 여기서** 한다
   — 파이썬을 안 건드린다. 파일 맨 위 사람용 머리말은 첫 `---`까지 잘려 나가고, `{{...}}`
@@ -87,6 +99,9 @@
 | `GET /history` | 지난 질문+양쪽 답 (공개된 것만) |
 | `GET /insight` | `?year=&month=` 월간 정량(실시간)+정성(DB 캐시본). claude는 요청 경로에서 호출 안 함; 없으면 백그라운드 생성 트리거 후 플레이스홀더 |
 | `GET,POST /settings` | 앱 이름(Setting)·내 표시이름 수정 · 네이버 업로더 키 재발급 · **네이버 API HUB 키(사용자별) 저장/연결확인/삭제** — 값은 다시 렌더하지 않고 설정됨/미설정만 |
+| `POST /videos/upload` | (Step 5) 동영상 1개를 **청크 스트림**으로 OneDrive 에 보관 — 바이트를 통째로 메모리에 올리지 않는다 |
+| `GET /videos/<id>/stream` | (Step 5) **Range(206) 중계.** `<video>` seek 의 전제이자 same-origin 이라 Canvas taint 없음 |
+| `GET /videos/<id>/source` | (Step 5) 바이트 경로 (a)OneDrive 직접 / (b)앱 프록시 를 **실측(ACAO·206)으로** 가르고 행에 캐시 |
 | `GET /manifest.json` | 동적 매니페스트(APP_NAME 반영) |
 | `GET /sw.js` | 서비스 워커 (루트 스코프) |
 | `GET /healthz` | 헬스체크 |

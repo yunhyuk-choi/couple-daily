@@ -397,6 +397,162 @@
   .rv-thumb-card .rv-thumb-check { max-height: 260px; font-size: 11px; }
 </style>
 
+{# ---- 동영상 → GIF (Step 5) -------------------------------------------------
+   썸네일과 **같은 자리에 같은 방식으로** 얹는다. 서버(Render 무료티어 512MB·0.1 CPU,
+   python:3.12-slim)엔 ffmpeg 가 없다 — 그래서 디코딩·프레임 추출·GIF 인코딩을 전부
+   **이 페이지를 보고 있는 브라우저**가 한다(static/gif.js). 영상 원본은 사진과 같은
+   OneDrive 폴더에 보관하고, 서버는 Range(206)로 바이트만 흘린다.
+   ⛔ 용량이 한도를 넘으면 화질을 몰래 깎지 않는다 — 내려받기를 막고 길이를 줄이라고 말한다. #}
+<div class="card rv-gif-card" id="rv-gif"
+     data-state-url="{{ url_for('review_gif_state', rid=review.id) }}"
+     data-upload-url="{{ url_for('video_upload') }}"
+     data-topic="{{ review.topic }}-GIF"
+     data-gifenc-url="{{ url_for('static', filename='vendor/gifenc.esm.js') }}">
+  <div class="rv-copy-head">
+    <strong>동영상 → GIF</strong>
+    <span class="muted rv-copy-hint">
+      네 브라우저가 직접 만들어 바로 내려받아 · 한도 {{ (gif_spec.max_bytes // 1048576) }}MB
+    </span>
+  </div>
+
+  {% if not onedrive_ready %}
+  <p class="muted small" style="margin:8px 0 0;">
+    영상은 OneDrive 에 보관해. OneDrive 연결이 필요해.
+  </p>
+  {% else %}
+
+  <div class="rv-gif-row">
+    <button type="button" class="btn ghost sm rv-gif-upload-btn">＋ 영상 올리기</button>
+    <input type="file" class="rv-gif-upload" accept="video/*"
+           style="display:none;" />
+    <span class="muted small">
+      {{ (gif_spec.max_video_bytes // 1048576) }}MB 이하 · 아이폰 .MOV 도 그대로 올리면 돼
+    </span>
+  </div>
+
+  <label class="rv-gif-field" {% if not gif_videos %}hidden{% endif %}>
+    <span class="muted small">영상 고르기 <span style="opacity:.7;">· OneDrive 에 보관된 우리 영상</span></span>
+    <select class="rv-gif-video">
+      {% for v in gif_videos %}
+      <option value="{{ v.id }}">{{ v.name }} ({{ '%.1f'|format(v.size / 1048576) }}MB)</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <p class="rv-gif-empty muted small" style="margin:10px 0 0;" {% if gif_videos %}hidden{% endif %}>
+    아직 올린 영상이 없어. 위에서 하나 올리면 구간을 잘라 GIF 로 만들 수 있어.
+  </p>
+
+  <div class="rv-gif-panel" {% if not gif_videos %}hidden{% endif %}>
+    {# 미리보기 — 이 <video> 가 곧 디코더다. same-origin 프록시라 Canvas 가 오염되지 않는다. #}
+    <video class="rv-gif-player" controls muted playsinline preload="auto"></video>
+
+    <div class="rv-gif-fields">
+      <label class="rv-gif-field">
+        <span class="muted small">시작점 · <span class="rv-gif-start-out">0.0초</span></span>
+        <input type="range" class="rv-gif-start" min="0" max="10" step="0.1" value="0" />
+      </label>
+      <label class="rv-gif-field">
+        <span class="muted small">길이 · <span class="rv-gif-dur-out">2.0초</span>
+          <span style="opacity:.7;">(최대 {{ gif_spec.max_duration }}초)</span></span>
+        <input type="range" class="rv-gif-dur"
+               min="{{ gif_spec.min_duration }}" max="{{ gif_spec.max_duration }}"
+               step="0.1" value="{{ gif_spec.default_duration }}" />
+      </label>
+    </div>
+
+    <div class="rv-gif-row" style="margin-top:8px;">
+      <button type="button" class="btn ghost sm rv-gif-play">▶ 구간만 재생</button>
+      <button type="button" class="btn ghost sm rv-gif-delete">🗑 이 영상 지우기</button>
+    </div>
+
+    <div class="rv-gif-fields">
+      <div class="rv-gif-field">
+        <span class="muted small">가로 크기</span>
+        <div class="rv-gif-widths rv-gif-chips">
+          {% for w in gif_spec.widths %}
+          <label><input type="radio" name="rv-gif-w" value="{{ w }}"
+                        {% if w == gif_spec.default_width %}checked{% endif %} /> {{ w }}px</label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="rv-gif-field">
+        <span class="muted small">fps <span style="opacity:.7;">· 높을수록 부드럽고 무거워</span></span>
+        <div class="rv-gif-fpses rv-gif-chips">
+          {% for f in gif_spec.fps %}
+          <label><input type="radio" name="rv-gif-fps" value="{{ f }}"
+                        {% if f == gif_spec.default_fps %}checked{% endif %} /> {{ f }}</label>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <p class="rv-gif-estimate muted small" style="margin:8px 0 0;"></p>
+    <p class="rv-gif-diag small" hidden></p>
+    <progress class="rv-gif-bar" max="1" value="0" hidden></progress>
+    <p class="rv-gif-warn" hidden></p>
+    <p class="rv-gif-status muted small"></p>
+    <p class="rv-gif-result muted small" style="margin:4px 0 0;"></p>
+    <img class="rv-gif-preview" alt="만든 GIF 미리보기" hidden />
+
+    <div class="rv-copy-actions" style="margin-top:10px;">
+      <button type="button" class="btn primary sm rv-gif-make" disabled>🎞 GIF 만들기</button>
+      <button type="button" class="btn sm rv-gif-download" disabled>⬇ GIF 내려받기</button>
+    </div>
+  </div>
+
+  {% if gif and gif.result %}
+  <p class="muted small" style="margin:8px 0 0;">
+    마지막으로 만든 것 — {{ gif.result.width }}×{{ gif.result.height }} ·
+    {{ gif.result.frames }}장 · {{ '%.1f'|format(gif.result.bytes / 1048576) }}MB ·
+    {{ '한도 안' if gif.result.ok else '한도 초과(내려받기 막힘)' }}
+    {% if gif.result.made_at %} · {{ gif.result.made_at }}{% endif %}
+  </p>
+  {% endif %}
+
+  <script type="application/json" id="rv-gif-spec">{{ gif_spec | tojson }}</script>
+  <script type="application/json" id="rv-gif-state">{{ gif | tojson }}</script>
+  <script type="application/json" id="rv-gif-videos">{{ gif_videos | tojson }}</script>
+  <script src="{{ url_for('static', filename='gif.js') }}" defer></script>
+  {% endif %}
+</div>
+
+<style>
+  .rv-gif-card .rv-gif-row {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 0;
+  }
+  .rv-gif-card .rv-gif-fields {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 8px; margin: 10px 0 0;
+  }
+  .rv-gif-card .rv-gif-field { display: flex; flex-direction: column; gap: 3px; }
+  .rv-gif-card .rv-gif-field select,
+  .rv-gif-card .rv-gif-field input[type="range"] { width: 100%; }
+  .rv-gif-card .rv-gif-field select {
+    padding: 7px 9px; border: 1px solid var(--line, #e7d9e0); border-radius: 8px;
+    font: inherit; background: #fff; box-sizing: border-box;
+  }
+  .rv-gif-card .rv-gif-chips { display: flex; gap: 10px; flex-wrap: wrap; padding: 4px 0; }
+  .rv-gif-card .rv-gif-chips label { font-size: .86rem; display: flex; gap: 4px; align-items: center; }
+  .rv-gif-card .rv-gif-player {
+    width: 100%; max-height: 300px; margin: 12px 0 0; border-radius: 10px;
+    background: #000; display: block;
+  }
+  .rv-gif-card .rv-gif-bar { width: 100%; margin: 8px 0 0; height: 8px; }
+  .rv-gif-card .rv-gif-preview {
+    max-width: 100%; margin: 8px 0 0; border-radius: 10px; display: block;
+  }
+  /* 넘침 경고 — 썸네일의 넘침 경고와 **같은 모양**이다(같은 규율이니까). */
+  .rv-gif-card .rv-gif-warn {
+    margin: 8px 0 0; padding: 8px 10px; border-radius: 8px;
+    background: #fff3f3; color: #a4303f; font-size: .86rem; line-height: 1.5;
+  }
+  .rv-gif-card .rv-gif-estimate.over { color: #a4303f; }
+  .rv-gif-card .rv-gif-diag.bad { color: #a4303f; }
+  .rv-gif-card .rv-gif-download[disabled],
+  .rv-gif-card .rv-gif-make[disabled] { opacity: .5; cursor: not-allowed; }
+</style>
+
 {# 네이버 붙여넣기용: '편집 가능한 미리보기 = 복사 원본'. 여기서 바로 고치고
    '복사'하면 서식·사진까지 text/html로 네이버 스마트에디터에 붙는다. #}
 <div class="review-copy-wrap">
