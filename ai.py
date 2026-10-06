@@ -1455,3 +1455,45 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] blog review generation failed: {e}", file=sys.stderr)
         return None
+
+
+# --- 썸네일 카피(노선 2 Step 4) ---------------------------------------------
+# 글이 **완성된 뒤** 한 번 더 claude를 쓴다. 그래서 초안 생성 경로에 끼지 않는다 —
+# 사용자가 상세 화면에서 요청할 때만 돈다(초안 생성 시간을 1초도 늘리지 않는다).
+# 그림은 AI가 그리지 않는다. 카피만 쓰고, 렌더는 브라우저가 template.css 수치로 한다
+# (gf-blog [썸네일 카피 생성] 7·8번 — AI 이미지 생성·유사 글꼴 금지).
+_THUMB_BODY_CHARS = 2600
+
+
+def suggest_thumbnail_copy(input_block, title, body_text, research=None,
+                           budget=None):
+    """완성된 글 → 썸네일 카피 후보 3개 + 선정. 실패하면 ``None``(기능만 꺼진다).
+
+    ``budget``은 ``thumbnail.copy_budget()`` 산출(상자별 대략의 글자 예산)이고
+    프롬프트의 길이 안내로만 들어간다 — **넘침의 판정은 브라우저 실측**이다.
+    반환은 ``thumbnail.normalize_copy()``가 정규화한 dict.
+    """
+    import thumbnail  # 지연 import — thumbnail은 ai를 쓰지 않는다(순환 없음)
+
+    template = load_prompt("thumbnail-copy")
+    if not template:
+        print("[ai] thumbnail-copy prompt unavailable — skip", file=sys.stderr)
+        return None
+    budget = budget or {}
+    prompt = (
+        template
+        .replace("{{INPUT_BLOCK}}", (input_block or "").strip() or "(없음)")
+        .replace("{{TITLE}}", (title or "").strip() or "(제목 없음)")
+        .replace("{{POST_BODY}}", (body_text or "").strip()[:_THUMB_BODY_CHARS]
+                 or "(본문 없음)")
+        .replace("{{KEYWORD_BLOCK}}", format_keyword_block(research))
+        .replace("{{MAIN_BUDGET}}", str(budget.get("main_line", 9)))
+        .replace("{{SUB_BUDGET}}", str(budget.get("sub", 12)))
+        .replace("{{BADGE_BUDGET}}", str(budget.get("badge", 7)))
+    )
+    try:
+        data = _extract_json(_run_claude(prompt))
+    except Exception as e:  # noqa: BLE001 — 썸네일은 글 생성의 전제가 아니다
+        print(f"[ai] thumbnail copy failed: {e}", file=sys.stderr)
+        return None
+    return thumbnail.normalize_copy(data)

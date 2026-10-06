@@ -48,7 +48,8 @@
 - **`models.py`** — SQLAlchemy: `Couple`·`User`·`DailyQuestion`·`Answer`·`Setting`·
   `MonthlyReport`(캐시된 월간 정성 인사이트) 등.
 - **`ai.py`** — `claude` CLI 래퍼. `generate_daily_question`, `generate_monthly_qualitative`,
-  `write_review`(블로그 후기), `suggest_keyword_candidates`/`select_keywords`(키워드 조사).
+  `write_review`(블로그 후기), `suggest_keyword_candidates`/`select_keywords`(키워드 조사),
+  `suggest_thumbnail_copy`(썸네일 카피).
   긴 생성 프롬프트는 `ai.load_prompt(<이름>)`로 **파일에서** 읽는다.
 - **`naver_api.py`** — NAVER API HUB(블로그 검색 · 검색어 트렌드) 얇은 클라이언트. 자격증명은
   **인자로만** 받고 로그·예외에 남기지 않는다. 지표 오독 금지(검색 결과 수 != 검색량,
@@ -56,8 +57,15 @@
 - **`keyword_research.py`** — 후기 재료 → 롱테일 후보 → 네이버 조사 → 메인/보조 선정.
   **키가 없으면 건너뛴다**(`status: "skipped"`) — 생성은 그대로 돈다. 자세한 건
   `docs/blog-review-spec.md` §11.
+- **`thumbnail.py`** — 썸네일. Figma 내보내기 CSS(`design/thumbnail-template.css`)를
+  파싱해 **수치를 보존한 스펙**을 내고, 브라우저가 보고한 측정값으로 **넘침을 다시
+  판정**한다. ⛔ **서버는 픽셀을 만들지 않는다** — Render 무료티어에 Chromium 을 안 올리고
+  사용자의 브라우저가 DOM+Canvas 로 그린다. 넘치면 폰트가 아니라 **문구를 줄인다**.
+  자세한 건 `docs/blog-review-spec.md` §12.
+- **`static/thumbnail.js`** — 그 브라우저 렌더러(DOM 미리보기 · `scrollWidth<=clientWidth`
+  넘침 assert · `document.fonts.check` · Canvas 1080×1350 래스터).
 - **`prompts/`** — 파일로 분리한 생성 프롬프트(`blog-review.md`·`keyword-candidates.md`·
-  `keyword-select.md`). **글 품질 튜닝은 여기서** 한다
+  `keyword-select.md`·`thumbnail-copy.md`). **글 품질 튜닝은 여기서** 한다
   — 파이썬을 안 건드린다. 파일 맨 위 사람용 머리말은 첫 `---`까지 잘려 나가고, `{{...}}`
   자리만 런타임에 치환된다.
 - **`tests/`** — pytest(네트워크·`claude` 없이 돈다 — 임시 SQLite + `_run_claude` 가짜).

@@ -236,6 +236,8 @@ v2에서 바뀐 것:
 | POST | `/reviews/<rid>/title` | `review_pick_title` | (v2) 제목 후보 중 선택 → `ai_json.title` 교체 + `edited_text` 비움 |
 | POST | `/reviews/<rid>/regenerate` | `review_regenerate` | (P2) 초안 다시 생성(edited_text 비움) |
 | POST | `/reviews/<rid>/save-text` | `review_save_text` | (P2) 편집한 네이버 복사본 저장 |
+| POST | `/reviews/<rid>/thumbnail` | `review_thumbnail_generate` | (Step 4) 썸네일 카피 (재)생성 — 백그라운드 |
+| POST | `/reviews/<rid>/thumbnail/state` | `review_thumbnail_state` | (Step 4) 고른 후보·줄인 문구·쓸 사진·**렌더 측정값** 저장(서버가 넘침 재판정) |
 | POST | `/reviews/<rid>/delete` | `review_delete` | 삭제 → 목록 |
 
 - cross-couple rid → 404.
@@ -299,8 +301,8 @@ v2에서 바뀐 것:
 
 - **Step 3 — NAVER API HUB 키워드 조사.** 프롬프트는 사용자가 적어 준 `researched` 칸만 쓰고,
   **스스로 웹 검색을 하지 않는다**(`_run_claude(allow_web=False)`).
-- **Step 4 — 썸네일 생성.** Render 무료티어(512MB)에 Playwright/Chromium을 올리는 문제가
-  선행 판단이다.
+- ~~**Step 4 — 썸네일 생성.**~~ → **§12에서 완료.** Chromium을 서버에 올리지 않고
+  사용자의 브라우저가 `template.css` 수치 그대로 렌더한다.
 
 
 ---
@@ -386,3 +388,115 @@ POST /search-trend/v1/search   {startDate,endDate,timeUnit,keywordGroups[<=5][ke
 `tests/fixtures/naver_blog_search.json` · `naver_trend_52w.json` · `naver_trend_8w.json`에
 저장했고(픽스처에 키가 없다는 것도 테스트한다), 파싱·선정·프롬프트·키 취급·화면을 검증한다.
 롱테일 트렌드가 빈 배열인 실제 케이스가 픽스처에 들어 있다.
+
+---
+
+## 12. Step 4 — 썸네일 (노선 2 Step 4)
+
+### 12.1 선행 판단 — 서버에 Chromium 을 올리지 않는다
+
+gf-blog 는 **Playwright + Chrome headless** 로 썸네일을 렌더한다
+(`{맛집명}/thumbnail/render.py`). 우리는 Render 무료티어(512MB · 0.1 CPU)이고,
+사용자가 **Chromium 을 서버에 올리는 것을 명시적으로 배제**했다. 그래서 세 경로를
+실측하고 골랐다.
+
+| 경로 | 실측 | 판정 |
+|---|---|---|
+| (a) 앱의 기존 미리보기 재사용 | 기존 미리보기는 **네이버 본문 HTML** 을 그리는 것이라 1080×1350 썸네일을 내지 않는다 | 산출물로는 ✗ — 다만 **그 미리보기를 그리는 주체(사용자의 브라우저)** 가 (c)의 실행 장소다 |
+| (b) Pillow 서버 렌더 | Pillow 는 설치돼 있지만 **한글을 못 그린다** — `python:3.12-slim` 에 폰트가 없고(Dockerfile 이 `fonts-*` 를 설치하지 않는다) Pillow 기본 폰트는 한글을 전부 같은 `.notdef` 로 찍는다(서로 다른 한글 문자열의 래스터가 **바이트 단위로 동일**함을 확인). 쓰려면 Pretendard 3종(≈3.5MB)을 레포·이미지에 싣고, CSS 레이아웃(반행간·flex 정렬·그라데이션)을 Pillow 로 **다시 구현**해야 한다 — 검증된 수치에서 소리 없이 어긋날 자리가 생긴다. 합성 자체는 1080×1350 에 0.13초(로컬) | ✗ |
+| **(c) 브라우저 렌더 (채택)** | DOM 이 `design/thumbnail-template.css` **선언 그대로** 1080×1350 을 잡고 → 진짜 브라우저가 레이아웃 → `scrollWidth<=clientWidth` 로 넘침 판정 → Canvas 2D 가 같은 수치로 래스터. **서버 CPU 0, 서버 메모리 0, 폰트 문제 없음**, 그리고 넘침 검증이 gf-blog 의 assert 와 **같은 식 그대로** 남는다 | ✓ |
+
+(c)는 "AI 이미지 생성 금지"도 그대로 지킨다 — **배경은 후기에 올린 실제 사진**이고
+그 위에 타이포만 얹는 **합성**이다. 외부 이미지 생성 모델을 부르지 않는다.
+
+### 12.2 디자인 수치 — `design/thumbnail-template.css` 가 정본
+
+gf-blog `썸네일/template.css`(Figma 내보내기, 선택자 없는 선언 블록)를 **그대로** 들여왔다.
+`thumbnail.py` 가 gf-blog `render.py` 와 **같은 알고리즘**(`position:` 등장 위치로 쪼개고
+배지는 `display: flex;`·`width: 270px;` 에서 한 번 더 가른다)으로 파싱한다 —
+**선택자만 붙이고 값은 보존한다.** 숫자를 코드에 다시 적지 않으므로 어긋날 수 없다.
+
+| 영역 | 좌표·크기 | 타이포 |
+|---|---|---|
+| 캔버스 | 1080×1350 | — |
+| 그라데이션 | 전면 | `linear-gradient(180deg, rgba(217,217,217,0) 0%, rgba(17,17,17,0.7) 81.73%)` |
+| 메인(2줄) | (90, 935) 900×300 | Pretendard 700 · 95px / 113px · `#FFFFFF` |
+| 서브(1줄) | (90, 1181) 578×54 | Pretendard 500 · 45px / 54px · `#FFFFFF` |
+| 배지 | (90, 846) 307×70 · padding 10 · radius 999 | 배경 `#D7FFFC` |
+| 배지 라벨 | 270×43 (배지 안 flex 중앙) | Pretendard 600 · 36px / 43px · `#000000` |
+
+`tests/test_thumbnail.py` 가 이 표의 숫자를 **하나하나** 못박는다. 박스 기준은 gf-blog
+`render.py` 와 같은 `box-sizing: border-box` 다.
+
+### 12.3 배경 — 후기에 올린 **첫 사진**
+
+- 기본 배경 = `review.photos_ordered[0]`(사용자가 고른 순서의 첫 사진). 화면에서 다른
+  사진으로 바꿀 수 있고 선택은 `thumbnail_json.photo_index` 에 남는다.
+- 바이트는 **앱이 이미 쓰는 경로** 그대로다 — OneDrive 뒤의 서명 URL `/blog-img/<id>`
+  에 `&hq=1`(원본 해상도. 1280px 다운스케일본을 1080 캔버스에 늘리면 흐려진다).
+  **새 업로드 경로를 만들지 않는다.**
+- 사진은 `object-fit: cover`(중앙) 로 캔버스를 채운다.
+- **가독성 처리 = 위 그라데이션**이다. 사진 위에 아래로 갈수록 짙어지는 어두운 층이
+  깔려 흰 글자가 읽힌다(메인이 시작되는 y=935 에서 오버레이 불투명도 ≈0.59).
+  템플릿에 없는 그림자를 새로 더하지 않는다 — 검증된 디자인은 이 조합이다.
+- **사진이 없는 후기**는 그라데이션 끝 색(`rgb(17,17,17)`) 단색을 배경으로 쓴다.
+  없는 그림을 지어내지 않는다.
+
+### 12.4 넘침 검증 — 재서 판정하고, 폰트가 아니라 문구를 줄인다
+
+gf-blog `render.py` 의 두 assert 를 **같은 식으로** 유지한다:
+
+1. `document.fonts.check('<weight> <size>px Pretendard')` — 폰트가 안 떴으면 **렌더를
+   거부한다.** 다른 폰트로 그리면 검증된 디자인이 아니다.
+2. 메인 · 서브 · 배지 라벨 세 상자에서 `scrollWidth <= clientWidth`.
+   미리보기는 `transform: scale()` 로만 줄이므로(레이아웃 크기 불변) 이 값은 **1080 기준
+   실측값**이다.
+
+그리고 **판정은 서버가 다시 한다**(`thumbnail.evaluate_render_check`). 브라우저가 보낸
+`ok` 주장은 읽지 않고 상자별 측정값만 받아 재계산한다 — 클레임이 아니라 측정이 근거다.
+결과는 `thumbnail_json.render_check` 에 좌표·폰트·넘침과 함께 남는다(gf-blog
+`render-check.json` 대응).
+
+⛔ **넘치면 글자 크기를 줄이지 않는다.** 내려받기 버튼이 잠기고, 사람이 문구를 줄이거나
+더 짧은 후보를 고른다. 그래서 `static/thumbnail.js` 에도 `thumbnail.py` 스키마에도
+**글자 크기를 바꾸는 길이 없다**(회귀 테스트가 그 부재를 검증한다).
+
+### 12.5 카피 — claude 가 쓰고, **초안 생성 경로에 끼지 않는다**
+
+```
+초안 생성(기존)  : 키워드 조사 → 본문 생성 → 제목 후보      ← 여기에 아무것도 안 더했다
+썸네일(신규)     : 사람이 상세 화면에서 요청 → 카피 후보 3개 → 선정 → 브라우저 렌더
+```
+
+썸네일 카피는 **글이 완성되고 제목이 확정된 뒤**에 뽑는 것이라 생성 파이프라인에 넣을
+이유가 없다. 이미 Render 0.1 CPU 에서 ~170초인 초안 생성에 **claude 호출을 하나도 더
+얹지 않는다**(회귀 테스트가 `generate_review` 경로에서 썸네일이 안 불린다는 것을 못박는다).
+요청 시에만 `generate_thumbnail_copy` 워커가 `_CAPTION_SEM` 안에서 한 번 돈다.
+
+규율 정본은 gf-blog `naver-blog-prompt.md` **[썸네일 카피 생성] 1~6·8번**이고
+`prompts/thumbnail-copy.md` 에 옮겼다: 후기에 없는 것 금지 / `~~한 000`·`~~할 때 가기
+좋은 000` 형식 / 궁금증 유도만으로 끝내지 않기 / **후보 3개 중 1개 선정 + 이유** /
+과장·판매 문구 금지 / 메인·서브·배지가 서로 다른 것을 말하기. 7·9번(렌더링 방법·소재
+폴더 저장)은 앱이 하므로 프롬프트에 넣지 않는다.
+
+상자별 **대략의 글자 예산**(메인 9 / 서브 12 / 배지 7 — 상자 폭 ÷ 폰트 크기)이
+프롬프트에 안내로 들어가고, 후보 하나는 **일부러 더 짧게** 만들게 한다(넘쳤을 때 바로
+고를 안전 후보). 그 숫자는 판정이 아니다 — 판정은 언제나 브라우저 실측이다.
+
+### 12.6 데이터·엔드포인트
+
+| | |
+|---|---|
+| 컬럼 | `blog_reviews.thumbnail_json` (TEXT, nullable — `run_startup_migrations()` 가 ADD COLUMN) |
+| 내용 | `candidates[3]` · `picked` · `pick_reason` · `copy`(사람이 줄인 최종 문구) · `photo_index` · `render_check` · `status` |
+| `POST /reviews/<rid>/thumbnail` | 카피 (재)생성 — 백그라운드 스폰. 초안이 `ready` 일 때만 |
+| `POST /reviews/<rid>/thumbnail/state` | 고른 후보 · 줄인 문구 · 쓸 사진 · **측정값** 저장(서버가 넘침 재판정) |
+
+⚠️ 템플릿에서 `thumb.copy` 로 쓰면 **Jinja 가 dict 의 `copy()` 메서드**를 먼저 집어
+(truthy) 편집칸이 전부 빈 채로 렌더된다. 반드시 `thumb['copy']` 로 읽는다.
+
+### 12.7 테스트
+
+`tests/test_thumbnail.py` — 네트워크·`claude` 없이 돈다. 템플릿 수치 보존 · 카피 정규화 ·
+넘침 재판정(클라이언트 주장 무시) · **초안 생성 경로 격리** · 라우트 커플 스코프 ·
+화면 렌더 · 렌더러에 폰트 축소 코드가 없음을 검증한다.

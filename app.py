@@ -56,6 +56,7 @@ import insights
 import keyword_research
 import naver_api
 import onedrive
+import thumbnail
 from models import (
     Answer,
     Bet,
@@ -1995,6 +1996,112 @@ def _spawn_generate_review(app, review_id):
         log.exception("failed to spawn review thread for review %s", review_id)
         with _generating_reviews_lock:
             _generating_reviews.discard(review_id)
+
+
+# ---------------------------------------------------------------------------
+# 썸네일 카피 백그라운드 생성 (Step 4)
+#
+# 초안 생성(generate_review)과 **같은 패턴**이되 **같은 경로가 아니다** — 썸네일은
+# 글이 완성되고 제목이 확정된 뒤에 뽑는 것이라, 사용자가 상세 화면에서 요청할 때만
+# 돈다. 그래서 초안 생성 시간(이미 Render 0.1 CPU에서 ~170초)에 **아무것도 더하지
+# 않는다.** claude 직렬화는 같은 _CAPTION_SEM을 쓴다(동시에 claude 하나만).
+# ---------------------------------------------------------------------------
+_thumbing_reviews_lock = threading.Lock()
+_thumbing_reviews: set[int] = set()
+
+
+def generate_thumbnail_copy(app, review_id):
+    """백그라운드 워커: 한 BlogReview의 썸네일 카피 후보 3개 + 선정을 만든다.
+
+    완성된 본문·확정된 제목·키워드 조사를 재료로 ``ai.suggest_thumbnail_copy``를
+    한 번 부른다. 성공하면 ``thumbnail_json``에 ``status='ready'``로, 실패하면
+    ``status='failed'``로 남긴다(직전 성공분이 있으면 그걸 지킨다 — 초안 생성과 같은
+    결). 사람이 이미 고르거나 줄여 둔 문구가 있으면 **재생성이 그걸 덮어쓴다**(재생성은
+    명시적 요청이다). 절대 raise 안 하고 finally에서 가드를 해제한다.
+    """
+    try:
+        with app.app_context():
+            try:
+                review = db.session.get(BlogReview, review_id)
+                if review is None or not review.ai:
+                    return
+                prior = review.thumbnail
+                prior_ok = bool(prior and prior.get("candidates"))
+                data = review.ai
+                input_block = ai.build_review_input_block(
+                    review.topic, review.location, review.prose,
+                    review.overall_score, review.details,
+                )
+                body_text = _review_copy_text(review)
+                budget = (thumbnail.spec() or {}).get("budget")
+                _CAPTION_SEM.acquire()
+                try:
+                    result = ai.suggest_thumbnail_copy(
+                        input_block, (data.get("title") or "").strip(), body_text,
+                        research=review.research, budget=budget,
+                    )
+                except Exception:  # noqa: BLE001 — 썸네일은 best-effort
+                    log.exception(
+                        "claude thumbnail copy raised (review=%s)", review_id
+                    )
+                    result = None
+                finally:
+                    _CAPTION_SEM.release()
+
+                review = db.session.get(BlogReview, review_id)  # 행이 바뀌었을 수 있다
+                if review is None:
+                    return
+                if result:
+                    state = dict(result)
+                    state["status"] = "ready"
+                    # 쓸 사진은 기본 0번(첫 사진) — 사람이 화면에서 바꾼다. 재생성
+                    # 전에 고른 사진이 있으면 그 선택은 지킨다(문구만 새로 뽑은 것이다).
+                    state["photo_index"] = (prior or {}).get("photo_index", 0)
+                elif prior_ok:
+                    state = dict(prior)
+                    state["status"] = "ready"
+                    state["last_error"] = "재생성에 실패해서 직전 문구를 그대로 뒀어."
+                else:
+                    state = {"status": "failed"}
+                try:
+                    review.thumbnail_json = json.dumps(state, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    review.thumbnail_json = None
+                review.updated_at = datetime.utcnow()
+                try:
+                    db.session.commit()
+                except Exception:  # noqa: BLE001
+                    db.session.rollback()
+                    log.exception(
+                        "commit failed for thumbnail copy (review=%s)", review_id
+                    )
+            except Exception:  # noqa: BLE001 — 절대 탈출 금지
+                db.session.rollback()
+                log.exception(
+                    "generate_thumbnail_copy failed (review=%s)", review_id
+                )
+    finally:
+        with _thumbing_reviews_lock:
+            _thumbing_reviews.discard(review_id)
+
+
+def _spawn_generate_thumbnail(app, review_id):
+    """썸네일 카피 생성 스레드를 스폰(이미 진행 중이면 no-op). 절대 raise 안 한다."""
+    spawn = False
+    with _thumbing_reviews_lock:
+        if review_id not in _thumbing_reviews:
+            _thumbing_reviews.add(review_id)
+            spawn = True
+    if not spawn:
+        return
+    try:
+        threading.Thread(
+            target=generate_thumbnail_copy, args=(app, review_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — 썸네일은 best-effort
+        log.exception("failed to spawn thumbnail thread for review %s", review_id)
+        with _thumbing_reviews_lock:
+            _thumbing_reviews.discard(review_id)
 
 
 def _star_bar(score):
@@ -5997,6 +6104,19 @@ def _register_routes(app: Flask):
                         "crop": crop,
                     }
                 )
+        # 썸네일(Step 4) 재료. 서버는 스펙(template.css에서 읽은 수치)과 사진 URL만
+        # 넘기고, 그림은 브라우저가 그린다. 사진은 hq(원본 해상도)로 받는다 —
+        # 1080×1350 캔버스에 1280px 다운스케일본을 늘려 쓰면 흐려진다.
+        thumb_photos = []
+        for i, p in enumerate(review.photos_ordered):
+            url = blog_img_url(p)
+            thumb_photos.append(
+                {
+                    "index": i,
+                    "url": url + ("&" if "?" in url else "?") + "hq=1",
+                    "name": (p.caption or p.original_name or f"사진 {i + 1}")[:40],
+                }
+            )
         return render_template(
             "review_detail.html",
             review=review,
@@ -6004,6 +6124,9 @@ def _register_routes(app: Flask):
             copy_html=copy_html,
             crop_sections=crop_sections,
             doc_data=doc_data,
+            thumb=review.thumbnail,
+            thumb_spec=thumbnail.spec(),
+            thumb_photos=thumb_photos,
             # 조사 메모 카드 재료. research는 dict(없으면 None)이고, 키 보유 여부는
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
@@ -6329,6 +6452,78 @@ def _register_routes(app: Flask):
             return jsonify(ok=True, crop=blocks[idx]["crop"])
         flash("사진 위치를 저장했어.", "success")
         return redirect(url_for("review_detail", rid=review.id))
+
+    # ---- 썸네일 (Step 4) --------------------------------------------------
+    # 서버는 픽셀을 만들지 않는다. 카피를 만들고(claude), 사람이 고르거나 줄인 문구를
+    # 저장하고, **브라우저가 보고한 측정값을 다시 판정해** 넘침 여부를 기록한다.
+    # PNG는 사용자의 브라우저가 Canvas로 그려 바로 내려받는다(thumbnail.py 머리말).
+    def _review_or_404(rid):
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        return review
+
+    @app.route("/reviews/<int:rid>/thumbnail", methods=["POST"])
+    @active_couple_required
+    def review_thumbnail_generate(rid):
+        """썸네일 카피를 (재)생성한다 — 백그라운드 스레드. 초안이 없으면 409.
+
+        요청 경로에서 claude를 돌리지 않는다(앱 절대 제약). 상태를 'pending'으로
+        적고 바로 돌아오면, 상세 화면이 meta refresh로 결과를 받는다.
+        """
+        review = _review_or_404(rid)
+        if not (review.status == "ready" and review.ai):
+            flash("초안이 준비된 다음에 썸네일을 만들 수 있어.", "error")
+            return redirect(url_for("review_detail", rid=review.id))
+        state = review.thumbnail or {}
+        state["status"] = "pending"
+        state.pop("last_error", None)
+        review.thumbnail_json = json.dumps(state, ensure_ascii=False)
+        db.session.commit()
+        _spawn_generate_thumbnail(app, review.id)
+        flash("썸네일 문구를 만드는 중이야… 잠깐만 ✨", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/thumbnail/state", methods=["POST"])
+    @active_couple_required
+    def review_thumbnail_state(rid):
+        """사람이 고른 후보·줄인 문구·쓸 사진, 그리고 **브라우저 렌더 검증**을 저장.
+
+        JSON 본문: ``{"picked": 0, "copy": {...}, "photo_index": 0,
+        "render_check": {"fonts_ok": true, "boxes": {...}}}`` — 전부 선택이다.
+
+        ``render_check``는 클라이언트가 보낸 **측정값만** 받고 ``ok``는 서버가 다시
+        계산한다(``thumbnail.evaluate_render_check``) — 넘침 판정을 클라이언트의
+        주장에 맡기지 않는다. 폰트 크기를 줄여 맞추는 길은 **스키마에 없다**:
+        넘치면 ``ok=False``로 남고 문구를 줄여야 한다(gf-blog 규율).
+        """
+        review = _review_or_404(rid)
+        state = review.thumbnail
+        if not (state and state.get("candidates")):
+            return jsonify(ok=False, error="no_thumbnail"), 409
+        body = request.get_json(silent=True) or {}
+        state = thumbnail.apply_pick(
+            state,
+            picked=body.get("picked"),
+            copy=body.get("copy"),
+            photo_index=body.get("photo_index"),
+        )
+        if "render_check" in body:
+            checked = thumbnail.evaluate_render_check(body.get("render_check"))
+            if checked is None:
+                return jsonify(ok=False, error="bad_render_check"), 400
+            checked["checked_at"] = datetime.utcnow().isoformat(timespec="seconds")
+            state["render_check"] = checked
+        state["status"] = "ready"
+        review.thumbnail_json = json.dumps(state, ensure_ascii=False)
+        db.session.commit()
+        rc = state.get("render_check") or {}
+        return jsonify(
+            ok=True,
+            render_ok=bool(rc.get("ok")),
+            overflowing=rc.get("overflowing") or [],
+        )
 
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
