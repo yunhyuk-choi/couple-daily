@@ -401,6 +401,12 @@ def _normalize_db_url(url: str) -> str:
     # Heroku/Fly sometimes hand out postgres://; SQLAlchemy 2.x wants postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
+    # ⚠️ 드라이버를 명시한다. SQLAlchemy 2.1부터 `postgresql://`의 기본 드라이버가
+    # psycopg2 -> psycopg(v3)로 바뀌었는데, 우리 requirements는 psycopg2-binary다.
+    # 명시하지 않으면 부팅이 `ModuleNotFoundError: No module named 'psycopg'`로 죽는다
+    # (2026-10-06 실제 사고 — 코드 변경 없이 재기동만으로 터졌다).
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return url
 
 
