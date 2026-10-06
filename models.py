@@ -235,6 +235,10 @@ def run_startup_migrations():
                 # Step 4 썸네일 상태(JSON). 없으면 NULL — 썸네일을 안 만든 후기는
                 # 카드에 "만들기" 버튼만 보인다.
                 ("thumbnail_json", "TEXT"),
+                # Step 5 동영상→GIF 상태(JSON). 없으면 NULL — GIF를 안 만든 후기는
+                # 카드에 "영상 올리기"만 보인다. (``videos`` 테이블 자체는 brand-new라
+                # create_all()이 만든다 — ALTER가 필요한 건 이 컬럼 하나뿐이다.)
+                ("gif_json", "TEXT"),
             ):
                 if col in rcols:
                     continue
@@ -533,6 +537,62 @@ class Photo(db.Model):
             return v if isinstance(v, list) else []
         except (ValueError, TypeError):
             return []
+
+
+class Video(db.Model):
+    """커플이 올린 동영상 한 건 — 바이트는 OneDrive(``couple-daily`` 폴더)에 있다.
+
+    ``Photo`` 와 **같은 구조**다(OneDrive item id + 가벼운 메타만, 커플 스코프).
+    사진과 테이블을 나눈 이유는 두 가지다:
+
+    * 사진 경로에는 자동 캡션·EXIF·블로그 서명 URL·썸네일 프록시가 줄줄이 달려 있다.
+      동영상은 그중 어느 것도 타면 안 된다(vision 캡셔너에 50MB 영상을 먹이면
+      0.1 CPU 워커가 죽는다).
+    * 추억 갤러리는 사진 그리드다. 영상이 섞여 들어가면 ``<img>`` 가 깨진다.
+
+    브랜드-뉴 테이블이라 ``db.create_all()`` 이 만든다 — ALTER 마이그레이션 없음
+    (``blog_reviews`` · ``photos`` 가 처음 들어올 때와 같은 방식).
+
+    ``cors_probe`` 는 **실측 기록**이다 — 이 영상의 OneDrive 직접 다운로드 URL을
+    브라우저가 Canvas 로 읽을 수 있는지(ACAO 유무)를 서버가 한 번 재 본 결과를
+    JSON 으로 남긴다. 후보 (a)(CDN 직접 스트리밍)가 가능한 환경이면 그 사실이
+    주장이 아니라 **데이터로** 남게 하려는 칸이다. ⚠️ 다운로드 URL 자체는 쿼리에
+    토큰이 박힌 자격증명이라 **여기 절대 저장하지 않는다**(판정과 헤더 값만).
+    """
+    __tablename__ = "videos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    couple_id = db.Column(
+        db.Integer, db.ForeignKey("couples.id"), nullable=False, index=True
+    )
+    # OneDrive drive-item id (opaque). 스트리밍/삭제의 손잡이.
+    onedrive_item_id = db.Column(db.String(255), nullable=False)
+    # OneDrive에 실제로 저장된 이름(정규화·유니크).
+    filename = db.Column(db.String(255), nullable=False)
+    # 사용자가 올린 원래 파일명(표시용).
+    original_name = db.Column(db.String(255), nullable=True)
+    uploaded_by = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # 바이트 수 · 선언된 MIME. Range 응답과 화면 표시에 쓴다.
+    size_bytes = db.Column(db.Integer, nullable=False, default=0)
+    content_type = db.Column(db.String(100), nullable=True)
+    # 직접-스트리밍 가능 여부 실측 결과(JSON). NULL = 아직 재 보지 않음.
+    cors_probe = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    uploader = db.relationship("User")
+
+    @property
+    def cors_probe_data(self):
+        """``cors_probe`` 를 dict로 디코드(없거나 깨졌으면 None)."""
+        if not self.cors_probe:
+            return None
+        try:
+            v = json.loads(self.cors_probe)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
 
 
 class Setting(db.Model):
@@ -1069,6 +1129,11 @@ class BlogReview(db.Model):
     # 브라우저가 보고한 렌더 검증(좌표·폰트·넘침). **픽셀은 여기 안 들어간다** —
     # PNG는 사용자의 브라우저가 그려 바로 내려받는다(서버엔 Chromium이 없다).
     thumbnail_json = db.Column(db.Text, nullable=True)
+    # (Step 5) 동영상→GIF 상태 JSON — 고른 영상·구간(시작/길이)·프리셋(가로폭/fps)·
+    # 브라우저가 보고한 결과(용량·해상도·프레임 수·디코딩 경로)와 진단 코드.
+    # **픽셀은 여기 안 들어간다** — GIF도 사용자의 브라우저가 만들어 바로 내려받는다
+    # (서버엔 ffmpeg가 없다 — gifmaker.py 머리말).
+    gif_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(16), default="draft", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(
@@ -1169,6 +1234,22 @@ class BlogReview(db.Model):
             return None
         try:
             v = json.loads(self.thumbnail_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def gif(self):
+        """gif_json을 dict로 디코드(없거나 깨졌으면 None) — 동영상→GIF 카드용.
+
+        ``thumbnail`` 과 **같은 모양**이다. 픽셀은 여기 안 들어간다 — GIF 는 사용자의
+        브라우저가 만들어 바로 내려받고, 서버엔 고른 구간·프리셋·브라우저가 보고한
+        결과(용량·프레임 수)와 진단만 남는다(`gifmaker.py` 머리말).
+        """
+        if not self.gif_json:
+            return None
+        try:
+            v = json.loads(self.gif_json)
             return v if isinstance(v, dict) else None
         except (ValueError, TypeError):
             return None

@@ -51,6 +51,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import ai
 import events
 import exifutil
+import gifmaker
 import ics
 import insights
 import keyword_research
@@ -78,6 +79,7 @@ from models import (
     Schedule,
     Setting,
     User,
+    Video,
     db,
     notify,
     run_startup_migrations,
@@ -4900,6 +4902,180 @@ def _register_routes(app: Flask):
         accept = request.headers.get("Accept", "")
         return "application/json" in accept and "text/html" not in accept
 
+    # ---- 동영상 (노선 2 Step 5) — 보관은 OneDrive, 변환은 브라우저 -----------
+    # 사진 경로와 **일부러 갈라 둔다**: 영상은 자동 캡션(vision)·EXIF·블로그 서명
+    # URL·썸네일 프록시 중 어느 것도 타지 않는다. 0.1 CPU 워커에 50MB 영상을
+    # 먹이는 길을 아예 만들지 않는 게 요점이다(models.Video 머리말).
+    #
+    # ⛔ 서버는 **영상 바이트를 변수에 담지 않는다.** 업로드는 청크 PUT
+    #    (onedrive.upload_stream), 다운로드는 Range 스트리밍(아래 video_stream)이다.
+    def _video_or_404(video_id):
+        u = current_user()
+        video = db.session.get(Video, video_id)
+        if video is None or video.couple_id != u.couple_id:
+            abort(404)
+        return video
+
+    @app.route("/videos/upload", methods=["POST"])
+    @active_couple_required
+    def video_upload():
+        """동영상 1개를 OneDrive로 **스트리밍 업로드**하고 행을 남긴다 (AJAX 전용).
+
+        사진 업로더와 달리 ``file.read()`` 를 하지 않는다 — werkzeug 가 큰 업로드를
+        디스크로 스풀해 두므로 그 스트림을 3.2MiB 청크로 그대로 OneDrive 업로드
+        세션에 흘린다. 워커 메모리는 영상 크기와 무관하게 평평하다.
+        """
+        u = current_user()
+        if not onedrive.onedrive_enabled():
+            return jsonify(ok=False, error="onedrive_disabled",
+                           reason="OneDrive 연결이 필요해."), 400
+        file = request.files.get("video")
+        if not file or not file.filename:
+            return jsonify(ok=False, error="empty", reason="영상을 선택해줘."), 400
+        if not gifmaker.is_allowed_video(file.filename, file.mimetype or ""):
+            return jsonify(ok=False, error="bad_type",
+                           reason="동영상 파일만 올릴 수 있어."), 400
+
+        # 총 바이트를 먼저 잰다 — Content-Range 의 분모라 **정확해야** 한다.
+        stream = file.stream
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        if size <= 0:
+            return jsonify(ok=False, error="empty", reason="빈 파일이야."), 400
+        if size > gifmaker.MAX_VIDEO_BYTES:
+            mb = gifmaker.MAX_VIDEO_BYTES // (1024 * 1024)
+            return jsonify(ok=False, error="too_large",
+                           reason=f"영상 1개는 {mb}MB 이하만 올릴 수 있어."), 400
+
+        try:
+            item_id, stored_name = onedrive.upload_stream(stream, size, file.filename)
+        except onedrive.OneDriveError:
+            log.exception("OneDrive video upload failed for couple %s", u.couple_id)
+            return jsonify(ok=False, error="upload_failed",
+                           reason="OneDrive 업로드에 실패했어."), 502
+
+        video = Video(
+            couple_id=u.couple_id,
+            onedrive_item_id=item_id,
+            filename=stored_name[:255],
+            original_name=file.filename[:255],
+            uploaded_by=u.id,
+            size_bytes=size,
+            content_type=(file.mimetype
+                          or gifmaker.content_type_for(file.filename))[:100],
+        )
+        db.session.add(video)
+        db.session.commit()
+        return jsonify(ok=True, video={
+            "id": video.id,
+            "name": video.original_name or video.filename,
+            "size": video.size_bytes,
+        })
+
+    @app.route("/videos/<int:video_id>/delete", methods=["POST"])
+    @active_couple_required
+    def video_delete(video_id):
+        video = _video_or_404(video_id)
+        try:
+            onedrive.delete_photo(video.onedrive_item_id)  # 같은 drive-item 삭제 API
+        except onedrive.OneDriveError:
+            log.exception("OneDrive video delete failed for video %s", video.id)
+        db.session.delete(video)
+        db.session.commit()
+        return jsonify(ok=True)
+
+    # 스트리밍 청크. 작게 잡아야 ``0.1 CPU · 512MB`` 에서 메모리가 평평하다.
+    _VIDEO_CHUNK = 256 * 1024
+
+    @app.route("/videos/<int:video_id>/stream")
+    @active_couple_required
+    def video_stream(video_id):
+        """영상 바이트를 **Range(206) 지원**으로 흘린다 — 경로 (b).
+
+        ``<video>`` 의 seek 은 Range 없이는 동작하지 않는다(서버가 200 으로 전체만
+        주면 브라우저는 구간 지정을 포기하거나 전체를 받는다). 이 앱의 이미지
+        프록시에는 Range 처리가 **없었고**(206 응답 0건), 영상은 그걸 그대로 쓸 수
+        없어서 여기서 새로 연다.
+
+        Range 헤더는 **그대로 OneDrive 로 전달**하고 돌아온 206 을 그대로 중계한다 —
+        서버가 구간을 직접 잘라내지 않으므로 파싱 버그로 엉뚱한 바이트를 줄 일이 없고,
+        전체를 받아 쪼갤 필요도 없다. 응답은 제너레이터라 **한 번에 256KB만** 메모리에
+        있다.
+
+        이 라우트는 same-origin 이다 — 그래서 ``<video>`` 를 Canvas 에 그려도
+        tainted 가 되지 않고 ``getImageData`` 가 된다(그게 GIF 의 전제다).
+        """
+        video = _video_or_404(video_id)
+        range_header = request.headers.get("Range")
+        try:
+            status, headers, upstream = onedrive.open_range(
+                video.onedrive_item_id, range_header
+            )
+        except onedrive.OneDriveError:
+            log.exception("could not open video stream for video %s", video.id)
+            abort(502)
+        if upstream is None:
+            abort(404)  # OneDrive 에서 사라짐
+
+        def _pump():
+            try:
+                for chunk in upstream.iter_content(chunk_size=_VIDEO_CHUNK):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()   # 끊긴 연결에서도 소켓을 반드시 거둔다
+
+        ctype = (video.content_type
+                 or gifmaker.content_type_for(video.original_name or video.filename))
+        resp = app.response_class(_pump(), status=status, mimetype=ctype)
+        # Range 중계에 필요한 헤더만 통과시킨다(그 외 OneDrive 헤더는 흘리지 않는다).
+        for h in ("Content-Range", "Content-Length"):
+            if headers.get(h):
+                resp.headers[h] = headers[h]
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Cache-Control"] = "private, max-age=3600"
+        return resp
+
+    @app.route("/videos/<int:video_id>/source")
+    @active_couple_required
+    def video_source(video_id):
+        """브라우저가 **어디서** 영상 바이트를 받을지 — (a) 직접 / (b) 프록시.
+
+        후보 (a)는 OneDrive 다운로드 URL을 브라우저에 넘겨 Microsoft CDN 에서 바로
+        받게 하는 것이다(서버 대역폭 0). 되기만 하면 (a)가 낫다. **단 Canvas 로
+        픽셀을 읽으려면 CDN 이 ``Access-Control-Allow-Origin`` 을 줘야 한다** —
+        안 주면 캔버스가 오염돼 프레임 추출이 *아예* 막힌다.
+
+        그래서 여기서 **주장하지 않고 잰다**: ``onedrive.probe_direct_cors`` 가 실제로
+        ``Origin`` 을 붙여 1바이트를 받아 보고, ACAO 가 있으면 (a), 없으면 (b)를
+        고른다. 결과는 행에 캐시해 영상당 한 번만 잰다.
+
+        ⚠️ ACAO 가 없으면 **다운로드 URL을 클라이언트에 내보내지 않는다** — 그 URL은
+        쿼리에 토큰이 박힌 자격증명이고, 쓰지도 못할 URL을 DOM 에 흘릴 이유가 없다.
+        """
+        video = _video_or_404(video_id)
+        probe = video.cors_probe_data
+        if probe is None:
+            probe = onedrive.probe_direct_cors(
+                video.onedrive_item_id, request.host_url.rstrip("/")
+            ) or {"ok": False, "acao": None, "range": False, "status": 0,
+                  "error": "probe-failed"}
+            video.cors_probe = json.dumps(probe, ensure_ascii=False)
+            db.session.commit()
+        if probe.get("ok") and probe.get("range"):
+            try:
+                url = onedrive.get_download_url(video.onedrive_item_id)
+            except onedrive.OneDriveError:
+                url = None
+            if url:
+                return jsonify(ok=True, mode="direct", url=url, probe=probe,
+                               size=video.size_bytes)
+        return jsonify(
+            ok=True, mode="proxy", probe=probe, size=video.size_bytes,
+            url=url_for("video_stream", video_id=video.id),
+        )
+
     @app.route("/memories/upload", methods=["POST"])
     @active_couple_required
     def memories_upload():
@@ -6117,6 +6293,24 @@ def _register_routes(app: Flask):
                     "name": (p.caption or p.original_name or f"사진 {i + 1}")[:40],
                 }
             )
+        # GIF(Step 5) 재료. 영상 목록은 **DB 읽기뿐**이다 — 여기서 OneDrive 를 부르지
+        # 않는다(페이지 렌더가 네트워크를 기다리면 안 된다). 바이트가 어디서 올지는
+        # 브라우저가 ``/videos/<id>/source`` 로 따로 물어본다(거기서 한 번만 실측).
+        gif_videos = [
+            {
+                "id": v.id,
+                "name": (v.original_name or v.filename or f"영상 {v.id}")[:60],
+                "size": v.size_bytes,
+                "stream_url": url_for("video_stream", video_id=v.id),
+                "source_url": url_for("video_source", video_id=v.id),
+                "delete_url": url_for("video_delete", video_id=v.id),
+            }
+            for v in (
+                Video.query.filter_by(couple_id=u.couple_id)
+                .order_by(Video.created_at.desc(), Video.id.desc())
+                .all()
+            )
+        ]
         return render_template(
             "review_detail.html",
             review=review,
@@ -6127,6 +6321,10 @@ def _register_routes(app: Flask):
             thumb=review.thumbnail,
             thumb_spec=thumbnail.spec(),
             thumb_photos=thumb_photos,
+            gif=review.gif,
+            gif_spec=gifmaker.spec(),
+            gif_videos=gif_videos,
+            onedrive_ready=onedrive.onedrive_enabled(),
             # 조사 메모 카드 재료. research는 dict(없으면 None)이고, 키 보유 여부는
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
@@ -6525,6 +6723,59 @@ def _register_routes(app: Flask):
             overflowing=rc.get("overflowing") or [],
         )
 
+    # ---- 동영상 → GIF (Step 5) --------------------------------------------
+    # 썸네일과 **같은 자리에 같은 방식으로** 얹는다: 서버는 픽셀을 만들지 않고,
+    # 프리셋·한도를 단일 원천으로 내려보낸 뒤 **브라우저가 보고한 결과를 다시
+    # 판정**해 기록한다. 한도를 넘으면 화질을 몰래 깎지 않고 내려받기를 막는다.
+    #
+    # ⛔ 이 경로에는 claude 호출이 **하나도 없다.** 초안 생성(~170초)과 완전히 별개다.
+    @app.route("/reviews/<int:rid>/gif/state", methods=["POST"])
+    @active_couple_required
+    def review_gif_state(rid):
+        """고른 영상·구간·프리셋과 **브라우저가 보고한 인코딩 결과/진단**을 저장.
+
+        JSON 본문: ``{"settings": {...}, "result": {...}, "diag": {...}}`` — 전부 선택.
+
+        ``result`` 는 측정값만 받고 ``ok`` 는 서버가 다시 계산한다
+        (``gifmaker.evaluate_result``). 용량 판정을 클라이언트의 주장에 맡기지
+        않는다 — 썸네일의 ``evaluate_render_check`` 와 같은 태도다.
+        """
+        review = _review_or_404(rid)
+        body = request.get_json(silent=True) or {}
+        state = review.gif or {}
+
+        settings = None
+        if "settings" in body:
+            settings = gifmaker.normalize_settings(body.get("settings"))
+            # 고른 영상이 이 커플 것인지 **여기서 다시** 확인한다(남의 영상 id 차단).
+            vid = settings.get("video_id")
+            if vid is not None:
+                owned = db.session.get(Video, vid)
+                if owned is None or owned.couple_id != review.couple_id:
+                    return jsonify(ok=False, error="bad_video"), 400
+
+        result = None
+        if "result" in body:
+            result = gifmaker.evaluate_result(body.get("result"))
+            if result is None:
+                return jsonify(ok=False, error="bad_result"), 400
+            result["made_at"] = datetime.utcnow().isoformat(timespec="seconds")
+
+        diag = None
+        if "diag" in body:
+            diag = gifmaker.evaluate_diag(body.get("diag"))
+            if diag is None:
+                return jsonify(ok=False, error="bad_diag"), 400
+
+        state = gifmaker.apply_state(state, settings=settings, result=result,
+                                     diag=diag)
+        state["status"] = "ready"
+        review.gif_json = json.dumps(state, ensure_ascii=False)
+        db.session.commit()
+        r = state.get("result") or {}
+        return jsonify(ok=True, size_ok=bool(r.get("ok")),
+                       over_by=r.get("over_by", 0))
+
     # ---- Web Push subscription management ----
     @app.route("/push/public-key")
     def push_public_key():
@@ -6805,14 +7056,15 @@ def _register_routes(app: Flask):
     def _too_large(e):
         # 요청이 MAX_CONTENT_LENGTH를 넘었을 때. AJAX 업로더면 그 파일만 "too_large"로
         # 알려 나머지는 계속 올리게 하고, 일반 페이지 로드면 친절한 에러 화면을 보여준다.
+        # 사진뿐 아니라 동영상(Step 5)도 이 핸들러를 타므로 문구는 '파일'로 둔다.
         if _wants_json():
             return jsonify(ok=False, error="too_large",
-                           reason="사진 1장은 50MB 이하만 올릴 수 있어."), 413
+                           reason="파일 1개는 50MB 이하만 올릴 수 있어."), 413
         return (
             render_template(
                 "error.html",
-                heading="사진이 너무 커",
-                message="사진 1장은 50MB 이하만 올릴 수 있어. 조금 작은 파일로 다시 시도해줘.",
+                heading="파일이 너무 커",
+                message="파일 1개는 50MB 이하만 올릴 수 있어. 조금 작은 파일로 다시 시도해줘.",
             ),
             413,
         )
