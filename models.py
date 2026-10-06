@@ -195,6 +195,36 @@ def run_startup_migrations():
                     log.info("startup migration: added bets.end_date")
                 except Exception:  # noqa: BLE001
                     log.exception("startup migration: failed adding bets.end_date")
+
+        # 7) blog_reviews: v2 '재료' 칸 8개. blog_reviews 테이블은 프로덕션에 이미
+        #    존재하므로 create_all이 ALTER하지 않는다 — 없는 컬럼만 추가한다.
+        #    전부 nullable이라 **기존 후기는 그대로 NULL로 남고** 화면·재생성 모두
+        #    문제없다(값이 없으면 프롬프트에서 그 줄이 통째로 빠질 뿐). Postgres·
+        #    SQLite 모두 안전하고 반복 실행에 멱등하다.
+        if "blog_reviews" in insp.get_table_names():
+            rcols = {c["name"] for c in insp.get_columns("blog_reviews")}
+            for col, ddl in (
+                ("visited_when", "VARCHAR(100)"),
+                ("visit_reason", "VARCHAR(300)"),
+                ("access_note", "VARCHAR(300)"),
+                ("waiting", "VARCHAR(200)"),
+                ("order_items", "TEXT"),
+                ("highlight", "VARCHAR(300)"),
+                ("downside", "VARCHAR(300)"),
+                ("researched", "TEXT"),
+            ):
+                if col in rcols:
+                    continue
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE blog_reviews ADD COLUMN {col} {ddl}")
+                        )
+                    log.info("startup migration: added blog_reviews.%s", col)
+                except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                    log.exception(
+                        "startup migration: failed adding blog_reviews.%s", col
+                    )
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -954,8 +984,24 @@ class BlogReview(db.Model):
     topic = db.Column(db.String(200), nullable=False)
     # 위치(선택) — 주소·동네 등
     location = db.Column(db.String(300), nullable=True)
-    # 느낀점·특징 3~4줄 원문(필수)
+    # 자유 서술 원문(필수) — 사람 말투의 원천. v2에서 '3~4줄' 가이드를 걷어내고
+    # 길게 받는다(짧은 산문으로 긴 글을 만들면 AI가 지어낸다).
     prose = db.Column(db.Text, nullable=False)
+    # --- v2 '재료' 칸 (전부 선택 입력) --------------------------------------
+    # 레퍼런스 맛집 글(조회수가 더 높은 쪽) 5편을 역산해 뽑은 정보 조각들. 짧은
+    # 산문만으로는 구체적인 수치(대기 분·팀 수·인분·가격)가 안 나와서 AI가 지어내던
+    # 자리를, 사람이 아는 만큼만 채우게 한다. **모르면 비워 둔다** — 빈칸이
+    # 지어내기보다 낫다. 각 칸의 근거는 prompts/blog-review.md·docs/blog-review-spec.md.
+    visited_when = db.Column(db.String(100), nullable=True)   # 언제(요일·시간대)
+    visit_reason = db.Column(db.String(300), nullable=True)   # 왜 갔는지(도입 단락)
+    access_note = db.Column(db.String(300), nullable=True)    # 찾아가는 길·자리·주차
+    waiting = db.Column(db.String(200), nullable=True)        # 웨이팅·입장 방식
+    order_items = db.Column(db.Text, nullable=True)           # 주문·가격·총액
+    highlight = db.Column(db.String(300), nullable=True)      # 가장 기억에 남은 것
+    downside = db.Column(db.String(300), nullable=True)       # 아쉬운 점
+    # 검색해서 확인한 공개 정보(영업시간·휴무·주소·주차). 경험과 **어미가 다르다**
+    # (~것으로 안내돼 있어요) — 그래서 자유 서술과 칸을 분리한다.
+    researched = db.Column(db.Text, nullable=True)
     # 반쪽별 별점 합계(0~10). 별 5개 × 2점, 홀수는 반쪽.
     overall_score = db.Column(db.Integer, nullable=False)
     # 선택한 Photo id들을 JSON list[int]로, **순서 유지**해 저장.
@@ -1011,6 +1057,29 @@ class BlogReview(db.Model):
         )
         by_id = {p.id: p for p in rows}
         return [by_id[i] for i in ids if i in by_id]
+
+    # v2 '재료' 칸 이름 — 모델이 단일 원천이고, 폼·프롬프트가 이 순서를 따른다.
+    DETAIL_FIELDS = (
+        "visited_when",
+        "visit_reason",
+        "access_note",
+        "waiting",
+        "order_items",
+        "highlight",
+        "downside",
+        "researched",
+    )
+
+    @property
+    def details(self):
+        """v2 재료 칸을 ``{필드: 값}`` dict로(빈 칸은 빼고). ``ai.write_review``의
+        ``details`` 인자이자 폼 재렌더의 입력이다. 옛 행(컬럼이 NULL)이면 ``{}``."""
+        out = {}
+        for f in self.DETAIL_FIELDS:
+            v = (getattr(self, f, None) or "").strip()
+            if v:
+                out[f] = v
+        return out
 
     @property
     def ai(self):

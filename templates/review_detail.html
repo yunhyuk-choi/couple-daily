@@ -19,6 +19,28 @@
   </div>
   <p class="review-prose">{{ review.prose }}</p>
 
+  {# v2 '재료' 칸 — 채운 것만 보여준다(빈 칸은 '모른다'는 뜻이라 아예 안 그린다). #}
+  {% set facts = [
+       ('언제', review.visited_when),
+       ('계기', review.visit_reason),
+       ('가는 길·자리', review.access_note),
+       ('웨이팅', review.waiting),
+       ('주문·가격', review.order_items),
+       ('기억에 남은 것', review.highlight),
+       ('아쉬운 점', review.downside),
+       ('검색으로 확인', review.researched),
+     ] | selectattr('1') | list %}
+  {% if facts %}
+  <dl class="rv-facts-view" style="margin:10px 0 0;font-size:0.9rem;line-height:1.7;">
+    {% for label, value in facts %}
+    <div style="display:flex;gap:8px;align-items:baseline;">
+      <dt class="muted" style="flex:0 0 auto;min-width:88px;">{{ label }}</dt>
+      <dd style="margin:0;white-space:pre-line;">{{ value }}</dd>
+    </div>
+    {% endfor %}
+  </dl>
+  {% endif %}
+
   {% if photos %}
   <div class="review-photos">
     {% for p in photos %}
@@ -48,6 +70,51 @@
 </div>
 
 {% elif review.status == 'ready' and review.ai %}
+{# ---- 제목 후보 (v2) --------------------------------------------------------
+   AI가 '타깃 한 문장 → 후보 3개(서로 다른 구조) → 선정 + 이유'를 낸다. 사람이
+   여기서 바꿔 고를 수 있다. 후보가 없는 옛 후기는 이 카드가 통째로 안 그려진다. #}
+{% set cands = review.ai.get('title_candidates') or [] %}
+{% if cands | length > 1 %}
+<div class="card" style="margin-bottom:14px;">
+  <div class="rv-copy-head">
+    <strong>제목 후보</strong>
+    <span class="muted rv-copy-hint">고르면 미리보기 제목이 바뀌어.</span>
+  </div>
+  {% if review.ai.get('title_target') %}
+  <p class="muted small" style="margin:6px 0 0;">
+    타깃 — {{ review.ai.get('title_target') }}
+  </p>
+  {% endif %}
+  <form method="post" action="{{ url_for('review_pick_title', rid=review.id) }}"
+        {% if review.edited_text %}onsubmit="return confirm('제목을 바꾸면 편집한 미리보기가 새 초안으로 되돌아가. 계속할까?');"{% endif %}>
+    <div style="margin:10px 0 0;">
+      {% for c in cands %}
+      {% set picked = (c.get('title') == review.ai.get('title')) %}
+      <label style="display:flex;gap:9px;align-items:flex-start;padding:9px 2px;
+                    border-top:1px solid var(--line, #eee);">
+        <input type="radio" name="index" value="{{ loop.index0 }}"
+               {% if picked %}checked{% endif %} style="margin-top:4px;flex:0 0 auto;" />
+        <span>
+          <span style="font-weight:600;">{{ c.get('title') }}</span>
+          <span class="muted small" style="display:block;margin-top:2px;">
+            {{ c.get('title') | length }}자{% if c.get('structure') %} · {{ c.get('structure') }}{% endif %}{% if picked %} · 지금 쓰는 제목{% endif %}
+          </span>
+          {% if c.get('reason') %}
+          <span class="muted small" style="display:block;margin-top:2px;">{{ c.get('reason') }}</span>
+          {% endif %}
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+    {% if review.ai.get('title_pick_reason') %}
+    <p class="muted small" style="margin:8px 0 0;">
+      AI 선정 이유 — {{ review.ai.get('title_pick_reason') }}
+    </p>
+    {% endif %}
+    <button type="submit" class="btn ghost sm" style="margin-top:10px;">이 제목으로 바꾸기</button>
+  </form>
+</div>
+{% endif %}
 {# 네이버 붙여넣기용: '편집 가능한 미리보기 = 복사 원본'. 여기서 바로 고치고
    '복사'하면 서식·사진까지 text/html로 네이버 스마트에디터에 붙는다. #}
 <div class="review-copy-wrap">

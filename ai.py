@@ -36,6 +36,43 @@ FALLBACK_QUESTIONS = [
 ]
 
 
+# --- 파일로 분리한 프롬프트 (prompts/*.md) --------------------------------
+# 긴 생성 프롬프트는 '튜닝 대상'이라 코드에 박지 않는다 — 글 품질을 고치는 사람이
+# 파이썬을 안 건드리고 마크다운만 고칠 수 있어야 한다. 파일 맨 위의 문서용 머리말
+# (제목 + 인용 블록)은 모델에 보낼 내용이 아니므로 **첫 '---' 줄까지 잘라낸다.**
+_PROMPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+_PROMPT_CACHE = {}
+
+
+def load_prompt(name: str) -> str:
+    """``prompts/<name>.md``의 프롬프트 본문을 읽어 돌려준다(프로세스 내 캐시).
+
+    파일 맨 위 머리말(사람용 설명)은 첫 ``---`` 구분선까지 버린다. 파일이 없거나
+    읽기에 실패하면 ``""``를 돌려준다 — 호출부가 그걸 보고 우아하게 실패한다
+    (프롬프트가 없다고 앱이 죽으면 안 된다).
+    """
+    cached = _PROMPT_CACHE.get(name)
+    if cached is not None:
+        return cached
+    path = os.path.join(_PROMPT_DIR, f"{name}.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"[ai] prompt file missing: {path} ({e})", file=sys.stderr)
+        _PROMPT_CACHE[name] = ""
+        return ""
+    body = raw.replace("\r\n", "\n")
+    lines = body.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() == "---":           # 첫 구분선 뒤부터가 실제 프롬프트
+            body = "\n".join(lines[i + 1:])
+            break
+    body = body.strip()
+    _PROMPT_CACHE[name] = body
+    return body
+
+
 def _claude_argv(allow_web: bool = False) -> list:
     """``claude -p`` argv를 만든다(권한 플래그 포함). 단위 테스트로 argv만 검증 가능.
 
@@ -974,8 +1011,11 @@ def _valid_crop(crop):
 def _normalize_block(b, n_photos, _s):
     """자유형 블록 하나를 타입별로 검증·정규화한다. 못 쓰면 None(호출부가 드롭).
 
-    지원 타입: para/heading/quote(text) · image(photo_index[,crop]) ·
-    info/ratings/faq(items). 알 수 없는 타입·빈 내용은 None.
+    v2에서 AI가 만들 수 있는 블록은 **para/heading/quote(text) · image(photo_index[,crop])
+    넷뿐**이다. info(요약표)·faq(고정 Q&A)는 gf-blog 규율이 금지해 폐기했고, ratings는
+    사용자가 매긴 총점이라 ``_normalize_review``가 직접 붙인다 — 그래서 여기서 받지
+    않는다(알 수 없는 타입 → None → 드롭). 옛 후기에 남아 있는 세 타입은 생성이 아니라
+    **표시** 경로(app._ensure_blocks·_review_copy_html/_text)가 계속 다룬다.
     """
     if not isinstance(b, dict):
         return None
@@ -996,55 +1036,27 @@ def _normalize_block(b, n_photos, _s):
         if crop:  # 수동/구스키마 변환에서 온 크롭을 보존
             blk["crop"] = crop
         return blk
-    if t == "info":
-        items = []
-        for it in (b.get("items") or []):
-            if not isinstance(it, dict):
-                continue
-            label = _s(it.get("label"))
-            value = _s(it.get("value"))
-            if label and value:
-                items.append({"label": label, "value": value})
-            if len(items) >= 8:
-                break
-        return {"type": "info", "items": items} if items else None
-    if t == "ratings":
-        items = []
-        for it in (b.get("items") or []):
-            if not isinstance(it, dict):
-                continue
-            aspect = _s(it.get("aspect"))
-            if not aspect:
-                continue
-            items.append({"aspect": aspect, "score": _clamp_score10(it.get("score"), 0)})
-            if len(items) >= 6:
-                break
-        return {"type": "ratings", "items": items} if items else None
-    if t == "faq":
-        items = []
-        for it in (b.get("items") or []):
-            if not isinstance(it, dict):
-                continue
-            q = _s(it.get("q"))
-            a = _s(it.get("a"))
-            if not q or not a:
-                continue
-            items.append({"q": q, "a": a})
-            if len(items) >= 6:
-                break
-        return {"type": "faq", "items": items} if items else None
     return None
 
 
 def _normalize_review(data, photos, overall_score=0):
     """claude가 준 자유형 블록 dict를 렌더 가능한 일관 스키마로 정규화(순수/오프라인).
 
-    새 스키마: ``{title, blocks:[{type,...}], hashtags:[..]}``. 블록은 AI가 자유롭게
-    구성·정렬한다. 규칙:
-      * 모든 문자열 .strip(). title 비면 None.
-      * blocks: 타입별 검증(_normalize_block), 못 쓰는 블록은 드롭. 최대 60개.
-      * AEO 필수요소 보강: ratings 블록이 하나도 없으면 overall_score에서 만들어
-        끝에 덧붙인다. info·faq가 없으면 프롬프트 실패지만 우아하게(로그만) 진행.
+    v2 스키마::
+
+        {title, title_target, title_candidates[], title_pick_reason,
+         blocks:[{type,...}], hashtags:[..]}
+
+    규칙:
+      * 모든 문자열 .strip(). title 비면 후보 첫 개로 폴백, 그래도 없으면 None.
+      * title_candidates: {title, structure, reason} 최대 3개. 최종 title이 후보에
+        없으면 맨 앞에 끼워 넣는다(상세 화면이 '지금 쓰는 제목'도 고를 수 있게).
+      * blocks: 타입별 검증(_normalize_block — para/heading/image/quote만 통과).
+        최대 60개.
+      * summary: 비어 있는 게 기본이다(v2 계약 — answer-first 고정 폐기). 값이 있으면
+        맨 앞 para로 끼워 넣어 하류(렌더·복사본)는 blocks만 보면 되게 한다.
+      * ratings: AI 값은 버리고 **사용자 총점 하나**로 항상 끝에 붙인다(지어낸
+        항목별 별점 방지).
       * hashtags: 최대 10개, 앞에 # 보장.
       * title이 없거나 서술 콘텐츠(para/quote)가 전혀 없으면 None.
     """
@@ -1056,7 +1068,37 @@ def _normalize_review(data, photos, overall_score=0):
     def _s(v):
         return v.strip() if isinstance(v, str) else ("" if v is None else str(v).strip())
 
+    # --- 제목: 타깃 한 문장 → 후보 3개 → 선정 + 이유 ---------------------
     title = _s(data.get("title"))
+    title_target = _s(data.get("title_target"))
+    title_pick_reason = _s(data.get("title_pick_reason"))
+    candidates = []
+    raw_cands = data.get("title_candidates")
+    if isinstance(raw_cands, list):
+        seen = set()
+        for c in raw_cands:
+            if isinstance(c, str):
+                c = {"title": c}
+            if not isinstance(c, dict):
+                continue
+            ct = _s(c.get("title"))
+            if not ct or ct in seen:
+                continue
+            seen.add(ct)
+            candidates.append(
+                {
+                    "title": ct,
+                    "structure": _s(c.get("structure")),
+                    "reason": _s(c.get("reason")),
+                }
+            )
+            if len(candidates) >= 3:
+                break
+    if not title and candidates:
+        title = candidates[0]["title"]
+    if title and not any(c["title"] == title for c in candidates):
+        candidates.insert(0, {"title": title, "structure": "", "reason": ""})
+        candidates = candidates[:4]
 
     blocks = []
     raw_blocks = data.get("blocks")
@@ -1067,6 +1109,12 @@ def _normalize_review(data, photos, overall_score=0):
                 blocks.append(nb)
             if len(blocks) >= 60:
                 break
+
+    # summary는 '정보형 글'에서만 채워지는 선택 필드다(기본 빈 문자열). 있으면 맨 앞
+    # para로 흡수해, 렌더·복사본·export가 전부 blocks 하나만 보면 되게 한다.
+    summary = _s(data.get("summary"))
+    if summary:
+        blocks.insert(0, {"type": "para", "text": summary})
 
     # hashtags (최대 10, # 보장)
     hashtags = []
@@ -1088,36 +1136,61 @@ def _normalize_review(data, photos, overall_score=0):
     if not has_text:
         return None
 
-    # AEO 필수요소 보강: ratings 없으면 총점으로 하나 만들어 붙인다.
-    if not any(b["type"] == "ratings" for b in blocks):
-        blocks.append(
-            {
-                "type": "ratings",
-                "items": [
-                    {"aspect": "전체 만족도", "score": _clamp_score10(overall_score, 0)}
-                ],
-            }
-        )
-    if not any(b["type"] == "info" for b in blocks):
-        print("[ai] review missing info block — degraded", file=sys.stderr)
-    if not any(b["type"] == "faq" for b in blocks):
-        print("[ai] review missing faq block — degraded", file=sys.stderr)
+    # 별점은 **사용자가 매긴 총점 하나**만. AI가 항목별 점수를 내면 그건 날조다
+    # (폼에 항목별 입력이 없다). 표로도 그리지 않는다 — 렌더러가 평문 한 줄로 낸다.
+    blocks.append(
+        {
+            "type": "ratings",
+            "items": [
+                {"aspect": "전체 만족도", "score": _clamp_score10(overall_score, 0)}
+            ],
+        }
+    )
 
-    return {"title": title, "blocks": blocks, "hashtags": hashtags}
+    out = {"title": title, "blocks": blocks, "hashtags": hashtags}
+    if candidates:
+        out["title_candidates"] = candidates
+    if title_target:
+        out["title_target"] = title_target
+    if title_pick_reason:
+        out["title_pick_reason"] = title_pick_reason
+    return out
 
 
-def write_review(topic, location, prose, overall_score, photos):
-    """데이트 후기 원문을 네이버 AI 검색 최적화 블로그 초안(구조화 JSON)으로 만든다.
+# 후기 '재료' 칸 — DB 컬럼 ↔ 프롬프트에 보일 라벨. 이 **순서가 곧 글의 흐름**이다
+# (방문 계기 → 찾아가는 길 → 웨이팅 → 주문·가격 → 하이라이트 → 아쉬운 점 → 조사 정보).
+# 레퍼런스 맛집 글 5편을 역산해 뽑은 정보 조각들이고, 전부 선택 입력이다 —
+# 모르면 비워 두는 편이 지어내는 것보다 낫다(prompts/blog-review.md 참고).
+REVIEW_DETAIL_FIELDS = (
+    ("visited_when", "언제 갔는지(요일·시간대)"),
+    ("visit_reason", "왜 갔는지(방문 계기)"),
+    ("access_note", "찾아가는 길·자리"),
+    ("waiting", "웨이팅·입장"),
+    ("order_items", "주문한 것과 가격"),
+    ("highlight", "가장 기억에 남은 것"),
+    ("downside", "아쉬운 점"),
+    ("researched", "검색해서 확인한 공개 정보"),
+)
+
+# '검색해서 확인한' 칸만 어미가 다르다(~것으로 안내돼 있어요). 재료 블록에서 한 번 더
+# 못박아, 모델이 공개 정보를 직접 겪은 것처럼 쓰지 않게 한다.
+_RESEARCHED_NOTE = " ← 이건 직접 겪은 게 아니라 검색으로 확인한 공개 정보다"
+
+
+def write_review(topic, location, prose, overall_score, photos, details=None):
+    """후기 재료를 네이버 블로그 글(구조화 JSON)로 만든다 — 프롬프트는 파일 분리.
 
     ``photos``: ``{"index": i, "caption": <그 사진의 AI 캡션>, "tags": [..]}``의
-    순서 리스트(호출부가 순서대로 넘긴다). claude를 '한 번'만 호출하고 strict JSON을
-    파싱해 ``_normalize_review``로 정규화한 dict를 돌려주거나, 어떤 실패에도 ``None``을
-    돌려준다(절대 raise 안 함). 느린 서브프로세스라 호출부가 반드시 백그라운드에서
-    돌린다.
+    순서 리스트(호출부가 순서대로 넘긴다). ``details``: 선택 입력 칸 dict
+    (``REVIEW_DETAIL_FIELDS``의 키들 — 없거나 빈 값은 프롬프트에서 통째로 빠진다).
 
-    타깃 = 네이버 통합검색/AI 브리핑(하이퍼클로바X) + 네이버 홈피드 체류(끝까지
-    읽힘·댓글 유도). 생성 글은 네이버 AI가 인용하고, '진짜 경험 후기' 필터를
-    통과하도록 구성한다.
+    claude를 '한 번'만 호출하고 strict JSON을 파싱해 ``_normalize_review``로 정규화한
+    dict를 돌려주거나, 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함). 느린
+    서브프로세스라 호출부가 반드시 백그라운드에서 돌린다.
+
+    v2 기준: 글의 내용 규율은 gf-blog 프롬프트가 정본이다. 표·볼드 금지, 글자 수·
+    키워드 반복·소제목 개수 고정 금지, 경험/조사 어미 구분, 요약표·FAQ 고정 섹션
+    폐기. 본문 규율 전체는 ``prompts/blog-review.md``에 있고 여기선 재료만 채운다.
     """
     topic = (topic or "").strip()
     if not topic:
@@ -1126,9 +1199,32 @@ def write_review(topic, location, prose, overall_score, photos):
     location = (location or "").strip()
     overall_score = _clamp_score10(overall_score, 0)
     photos = photos or []
+    details = details or {}
 
-    # 사진 재료 블록 — 각 사진의 index(0-based)·캡션·태그를 그대로 준다. 캡션이
-    # 없으면 '(설명 없음)'로 표시하되, 모델이 지어내지 않도록 명시한다.
+    template = load_prompt("blog-review")
+    if not template:
+        print("[ai] blog-review prompt unavailable — skip", file=sys.stderr)
+        return None
+
+    # --- 재료 블록: 값이 있는 칸만 넣는다(빈 칸은 '모른다'는 뜻이라 아예 안 보인다) ---
+    input_lines = [f"주제 / 장소: {topic}"]
+    if location:
+        input_lines.append(f"위치: {location}")
+    for key, label in REVIEW_DETAIL_FIELDS:
+        val = (details.get(key) or "").strip() if isinstance(details, dict) else ""
+        if not val:
+            continue
+        note = _RESEARCHED_NOTE if key == "researched" else ""
+        input_lines.append(f"{label}{note}: {val}")
+    input_lines.append(f"사용자가 매긴 총점: {overall_score}/10 (본문에 숫자로 쓰지는 마라)")
+    input_lines.append(
+        "자유 서술(사용자가 직접 쓴 말 — 이 말투와 표현을 최대한 살려라):\n"
+        + (prose or "(없음)")
+    )
+    input_block = "\n".join(input_lines)
+
+    # --- 사진 재료 — 각 사진의 index(0-based)·캡션·태그를 그대로 준다. 캡션이 없으면
+    #     '(설명 없음)'으로 표시하고, 모델이 지어내지 않도록 규칙에서 못박는다. ---
     if photos:
         photo_lines = []
         for p in photos:
@@ -1142,123 +1238,23 @@ def write_review(topic, location, prose, overall_score, photos):
             photo_lines.append(line)
         photo_block = "\n".join(photo_lines)
         photo_rule = (
-            f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이야. 사진을 넣고 "
-            "싶은 자리에 image 블록을 두고 photo_index에 그 자리에 가장 잘 맞는 사진 "
-            "번호(0-based)를 넣어. 없는 번호는 절대 쓰지 마. 굳이 모든 사진을 다 넣을 "
-            "필요는 없어. 사진 설명은 위 캡션에만 근거하고 지어내지 마.\n"
+            f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이다. 넣고 싶은 "
+            "자리에 image 블록을 두고 photo_index에 그 자리에 가장 잘 맞는 사진 번호"
+            "(0-based)를 넣어라. 없는 번호는 절대 쓰지 마라. 모든 사진을 다 넣을 "
+            "필요는 없다."
         )
     else:
         photo_block = "(첨부된 사진 없음)"
-        photo_rule = "- 첨부된 사진이 없으니 image 블록은 넣지 마.\n"
-
-    loc_line = f"위치: {location}\n" if location else "위치: (입력 안 함)\n"
+        photo_rule = "- 첨부된 사진이 없으니 image 블록은 넣지 마라."
 
     prompt = (
-        "[페르소나]\n"
-        "너는 연인이 다녀온 데이트를 '네이버 블로그'에 올릴 진짜 경험 후기 포스트로 "
-        "다듬어주는 다정한 도우미야. 실제로 다녀와서 '내돈내산'으로 남기는 감성 후기 "
-        "톤이야. 정보 전달만 하지 말고, 독자가 끝까지 읽고 공감·댓글을 남기고 싶게 "
-        "만들어.\n\n"
-        "[가장 중요한 목표 — 두 마리 토끼]\n"
-        "이 글은 (1) '네이버 통합검색·AI 브리핑(하이퍼클로바X)'이 인용하고 '실제 방문 "
-        "경험' 필터를 통과해야 하고, 동시에 (2) 네이버 '홈피드'에서 끝까지 읽히고"
-        "(체류시간) 댓글·공감이 달려야 해. 네이버 AI는 광고성·AI 티 나는 일반론 글을 "
-        "하위 노출시켜. 그러니:\n"
-        "1) 진짜 다녀온 1인칭 경험 톤으로. 아래 '느낀점 원문'과 '사진 캡션'의 실제 "
-        "내용에만 근거해 구체적·개인적으로 써. 과장된 마케팅 톤·상투적 미사여구·"
-        "일반론·AI 광고글 금지.\n"
-        "2) 사용자가 주지 않은 사실(정확한 가격·영업시간·메뉴 등)은 절대 지어내지 마. "
-        "모르면 빼거나 '방문 시 확인'이라고 써.\n\n"
-        "[말투 — 감성 후기 v2]\n"
-        "- 존댓말 기반 생생한 블로그 말투('~했어요','~더라구요','~추천드려요'). "
-        "다녀온 사람이 도란도란 얘기하듯 따뜻하고 친근하게.\n"
-        "- 문장을 짧게 끊어. 한 문장 = 한 줄. para/quote text 안에서 문장이 끝날 "
-        "때마다 실제 줄바꿈(\\n)으로 나눠. 한 줄에 한 문장(빌더가 가운데 정렬로 렌더). "
-        "한 para는 대략 3~5줄.\n"
-        "- 짧은 줄 끝엔 마침표를 웬만하면 붙이지 마(줄마다 마침표=AI 티). 좀 긴 "
-        "문장에서 읽기 편할 때만 예외. 물음표·느낌표는 평소대로.\n"
-        "- 이모지는 아껴서 감성적인 것만 가끔(🤍 🩷 ☕️ 📸 🌿 ✨). 🔥😀👍💯💕 같은 "
-        "촌스러운 건 금지. 소제목 장식 이모지는 시스템이 넣으니 넣지 마.\n"
-        "- 뉴스 기사 문체 금지. 같은 어미 반복 금지.\n\n"
-        "[강조 마크업 — 색 대신 표시만]\n"
-        "para/quote text 안 강조는 아래 기호로 감싸기만(색코드·HTML·<span> 금지, "
-        "빌더가 팔레트로 변환): *감정·상호·핵심어* → 핑크 / `가격·주차·시간 같은 팩트` "
-        "→ 파랑 팩트 / ==진짜 인상 깊었던 한마디== → 형광펜 / **꼭 굵게** → 굵게. "
-        "한 줄에 강조 최대 1~2개(남발=역효과). 단어/짧은 구에만 딱 감싸(줄 전체 X). "
-        "같은 단어를 매번 강조하지 말고 핵심어는 처음 한 번만 강조해. heading엔 강조 "
-        "기호 쓰지 마.\n\n"
-        "[글의 구성 — 자유형 블록, 매번 다르게]\n"
-        "정해진 틀 없이 'blocks' 배열로 자유롭게. para/heading/image/info/ratings/"
-        "faq/quote를 원하는 순서·개수로 섞어(para/heading/image 교차). 고정 뼈대 반복 "
-        "금지, 이 후기만의 각도로 매번 다르게. 단 아래 [도입]·[정보 위치]·[마무리] "
-        "흐름은 지켜. 사용할 수 있는 블록:\n"
-        '  - {"type":"para","text":"본문(짧은 줄 \\n)"}\n'
-        '  - {"type":"heading","text":"소제목"}\n'
-        '  - {"type":"image","photo_index":0}\n'
-        '  - {"type":"info","items":[{"label":"분위기","value":".."}]}\n'
-        '  - {"type":"ratings","items":[{"aspect":"분위기","score":9}]}\n'
-        '  - {"type":"faq","items":[{"q":"..","a":".."}]}\n'
-        '  - {"type":"quote","text":"한줄 총평"}\n\n'
-        "[도입부 — 첫 두 블록(중요)]\n"
-        "① 첫 para = '한 줄 결론/한줄평'을 맨 앞에(네이버 AI가 여기서 답을 뽑음 = "
-        "answer-first).\n"
-        "② 이어지는 para = 후킹 도입: (a) 흔히 겪는 실제 상황 2줄+ → (b) 문제 제기"
-        "(독자가 궁금할 질문) → (c) 창작자 반응 최소 1회(\"저도 처음엔 몰랐어요\") → "
-        "(d) 궁금증으로 마무리.\n\n"
-        "[본문 전개]\n"
-        "- 소제목(heading)은 그 섹션을 '검색해서 찾을 만한 말'로 요약하되, 동시에 "
-        "'읽고 싶게' 만드는 궁금증·감정을 한 줄에 자연스럽게 녹여. 정해진 틀·부호"
-        "(대시 '—' 등)를 쓰지 말고, 그 섹션 내용에서 가장 자연스럽게 나오는 표현으로"
-        "(질문형·정보요약·감성 등 그때그때 다르게). 낚시성·똑같은 형식 반복 금지. "
-        "개수 3개 안팎, 그중 최소 1~2개엔 장소·메뉴 키워드가 자연스럽게 들어가게"
-        "(전부 강제하진 마).\n"
-        "- 각 섹션은 단순 설명 나열 말고 [설명 → 반응 → 정보 → 의문 → 공감]을 "
-        "자연스럽게 반복.\n"
-        "- 작성자 생각·감정을 글 전체에 최소 4회 이상(\"솔직히 놀랐어요\",\"저희는 이게 "
-        "제일 좋았어요\").\n"
-        "- 중간중간 몰입 문장을 후기 감성톤으로(정보 낚시체 X): \"이건 진짜 가보고 "
-        "알았어요\",\"여기서 분위기가 확 달라져요\".\n\n"
-        "[정보 요소 — 뒤쪽 배치(AEO)]\n"
-        "글 뒷부분(마무리 직전)에 배치: info 1개+(짧은 label:value, 아는 것만. "
-        "'방문 날짜'는 시스템이 넣으니 넣지 마), ratings 1개+(총점 외 맥락형 항목 "
-        "3~5개, score 0~10 정수), faq 2~3개(질문형, 실제 궁금할 현실적 질문).\n\n"
-        "[마무리]\n"
-        "① 한 줄 요약 → ② 핵심 다시 강조 → ③ 댓글 유도 질문. 한줄 총평(quote)로 "
-        "감성 매듭도 좋음.\n\n"
-        "[분량·키워드]\n"
-        "- 본문(para) 총량 대략 900~1400자.\n"
-        "- 메인 키워드(주제/장소명)는 제목·소제목·본문에 자연스럽게 여러 번 노출"
-        "(검색 도움). 억지로 같은 말 반복 금지 — 어색하면 빼.\n"
-        "- 검색어형 hashtags.\n\n"
-        "[사실성 원칙 — 해당될 때만]\n"
-        "건강·의학·법률·금융처럼 민감한 내용이 나오면 검증된 일반적 사실만, 단정 금지"
-        "(\"~할 수 있다\",\"일반적으로 알려져 있다\"). 특정 음식·행동이 효능/원인이라 "
-        "단정 금지. (해당 없으면 안 씀.)\n\n"
-        "[사용자가 남긴 후기 원문]\n"
-        f"주제/장소: {topic}\n"
-        f"{loc_line}"
-        f"사용자가 매긴 총점: {overall_score}/10\n"
-        f"느낀점·특징(원문):\n{prose or '(원문 없음)'}\n\n"
-        "[첨부 사진과 그 설명(캡션)]\n"
-        f"{photo_block}\n\n"
-        "[사진 규칙]\n"
-        f"{photo_rule}\n"
-        "출력은 아래 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이 출력해. "
-        "text 값 안의 줄바꿈은 JSON 문자열이므로 \\n 으로 이스케이프해:\n"
-        "{\n"
-        '  "title": "검색 의도를 담은 포스트 제목",\n'
-        '  "blocks": [ {"type":"para","text":"한 줄 결론"}, '
-        '{"type":"para","text":"상황\\n문제제기\\n반응\\n궁금증"}, '
-        '{"type":"heading","text":"소제목"}, '
-        '{"type":"para","text":"짧은 줄들 \\n 로"}, {"type":"image","photo_index":0}, '
-        '{"type":"info","items":[{"label":"분위기","value":".."}]}, '
-        '{"type":"ratings","items":[{"aspect":"분위기","score":9}]}, '
-        '{"type":"faq","items":[{"q":"..","a":".."}]}, '
-        '{"type":"para","text":"요약\\n핵심 강조\\n댓글 유도 질문"}, '
-        '{"type":"quote","text":"한줄 총평"} ],\n'
-        '  "hashtags": ["#장소명", "#데이트"]\n'
-        "}"
+        template
+        .replace("{{INPUT_BLOCK}}", input_block)
+        .replace("{{PHOTO_BLOCK}}", photo_block)
+        .replace("{{PHOTO_RULE}}", photo_rule)
+        .replace("{{PHOTO_COUNT}}", str(len(photos)))
     )
+
     try:
         raw = _run_claude(prompt)
         data = _extract_json(raw)

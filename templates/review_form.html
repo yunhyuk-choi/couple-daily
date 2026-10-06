@@ -22,6 +22,69 @@
            value="{{ form.location if form else '' }}" />
   </label>
 
+  {# ---- v2 '재료' 칸 ------------------------------------------------------
+     짧은 느낌점만으로 1,500자짜리 글을 만들면 AI가 지어낸다. 실제로 잘 읽히는
+     블로그 글을 역산해 보면 '앞에 3팀·웨이팅 15분', '갈매기살 2인분', '총 46,000원'
+     같은 구체적인 조각들로 이뤄져 있다 — 그 조각을 받는 칸이다.
+     전부 선택 입력이고, 모르면 비워 두는 편이 지어내는 것보다 낫다. #}
+  <div class="rev-facts">
+    <span style="font-weight:600; font-size:0.92rem;">조금 더 구체적으로</span>
+    <p class="muted small" style="margin:4px 0 10px;">
+      전부 선택이야 — 아는 것만 적고 <b>모르면 그냥 비워 둬.</b>
+      빈칸이 AI가 지어낸 문장보다 나아. 숫자(대기 분·팀 수·인분·가격)가 글의 힘이야.
+    </p>
+
+    <label>언제 갔어? <span class="muted small">(요일·시간대)</span>
+      <input type="text" name="visited_when" maxlength="100"
+             placeholder="예: 일요일 저녁 / 토요일 오후 3시 반"
+             value="{{ form.visited_when if form else '' }}" />
+    </label>
+
+    <label>왜 갔어? <span class="muted small">(방문 계기 — 글의 도입이 돼)</span>
+      <input type="text" name="visit_reason" maxlength="300"
+             placeholder="예: 평이 좋다는 얘기를 들어서 / 예전부터 궁금했던 곳이라"
+             value="{{ form.visit_reason if form else '' }}" />
+    </label>
+
+    <label>찾아가는 길 · 자리 <span class="muted small">(층·골목·역·주차·좌석)</span>
+      <input type="text" name="access_note" maxlength="300"
+             placeholder="예: 롯데월드몰 6층 안쪽 / 철공소 골목 안쪽, 좌식 / 전용 주차장 없음"
+             value="{{ form.access_note if form else '' }}" />
+    </label>
+
+    <label>웨이팅 · 입장 <span class="muted small">(대기 분·앞 팀 수·줄서기 방식)</span>
+      <input type="text" name="waiting" maxlength="200"
+             placeholder="예: 앞에 3팀, 약 15분 기다림 / 테이블링 원격 줄서기 / 바로 입장"
+             value="{{ form.waiting if form else '' }}" />
+    </label>
+
+    <label>주문한 것과 가격 <span class="muted small">(인분·메뉴·가격·총액)</span>
+      <textarea name="order_items" rows="3" maxlength="2000"
+                placeholder="예: 갈매기살 2인분, 삿포로 생맥주, 돌솥밥 추가&#10;신라칼낙새 17,000원 · 감자전 12,000원, 둘이 총 46,000원">{{ form.order_items if form else '' }}</textarea>
+    </label>
+
+    <label>가장 기억에 남은 것 <span class="muted small">(하나만)</span>
+      <input type="text" name="highlight" maxlength="300"
+             placeholder="예: 구운 새우젓에 백김치 올려 먹은 조합 / 직원분이 직접 구워주신 것"
+             value="{{ form.highlight if form else '' }}" />
+    </label>
+
+    <label>아쉬운 점 <span class="muted small">(솔직한 게 글을 믿게 만들어)</span>
+      <input type="text" name="downside" maxlength="300"
+             placeholder="예: 양이 많아서 남겼어 / 웨이팅까지 할 만큼 인상 깊진 않았어"
+             value="{{ form.downside if form else '' }}" />
+    </label>
+
+    <label>검색해서 확인한 정보 <span class="muted small">(영업시간·휴무·주소·주차)</span>
+      <textarea name="researched" rows="2" maxlength="2000"
+                placeholder="예: 화~일 10:00~20:00, 월요일 휴무, 라스트오더 19:20&#10;전용 주차장 없음 (공영주차장 이용)">{{ form.researched if form else '' }}</textarea>
+    </label>
+    <p class="muted small" style="margin:-2px 0 0;">
+      ↑ 여긴 <b>직접 겪은 게 아니라 검색으로 안 것만</b> 적어줘. 글에서 어미가 달라져
+      (겪은 건 “~했어요”, 찾아본 건 “~안내돼 있어요”).
+    </p>
+  </div>
+
   {# ---- 반쪽별 별점 (0~10) — 드래그/탭/키보드 ---- #}
   <div>
     <span style="font-weight:600; font-size:0.92rem;">별점 <span class="muted small">(0~10 · 별 하나 = 2점)</span></span>
@@ -77,9 +140,11 @@
            value="{{ init_ids | tojson }}" />
   </div>
 
-  <label>느낀점 · 특징 <span class="muted small">(필수 · 3~4줄)</span>
-    <textarea name="prose" rows="4" required
-              placeholder="분위기, 좋았던 점, 아쉬운 점, 추천 포인트를 편하게 적어줘. AI가 이걸 블로그 글로 다듬어줄 거야.">{{ form.prose if form else '' }}</textarea>
+  {# 자유 서술은 '사람 말투의 원천'이다 — v2에서 3~4줄 가이드를 걷어내고 길게 받는다.
+     위 칸들이 사실·숫자를 담당하고, 여기가 어투와 감상을 담당한다. #}
+  <label>자유 서술 <span class="muted small">(필수 · 길수록 좋아)</span>
+    <textarea name="prose" rows="10" required
+              placeholder="그날 있었던 일을 떠오르는 대로 편하게 적어줘. 길어도 괜찮아 — 네 말투가 그대로 글이 돼.&#10;&#10;· 들어가서 뭘 보고 뭘 느꼈는지&#10;· 맛·식감·향·소스, 뭐랑 같이 먹었는지&#10;· 둘이 나눈 말, 웃겼던 순간&#10;· 다시 올 것 같은지">{{ form.prose if form else '' }}</textarea>
   </label>
 
   <button class="btn primary" type="submit">{{ '수정 → 초안 다시 생성' if editing else '등록 → AI 초안 생성' }}</button>
