@@ -54,6 +54,110 @@
   {% endif %}
 </div>
 
+{# ---- 키워드 조사 메모 (Step 3) ------------------------------------------
+   gf-blog 워크플로우에서 사람이 손으로 남기던 '조사 메모'를 앱이 대신 남긴 것.
+   후보 / 근거 / 선정·제외 이유 / 데이터 한계를 그대로 보여준다 — 그래야
+   "대체"가 아니라 "자동화"로 읽힌다. 조사가 없으면(키 미설정) 안내만 한다. #}
+{% set rs = research.status if research else none %}
+{% if rs == 'ok' and research.selection %}
+{% set sel = research.selection %}
+<div class="card" style="margin-bottom:14px;">
+  <div class="rv-copy-head">
+    <strong>키워드 조사 메모</strong>
+    <span class="muted rv-copy-hint">네이버 블로그 검색 · 검색어 트렌드(52주/8주)로 확인한 것</span>
+  </div>
+  <p style="margin:8px 0 0;">
+    메인 키워드 — <strong>{{ sel.main }}</strong>
+  </p>
+  {% if sel.supporting %}
+  <p class="muted small" style="margin:4px 0 0;">
+    보조 — {{ sel.supporting | join(' · ') }}
+  </p>
+  {% endif %}
+  {% if sel.main_reason %}
+  <p class="small" style="margin:8px 0 0;">선정 이유 — {{ sel.main_reason }}</p>
+  {% endif %}
+  {% if sel.supporting_reason %}
+  <p class="muted small" style="margin:4px 0 0;">보조 이유 — {{ sel.supporting_reason }}</p>
+  {% endif %}
+  {% if sel.angle %}
+  <p class="muted small" style="margin:4px 0 0;">본문이 답해야 할 것 — {{ sel.angle }}</p>
+  {% endif %}
+  {% if sel.competition %}
+  <p class="muted small" style="margin:4px 0 0;">경쟁 — {{ sel.competition }}</p>
+  {% endif %}
+  {% if sel.excluded %}
+  <p class="muted small" style="margin:8px 0 0;">제외한 후보</p>
+  <ul class="muted small" style="margin:2px 0 0;padding-left:18px;">
+    {% for ex in sel.excluded %}
+    <li>{{ ex.keyword }}{% if ex.reason %} — {{ ex.reason }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if research.candidates %}
+  <details style="margin-top:10px;">
+    <summary class="muted small" style="cursor:pointer;">후보별 조사 근거 보기 ({{ research.candidates | length }}개)</summary>
+    {% for c in research.candidates %}
+    <div style="border-top:1px solid var(--line, #eee);padding:8px 0 0;margin-top:8px;">
+      <p style="margin:0;font-weight:600;">
+        {{ c.keyword }}{% if c.keyword == sel.main %} · 메인{% endif %}
+      </p>
+      {% if c.question %}<p class="muted small" style="margin:2px 0 0;">묻는 것 — {{ c.question }}</p>{% endif %}
+      {% if c.answerable %}<p class="muted small" style="margin:2px 0 0;">후기가 답하는 대목 — {{ c.answerable }}</p>{% endif %}
+      <p class="muted small" style="margin:2px 0 0;">
+        블로그 검색 결과 수 — {% if c.total is none %}조회 실패{% else %}{{ c.total }}편{% endif %}
+        <span style="opacity:.75;">(검색량이 아니라 글 편수)</span>
+      </p>
+      <p class="muted small" style="margin:2px 0 0;">트렌드 52주 — {{ c.trend_52w }}</p>
+      <p class="muted small" style="margin:2px 0 0;">트렌드 8주 — {{ c.trend_8w }}</p>
+      {% if c.competitors %}
+      <p class="muted small" style="margin:4px 0 0;">같은 말로 걸리는 글</p>
+      <ul class="muted small" style="margin:2px 0 0;padding-left:18px;">
+        {% for g in c.competitors %}
+        <li>
+          {% if g.link %}<a href="{{ g.link }}" target="_blank" rel="noopener noreferrer">{{ g.title }}</a>{% else %}{{ g.title }}{% endif %}
+          {% if g.postdate %} · {{ g.postdate }}{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </details>
+  {% endif %}
+
+  {% if sel.limits %}
+  <p class="muted small" style="margin:10px 0 0;">이번 조사의 한계 — {{ sel.limits }}</p>
+  {% endif %}
+  <p class="muted small" style="margin:4px 0 0;">{{ research.caveat }}</p>
+  {% if research.errors %}
+  <p class="muted small" style="margin:4px 0 0;">조사 실패 항목 — {{ research.errors | join(' / ') }}</p>
+  {% endif %}
+  {% if research.key_owner %}
+  <p class="muted small" style="margin:4px 0 0;">{{ research.key_owner }}의 네이버 API 키로 조사했어.</p>
+  {% endif %}
+</div>
+
+{% elif rs == 'failed' %}
+<div class="card" style="margin-bottom:14px;">
+  <strong class="small">키워드 조사</strong>
+  <p class="muted small" style="margin:6px 0 0;">
+    이번엔 조사가 안 됐어 — 글은 재료만 보고 썼어. '↻ 다시 생성'으로 다시 시도할 수 있어.
+  </p>
+</div>
+
+{% elif review.status != 'pending' and not naver_keys_set %}
+<div class="card" style="margin-bottom:14px;">
+  <strong class="small">키워드 조사가 꺼져 있어</strong>
+  <p class="muted small" style="margin:6px 0 0;">
+    <a href="{{ url_for('settings') }}">설정</a>에서 네이버 API HUB 키를 넣으면,
+    후기를 만들 때 롱테일 키워드 후보를 뽑아 블로그 검색·검색어 트렌드로 확인하고
+    메인/보조 키워드와 선정 이유를 여기 남겨. 지금은 재료만 보고 글을 써.
+  </p>
+</div>
+{% endif %}
+
 {# ---- P2: 생성 중 / 초안 준비됨 / 실패 ---- #}
 {% if review.status == 'pending' %}
 <div class="review-placeholder">
