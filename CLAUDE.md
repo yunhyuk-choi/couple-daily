@@ -48,8 +48,16 @@
 - **`models.py`** — SQLAlchemy: `Couple`·`User`·`DailyQuestion`·`Answer`·`Setting`·
   `MonthlyReport`(캐시된 월간 정성 인사이트) 등.
 - **`ai.py`** — `claude` CLI 래퍼. `generate_daily_question`, `generate_monthly_qualitative`,
-  `write_review`(블로그 후기). 긴 생성 프롬프트는 `ai.load_prompt(<이름>)`로 **파일에서** 읽는다.
-- **`prompts/`** — 파일로 분리한 생성 프롬프트(`blog-review.md`). **글 품질 튜닝은 여기서** 한다
+  `write_review`(블로그 후기), `suggest_keyword_candidates`/`select_keywords`(키워드 조사).
+  긴 생성 프롬프트는 `ai.load_prompt(<이름>)`로 **파일에서** 읽는다.
+- **`naver_api.py`** — NAVER API HUB(블로그 검색 · 검색어 트렌드) 얇은 클라이언트. 자격증명은
+  **인자로만** 받고 로그·예외에 남기지 않는다. 지표 오독 금지(검색 결과 수 != 검색량,
+  상대지수 != 절대 검색 횟수, 빈 트렌드 = 정량 확인 실패)는 모듈 머리말이 정본.
+- **`keyword_research.py`** — 후기 재료 → 롱테일 후보 → 네이버 조사 → 메인/보조 선정.
+  **키가 없으면 건너뛴다**(`status: "skipped"`) — 생성은 그대로 돈다. 자세한 건
+  `docs/blog-review-spec.md` §11.
+- **`prompts/`** — 파일로 분리한 생성 프롬프트(`blog-review.md`·`keyword-candidates.md`·
+  `keyword-select.md`). **글 품질 튜닝은 여기서** 한다
   — 파이썬을 안 건드린다. 파일 맨 위 사람용 머리말은 첫 `---`까지 잘려 나가고, `{{...}}`
   자리만 런타임에 치환된다.
 - **`tests/`** — pytest(네트워크·`claude` 없이 돈다 — 임시 SQLite + `_run_claude` 가짜).
@@ -70,7 +78,7 @@
 | `POST /answer` | 오늘 질문에 답변(있으면 수정). 둘 다 답해야 공개 |
 | `GET /history` | 지난 질문+양쪽 답 (공개된 것만) |
 | `GET /insight` | `?year=&month=` 월간 정량(실시간)+정성(DB 캐시본). claude는 요청 경로에서 호출 안 함; 없으면 백그라운드 생성 트리거 후 플레이스홀더 |
-| `GET,POST /settings` | 앱 이름(Setting)·내 표시이름 수정 |
+| `GET,POST /settings` | 앱 이름(Setting)·내 표시이름 수정 · 네이버 업로더 키 재발급 · **네이버 API HUB 키(사용자별) 저장/연결확인/삭제** — 값은 다시 렌더하지 않고 설정됨/미설정만 |
 | `GET /manifest.json` | 동적 매니페스트(APP_NAME 반영) |
 | `GET /sw.js` | 서비스 워커 (루트 스코프) |
 | `GET /healthz` | 헬스체크 |
