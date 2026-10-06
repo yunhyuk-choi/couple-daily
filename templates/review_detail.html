@@ -4,7 +4,13 @@
 {% block head %}
   {# 생성 중일 때만 4초마다 새로고침 — 백그라운드 초안이 끝나면 자동으로 결과가
      뜬다. (의존성 없는 순수 meta refresh. 'ready'/'failed'가 되면 자연히 멈춘다.) #}
-  {% if review.status == 'pending' %}<meta http-equiv="refresh" content="4" />{% endif %}
+  {% if review.status == 'pending' or (thumb and thumb.status == 'pending') %}<meta http-equiv="refresh" content="4" />{% endif %}
+  {# 썸네일 타이포 — design/thumbnail-template.css 가 지정한 Pretendard. 다른 폰트로
+     그리면 검증된 디자인이 아니게 되므로, 로딩에 실패하면 JS가 렌더를 아예 막는다. #}
+  {% if thumb and thumb.candidates and thumb_spec and thumb_photos %}
+  <link rel="stylesheet" crossorigin="anonymous"
+        href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard-dynamic-subset.css" />
+  {% endif %}
 {% endblock %}
 {% block content %}
 <div class="page-head">
@@ -219,6 +225,178 @@
   </form>
 </div>
 {% endif %}
+{# ---- 썸네일 (Step 4) ------------------------------------------------------
+   네이버는 썸네일이 클릭을 좌우한다. gf-blog 는 Playwright + Chrome headless 로
+   렌더했지만 우리 서버(Render 무료티어 512MB·0.1 CPU)엔 Chromium 이 없다 —
+   그래서 **이 미리보기를 그리고 있는 브라우저**가 같은 수치(design/thumbnail-template.css)로
+   직접 그린다. 넘침 검증(scrollWidth <= clientWidth)도 그 진짜 DOM 에서 그대로 친다.
+   문구는 claude 가 쓰고(후보 3개 → 1개), 넘치면 **폰트가 아니라 문구를 줄인다.** #}
+<div class="card rv-thumb-card" id="rv-thumb"
+     data-state-url="{{ url_for('review_thumbnail_state', rid=review.id) }}"
+     data-topic="{{ review.topic }}">
+  <div class="rv-copy-head">
+    <strong>썸네일</strong>
+    <span class="muted rv-copy-hint">
+      {{ thumb_spec.canvas.width if thumb_spec else 1080 }}×{{ thumb_spec.canvas.height if thumb_spec else 1350 }}
+      PNG · 네 브라우저가 직접 그려서 바로 내려받아.
+    </span>
+  </div>
+
+  {% if not thumb_spec %}
+  <p class="muted small" style="margin:8px 0 0;">
+    디자인 템플릿(<code>design/thumbnail-template.css</code>)을 읽지 못해서 썸네일이 꺼져 있어.
+  </p>
+
+  {% elif thumb and thumb.status == 'pending' %}
+  <p style="margin:8px 0 0;">✨ 썸네일 문구를 만드는 중이야… (잠시만!)</p>
+
+  {% elif thumb and thumb.candidates %}
+  {% set picked = thumb.picked or 0 %}
+  {# ⚠️ `thumb.copy` 로 쓰면 안 된다 — Jinja 의 속성 조회가 dict 의 **copy() 메서드**를
+     먼저 집어서(truthy) 칸이 전부 빈 채로 렌더된다(실측된 버그). 항목은 첨자로 읽는다. #}
+  {% set picked_copy = thumb['copy'] or thumb.candidates[picked] %}
+  {% if thumb.last_error %}
+  <p class="muted small" style="margin:8px 0 0;">{{ thumb.last_error }}</p>
+  {% endif %}
+
+  {# 후보 3개 — 제목 후보 카드와 같은 모양(사람이 고른다). #}
+  <div style="margin:10px 0 0;">
+    {% for c in thumb.candidates %}
+    <label style="display:flex;gap:9px;align-items:flex-start;padding:9px 2px;
+                  border-top:1px solid var(--line, #eee);">
+      <input type="radio" name="rv-thumb-pick" value="{{ loop.index0 }}"
+             {% if loop.index0 == picked %}checked{% endif %}
+             style="margin-top:4px;flex:0 0 auto;" />
+      <span>
+        <span style="font-weight:600;">{{ c.main_line1 }} / {{ c.main_line2 }}</span>
+        <span class="muted small" style="display:block;margin-top:2px;">
+          서브 — {{ c.sub or '(없음)' }}{% if c.badge %} · 배지 — {{ c.badge }}{% endif %}
+        </span>
+        {% if c.reason %}
+        <span class="muted small" style="display:block;margin-top:2px;">{{ c.reason }}</span>
+        {% endif %}
+      </span>
+    </label>
+    {% endfor %}
+  </div>
+  {% if thumb.pick_reason %}
+  <p class="muted small" style="margin:8px 0 0;">AI 선정 이유 — {{ thumb.pick_reason }}</p>
+  {% endif %}
+
+  {# 사람이 줄이는 자리. 넘치면 폰트가 아니라 **여기**를 줄인다. #}
+  <div class="rv-thumb-fields">
+    {% for field, label, budget in [
+         ('main_line1', '메인 1줄', thumb_spec.budget.main_line),
+         ('main_line2', '메인 2줄', thumb_spec.budget.main_line),
+         ('sub', '서브', thumb_spec.budget.sub),
+         ('badge', '배지', thumb_spec.budget.badge)] %}
+    <label class="rv-thumb-field">
+      <span class="muted small">{{ label }} <span style="opacity:.7;">· 한글 {{ budget }}자 안쪽</span></span>
+      <input type="text" class="rv-thumb-input" data-field="{{ field }}"
+             maxlength="40" autocomplete="off" value="{{ picked_copy[field] or '' }}" />
+    </label>
+    {% endfor %}
+    {% if thumb_photos %}
+    {# 배경은 후기에 **이미 올려 둔 사진**이다 — 기본값은 첫 사진. 새 업로드 경로를
+       만들지 않고 앱의 OneDrive 사진을 서명 URL(/blog-img)로 그대로 쓴다. #}
+    <label class="rv-thumb-field">
+      <span class="muted small">배경 사진 <span style="opacity:.7;">· 기본은 첫 사진</span></span>
+      <select class="rv-thumb-photo-select">
+        {% for p in thumb_photos %}
+        <option value="{{ p.index }}" data-url="{{ p.url }}"
+                {% if p.index == (thumb.photo_index or 0) %}selected{% endif %}>
+          {{ loop.index }}. {{ p.name }}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
+  </div>
+  {% if not thumb_photos %}
+  <p class="muted small" style="margin:8px 0 0;">
+    후기에 사진이 없어서 단색 배경으로 그려. 사진을 넣으면 <strong>첫 사진</strong>이
+    배경이 돼 — AI 로 그림을 지어내지는 않아.
+  </p>
+  {% endif %}
+
+  {# 미리보기 — 1080×1350 그대로 만들고 transform 으로만 줄인다(측정값은 진짜). #}
+  <div class="rv-thumb-stage">
+    <div class="rv-thumb-cover">
+      <img class="rv-thumb-photo" alt="썸네일 배경 사진" />
+      <div class="rv-thumb-gradient"></div>
+      <div class="rv-thumb-main"><span class="rv-thumb-main-l1"></span><br /><span class="rv-thumb-main-l2"></span></div>
+      <div class="rv-thumb-sub"></div>
+      <div class="rv-thumb-badge"><div class="rv-thumb-badge-label"></div></div>
+    </div>
+  </div>
+
+  <p class="rv-thumb-warn" hidden></p>
+  <p class="rv-thumb-status muted small"></p>
+
+  <div class="rv-copy-actions" style="margin-top:10px;">
+    <button type="button" class="btn primary sm rv-thumb-download">⬇ PNG 내려받기</button>
+    <form method="post" action="{{ url_for('review_thumbnail_generate', rid=review.id) }}"
+          style="margin-left:auto;"
+          onsubmit="return confirm('문구를 다시 만들까? 지금 고쳐 둔 문구는 새 후보로 바뀌어.');">
+      <button type="submit" class="btn ghost sm">↻ 문구 다시 만들기</button>
+    </form>
+  </div>
+
+  <details style="margin-top:10px;">
+    <summary class="muted small" style="cursor:pointer;">측정값 보기 (좌표·폰트·넘침)</summary>
+    <pre class="rv-thumb-check muted small"
+         style="overflow:auto;white-space:pre;margin:6px 0 0;"></pre>
+    {% if thumb.render_check %}
+    <p class="muted small" style="margin:6px 0 0;">
+      서버에 저장된 마지막 검증 — {{ '통과' if thumb.render_check.ok else '넘침/폰트 실패' }}
+      {% if thumb.render_check.checked_at %} · {{ thumb.render_check.checked_at }}{% endif %}
+    </p>
+    {% endif %}
+  </details>
+
+  <script type="application/json" id="rv-thumb-spec">{{ thumb_spec | tojson }}</script>
+  <script type="application/json" id="rv-thumb-state">{{ thumb | tojson }}</script>
+  <script src="{{ url_for('static', filename='thumbnail.js') }}" defer></script>
+
+  {% else %}
+  {% if thumb and thumb.status == 'failed' %}
+  <p class="muted small" style="margin:8px 0 0;">문구 생성이 잘 안 됐어. 다시 시도해줘 🙏</p>
+  {% else %}
+  <p class="muted small" style="margin:8px 0 0;">
+    완성된 글에서 썸네일 문구 후보 3개를 뽑아 줄게. 사진 위에 올려 바로 내려받을 수 있어.
+  </p>
+  {% endif %}
+  <form method="post" action="{{ url_for('review_thumbnail_generate', rid=review.id) }}"
+        style="margin-top:10px;">
+    <button type="submit" class="btn primary sm">✨ 썸네일 문구 만들기</button>
+  </form>
+  {% endif %}
+</div>
+
+<style>
+  .rv-thumb-card .rv-thumb-fields {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 8px; margin: 12px 0 0;
+  }
+  .rv-thumb-card .rv-thumb-field { display: flex; flex-direction: column; gap: 3px; }
+  .rv-thumb-card .rv-thumb-field input,
+  .rv-thumb-card .rv-thumb-field select {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line, #e7d9e0);
+    border-radius: 8px; font: inherit; background: #fff; box-sizing: border-box;
+  }
+  /* 미리보기 무대 — 1080×1350 을 통째로 만들고 transform 으로만 줄인다.
+     transform 은 레이아웃을 바꾸지 않아서 넘침 측정이 진짜 수치로 남는다. */
+  .rv-thumb-card .rv-thumb-stage {
+    margin: 12px 0 0; overflow: hidden; border-radius: 10px; background: #f2e9ee;
+  }
+  .rv-thumb-card .rv-thumb-warn {
+    margin: 8px 0 0; padding: 8px 10px; border-radius: 8px;
+    background: #fff3f3; color: #a4303f; font-size: 0.86rem; line-height: 1.5;
+  }
+  .rv-thumb-card .rv-thumb-download[disabled] { opacity: .5; cursor: not-allowed; }
+  .rv-thumb-card .rv-thumb-check { max-height: 260px; font-size: 11px; }
+</style>
+
 {# 네이버 붙여넣기용: '편집 가능한 미리보기 = 복사 원본'. 여기서 바로 고치고
    '복사'하면 서식·사진까지 text/html로 네이버 스마트에디터에 붙는다. #}
 <div class="review-copy-wrap">

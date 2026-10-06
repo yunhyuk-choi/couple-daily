@@ -232,6 +232,9 @@ def run_startup_migrations():
                 # Step 3 키워드 조사 메모(JSON). 없으면 NULL — 조사 없이 만든
                 # 옛 후기는 메모 카드가 안 그려질 뿐 전부 그대로 동작한다.
                 ("research_json", "TEXT"),
+                # Step 4 썸네일 상태(JSON). 없으면 NULL — 썸네일을 안 만든 후기는
+                # 카드에 "만들기" 버튼만 보인다.
+                ("thumbnail_json", "TEXT"),
             ):
                 if col in rcols:
                     continue
@@ -1062,6 +1065,10 @@ class BlogReview(db.Model):
     # (Step 3) 키워드 조사 메모 JSON — 후보·근거·선정 이유·데이터 한계. 키가 없으면
     # {"status":"skipped"}로 남고 상세 화면이 "키를 넣으면 켜진다"를 안내한다.
     research_json = db.Column(db.Text, nullable=True)
+    # (Step 4) 썸네일 상태 JSON — 카피 후보 3개·선정·사람이 줄인 최종 문구·쓸 사진·
+    # 브라우저가 보고한 렌더 검증(좌표·폰트·넘침). **픽셀은 여기 안 들어간다** —
+    # PNG는 사용자의 브라우저가 그려 바로 내려받는다(서버엔 Chromium이 없다).
+    thumbnail_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(16), default="draft", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(
@@ -1151,6 +1158,17 @@ class BlogReview(db.Model):
             return None
         try:
             v = json.loads(self.research_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def thumbnail(self):
+        """thumbnail_json을 dict로 디코드(없거나 깨졌으면 None) — 썸네일 카드용."""
+        if not self.thumbnail_json:
+            return None
+        try:
+            v = json.loads(self.thumbnail_json)
             return v if isinstance(v, dict) else None
         except (ValueError, TypeError):
             return None
