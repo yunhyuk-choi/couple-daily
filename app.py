@@ -53,6 +53,8 @@ import events
 import exifutil
 import ics
 import insights
+import keyword_research
+import naver_api
 import onedrive
 from models import (
     Answer,
@@ -1830,12 +1832,36 @@ def _attach_section_crops(result, photos_ordered):
             continue
 
 
+def _naver_credentials_for(review):
+    """이 후기의 키워드 조사에 쓸 ``((client_id, secret), 키 주인 이름)``.
+
+    작성자 키 우선 → 없으면 같은 커플 구성원 중 키가 있는 사람. 아무도 없으면
+    ``((None, None), "")``이고 조사는 꺼진다(생성은 그대로 진행). 키 **값**은
+    돌려주기만 하고 로그에 남기지 않는다.
+    """
+    owner = db.session.get(User, review.created_by) if review.created_by else None
+    if owner is not None and owner.has_naver_api_keys:
+        return owner.naver_api_credentials, (owner.display_name or "")
+    mate = (
+        User.query.filter(
+            User.couple_id == review.couple_id,
+            User.id != (owner.id if owner else -1),
+            User.naver_api_key_id.isnot(None),
+        ).first()
+        if review.couple_id
+        else None
+    )
+    if mate is not None and mate.has_naver_api_keys:
+        return mate.naver_api_credentials, (mate.display_name or "")
+    return (None, None), ""
+
+
 def generate_review(app, review_id):
     """백그라운드 워커: 한 BlogReview의 네이버 블로그 초안을 생성한다.
 
     judge_case와 같은 결 — 새 app_context(→ 새 thread-local DB 세션)를 열고
     BlogReview + 순서대로의 사진 캡션/태그를 모아 _CAPTION_SEM 안에서
-    ``ai.write_review``를 '한 번' 호출한다. 성공하면 ai_json + status='ready',
+    **키워드 조사(선택) → ``ai.write_review``** 순으로 호출한다. 성공하면 ai_json + status='ready',
     실패하면 status='failed'(단, 직전에 쓸 만한 ai_json이 있으면 그걸 유지해
     'ready'로 둔다). 커밋은 rollback 가드. 절대 raise 안 하고 finally에서 가드 해제.
     """
@@ -1865,15 +1891,34 @@ def generate_review(app, review_id):
                 # v2 '재료' 칸(선택 입력). 빈 칸은 dict에 안 들어가고 프롬프트에서도
                 # 통째로 빠진다 — 옛 후기(컬럼 NULL)는 {}라 v1과 같은 입력이 된다.
                 details = review.details
+                # 키워드 조사(Step 3)에 쓸 자격증명 — **후기를 쓴 사람의 키**를 먼저
+                # 보고, 없으면 같은 커플의 파트너 키로 폴백한다(둘이 같은 블로그
+                # 워크플로우를 돌리는 커플 스코프 앱이고, 누구 키를 썼는지는 조사
+                # 메모에 남는다). 아무도 안 넣었으면 조사는 그냥 꺼진다.
+                creds, key_owner = _naver_credentials_for(review)
 
                 # 캡션·채점·추천과 '같은' 세마포어로 claude 콜을 직렬화. claude가
                 # 터져도 실패로만 취급(스레드를 죽이지 못하게).
                 _CAPTION_SEM.acquire()
                 try:
+                    # (1) 키워드 조사 → (2) 본문 생성. 조사는 **절대 생성을 막지
+                    # 않는다** — 키가 없으면 skipped, 실패하면 failed를 메모로 남기고
+                    # 지금까지와 똑같이 쓴다.
+                    try:
+                        research = keyword_research.research(
+                            topic, location, prose, overall, details,
+                            client_id=creds[0], client_secret=creds[1],
+                            key_owner=key_owner,
+                        )
+                    except Exception:  # noqa: BLE001 — 조사는 best-effort
+                        log.exception(
+                            "keyword research raised (review=%s)", review_id
+                        )
+                        research = {"status": "failed", "reason": "exception"}
                     try:
                         result = ai.write_review(
                             topic, location, prose, overall, photos_arg,
-                            details=details,
+                            details=details, research=research,
                         )
                     except Exception:  # noqa: BLE001
                         log.exception(
@@ -1900,6 +1945,12 @@ def generate_review(app, review_id):
                 if review is None:
                     return
                 now = datetime.utcnow()
+                # 조사 메모는 생성 성패와 무관하게 남긴다 — 사람이 '왜 조사가 안
+                # 붙었는지'(키 미설정·조사 실패)를 화면에서 봐야 한다.
+                try:
+                    review.research_json = json.dumps(research, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    review.research_json = None
                 if result:
                     review.ai_json = json.dumps(result, ensure_ascii=False)
                     review.status = "ready"
@@ -5270,6 +5321,44 @@ def _register_routes(app: Flask):
                 _ensure_export_key(u)
                 flash("네이버 업로더 키를 재발급했어. 유저스크립트에 다시 붙여넣어줘.", "ok")
                 return redirect(url_for("settings"))
+            # --- 네이버 API HUB 키(키워드 조사용) — 사용자별 -------------------
+            # 값은 **받기만 한다.** 어떤 경로로도 다시 렌더하지 않고, flash·로그에도
+            # 넣지 않는다(화면엔 설정됨/미설정만 보인다).
+            if request.form.get("naver_keys_clear"):
+                u.naver_api_key_id = None
+                u.naver_api_key = None
+                db.session.commit()
+                flash("네이버 API 키를 지웠어. 키워드 조사는 꺼져.", "ok")
+                return redirect(url_for("settings"))
+            if request.form.get("naver_keys_test"):
+                if not u.has_naver_api_keys:
+                    flash("먼저 키를 저장해줘.", "error")
+                    return redirect(url_for("settings"))
+                cid, secret = u.naver_api_credentials
+                ok, msg = naver_api.verify_credentials(cid, secret)
+                flash(msg, "ok" if ok else "error")
+                return redirect(url_for("settings"))
+            if request.form.get("naver_keys_save"):
+                key_id = (request.form.get("naver_api_key_id") or "").strip()[:200]
+                secret = (request.form.get("naver_api_key") or "").strip()[:400]
+                # 둘 중 하나만 비면 '그 칸은 그대로 두겠다'는 뜻으로 읽는다 — 폼이
+                # 기존 값을 다시 안 그리므로, 하나만 바꾸려는 사람이 나머지를
+                # 지우는 사고를 막는다.
+                if key_id:
+                    u.naver_api_key_id = key_id
+                if secret:
+                    u.naver_api_key = secret
+                if not key_id and not secret:
+                    flash("Client ID와 Secret을 입력해줘.", "error")
+                    return redirect(url_for("settings"))
+                db.session.commit()
+                if u.has_naver_api_keys:
+                    flash("네이버 API 키를 저장했어. '연결 확인'으로 점검해봐.", "ok")
+                else:
+                    flash("한 칸이 아직 비어 있어 — 키워드 조사는 두 값이 다 있어야 켜져.",
+                          "error")
+                return redirect(url_for("settings"))
+
             new_name = (request.form.get("app_name") or "").strip()
             new_display = (request.form.get("display_name") or "").strip()
             if new_name:
@@ -5282,7 +5371,11 @@ def _register_routes(app: Flask):
         # 네이버 업로더(유저스크립트)용 개인 키 — 최초 표시 시 생성. 템플릿은 me.export_key.
         _ensure_export_key(u)
         return render_template(
-            "settings.html", current_app_name=Setting.get("app_name", DEFAULT_APP_NAME)
+            "settings.html",
+            current_app_name=Setting.get("app_name", DEFAULT_APP_NAME),
+            # 값이 아니라 **불리언만** 넘긴다 — 템플릿이 키를 다시 그릴 방법 자체를
+            # 안 갖게 한다.
+            naver_keys_set=u.has_naver_api_keys,
         )
 
     # ---- in-app notifications ----
@@ -5911,6 +6004,10 @@ def _register_routes(app: Flask):
             copy_html=copy_html,
             crop_sections=crop_sections,
             doc_data=doc_data,
+            # 조사 메모 카드 재료. research는 dict(없으면 None)이고, 키 보유 여부는
+            # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
+            research=review.research,
+            naver_keys_set=u.has_naver_api_keys,
         )
 
     # ---- 네이버 자동 export(v2) ----

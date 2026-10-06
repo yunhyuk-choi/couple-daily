@@ -1177,12 +1177,210 @@ REVIEW_DETAIL_FIELDS = (
 _RESEARCHED_NOTE = " ← 이건 직접 겪은 게 아니라 검색으로 확인한 공개 정보다"
 
 
-def write_review(topic, location, prose, overall_score, photos, details=None):
+def build_review_input_block(topic, location, prose, overall_score, details=None):
+    """후기 '재료' 블록 문자열 — 값이 있는 칸만 넣는다(빈 칸은 '모른다'는 뜻).
+
+    ``write_review``와 키워드 조사(``suggest_keyword_candidates`` /
+    ``select_keywords``)가 **같은 재료**를 보도록 한 곳에서 만든다. 순수 함수.
+    """
+    topic = (topic or "").strip()
+    location = (location or "").strip()
+    prose = (prose or "").strip()
+    details = details if isinstance(details, dict) else {}
+    lines = [f"주제 / 장소: {topic}"]
+    if location:
+        lines.append(f"위치: {location}")
+    for key, label in REVIEW_DETAIL_FIELDS:
+        val = (details.get(key) or "").strip()
+        if not val:
+            continue
+        note = _RESEARCHED_NOTE if key == "researched" else ""
+        lines.append(f"{label}{note}: {val}")
+    lines.append(
+        f"사용자가 매긴 총점: {_clamp_score10(overall_score, 0)}/10 "
+        "(본문에 숫자로 쓰지는 마라)"
+    )
+    lines.append(
+        "자유 서술(사용자가 직접 쓴 말 — 이 말투와 표현을 최대한 살려라):\n"
+        + (prose or "(없음)")
+    )
+    return "\n".join(lines)
+
+
+# --- 키워드 조사(노선 2 Step 3) — claude를 두 번 쓴다 -----------------------
+# 1) 후보 생성: 후기 재료만 보고 '후기로 직접 답할 수 있는' 롱테일 후보 3~5개.
+# 2) 선정:     네이버 블로그 검색·트렌드로 모은 증거를 보고 메인 1 + 보조 2~4.
+# 그 사이의 네트워크 조사는 ``keyword_research``가 ``naver_api``로 한다(여긴 AI만).
+# 어떤 실패에도 None을 돌려준다 — 조사는 **있으면 좋은 것**이지 생성의 전제가 아니다.
+def suggest_keyword_candidates(input_block):
+    """재료 블록 → 롱테일 후보 리스트. 실패하면 None(조사를 건너뛴다).
+
+    반환: ``[{"keyword","variants":[..],"question","answerable"}, ...]`` 최대 5개.
+    첫 후보는 프롬프트상 시작 검색어(`지역+상호`)다 — 비교 기준선으로 남긴다.
+    """
+    template = load_prompt("keyword-candidates")
+    if not template or not (input_block or "").strip():
+        return None
+    prompt = template.replace("{{INPUT_BLOCK}}", input_block)
+    try:
+        data = _extract_json(_run_claude(prompt))
+    except Exception as e:  # noqa: BLE001 — 조사는 best-effort
+        print(f"[ai] keyword candidates failed: {e}", file=sys.stderr)
+        return None
+    return normalize_candidates(data)
+
+
+def normalize_candidates(data):
+    """후보 응답을 정규화(순수/오프라인). 못 쓰면 None."""
+    if not isinstance(data, dict):
+        return None
+    out = []
+    seen = set()
+    for raw in data.get("candidates") or []:
+        if isinstance(raw, str):
+            raw = {"keyword": raw}
+        if not isinstance(raw, dict):
+            continue
+        kw = (raw.get("keyword") or "").strip()
+        if not kw or kw in seen or len(kw) > 60:
+            continue
+        seen.add(kw)
+        variants = []
+        for v in raw.get("variants") or []:
+            v = str(v).strip()
+            if v and v not in variants and len(v) <= 60:
+                variants.append(v)
+            if len(variants) >= 3:
+                break
+        if kw not in variants:
+            variants.insert(0, kw)
+        out.append(
+            {
+                "keyword": kw,
+                "variants": variants[:3],
+                "question": (raw.get("question") or "").strip()[:300],
+                "answerable": (raw.get("answerable") or "").strip()[:300],
+            }
+        )
+        if len(out) >= 5:
+            break
+    return out or None
+
+
+def select_keywords(input_block, evidence_block, candidates):
+    """조사 증거 → 메인 1 + 보조 2~4 + 선정·제외 이유. 실패하면 None.
+
+    ``candidates``는 1단계 산출(메인 이름 검증용). 모델이 조사하지 않은 말을 메인으로
+    내면 첫 후보로 되돌린다 — 조사 없이 고르는 건 규율 위반이다.
+    """
+    template = load_prompt("keyword-select")
+    if not template or not candidates:
+        return None
+    prompt = (
+        template
+        .replace("{{INPUT_BLOCK}}", input_block or "")
+        .replace("{{EVIDENCE_BLOCK}}", evidence_block or "(조사 결과 없음)")
+    )
+    try:
+        data = _extract_json(_run_claude(prompt))
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] keyword selection failed: {e}", file=sys.stderr)
+        return None
+    return normalize_selection(data, candidates)
+
+
+def normalize_selection(data, candidates):
+    """선정 응답을 화면·프롬프트가 믿을 수 있는 모양으로 정규화(순수/오프라인).
+
+    규칙:
+      * ``main``은 반드시 **조사한 후보 중 하나**. 아니면 첫 후보로 되돌린다.
+      * ``supporting``은 메인을 뺀 것 중 최대 4개(없으면 빈 리스트).
+      * 설명은 strip + 길이 상한. **지어낸 경쟁 점수 같은 숫자 필드는 받지 않는다**
+        (받을 자리를 안 만들면 모델이 만들어 낼 수도 없다).
+    """
+    if not isinstance(data, dict) or not candidates:
+        return None
+    names = [c["keyword"] for c in candidates]
+
+    def _s(v, limit=600):
+        return (v.strip() if isinstance(v, str) else "")[:limit]
+
+    main = _s(data.get("main"), 60)
+    if main not in names:
+        main = names[0]
+    supporting = []
+    for v in data.get("supporting") or []:
+        v = _s(v, 60)
+        if v and v != main and v not in supporting:
+            supporting.append(v)
+        if len(supporting) >= 4:
+            break
+    excluded = []
+    for raw in data.get("excluded") or []:
+        if isinstance(raw, str):
+            raw = {"keyword": raw}
+        if not isinstance(raw, dict):
+            continue
+        kw = _s(raw.get("keyword"), 60)
+        if not kw or kw == main:
+            continue
+        excluded.append({"keyword": kw, "reason": _s(raw.get("reason"), 300)})
+        if len(excluded) >= 5:
+            break
+    return {
+        "main": main,
+        "main_reason": _s(data.get("main_reason")),
+        "supporting": supporting,
+        "supporting_reason": _s(data.get("supporting_reason")),
+        "excluded": excluded,
+        "competition": _s(data.get("competition")),
+        "limits": _s(data.get("limits")),
+        "angle": _s(data.get("angle")),
+    }
+
+
+# 키워드 조사가 없을 때 blog-review 프롬프트에 들어가는 블록. '조사를 했는데 결과가
+# 없다'가 아니라 **'조사를 안 했다'**로 읽히게 쓴다 — 모델이 없는 조사를 지어내
+# 인용하지 않도록.
+NO_KEYWORD_BLOCK = (
+    "(키워드 조사를 하지 않았다 — 네이버 API HUB 키가 없거나 조사에 실패했다.)\n"
+    "검색어 조사 결과가 없으니 **검색량·경쟁·노출에 대한 언급을 아예 하지 마라.**\n"
+    "재료에 있는 것만 가지고, 위 [제목] 규칙대로 지역·업종·상호가 보이는 제목과\n"
+    "자연스러운 방문 흐름의 본문을 써라."
+)
+
+
+def format_keyword_block(research):
+    """``keyword_research`` 산출 dict → blog-review 프롬프트에 넣을 텍스트 블록.
+
+    조사가 없거나 선정에 실패했으면 ``NO_KEYWORD_BLOCK``. 순수 함수라 테스트가 쉽다.
+    """
+    if not isinstance(research, dict):
+        return NO_KEYWORD_BLOCK
+    sel = research.get("selection")
+    if not isinstance(sel, dict) or not sel.get("main"):
+        return NO_KEYWORD_BLOCK
+    lines = [f"메인 키워드: {sel['main']}"]
+    if sel.get("supporting"):
+        lines.append("보조 키워드: " + ", ".join(sel["supporting"]))
+    if sel.get("angle"):
+        lines.append(f"이 키워드로 들어온 독자가 읽어야 할 것: {sel['angle']}")
+    if sel.get("main_reason"):
+        lines.append(f"선정 이유: {sel['main_reason']}")
+    if sel.get("limits"):
+        lines.append(f"조사의 한계: {sel['limits']}")
+    return "\n".join(lines)
+
+
+def write_review(topic, location, prose, overall_score, photos, details=None,
+                 research=None):
     """후기 재료를 네이버 블로그 글(구조화 JSON)로 만든다 — 프롬프트는 파일 분리.
 
     ``photos``: ``{"index": i, "caption": <그 사진의 AI 캡션>, "tags": [..]}``의
     순서 리스트(호출부가 순서대로 넘긴다). ``details``: 선택 입력 칸 dict
     (``REVIEW_DETAIL_FIELDS``의 키들 — 없거나 빈 값은 프롬프트에서 통째로 빠진다).
+    ``research``: ``keyword_research.research()`` 산출(선택). **없어도 그대로 생성한다**
+    — 키워드 조사는 글의 방향을 잡아 주는 보조일 뿐 생성의 전제가 아니다.
 
     claude를 '한 번'만 호출하고 strict JSON을 파싱해 ``_normalize_review``로 정규화한
     dict를 돌려주거나, 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함). 느린
@@ -1206,22 +1404,11 @@ def write_review(topic, location, prose, overall_score, photos, details=None):
         print("[ai] blog-review prompt unavailable — skip", file=sys.stderr)
         return None
 
-    # --- 재료 블록: 값이 있는 칸만 넣는다(빈 칸은 '모른다'는 뜻이라 아예 안 보인다) ---
-    input_lines = [f"주제 / 장소: {topic}"]
-    if location:
-        input_lines.append(f"위치: {location}")
-    for key, label in REVIEW_DETAIL_FIELDS:
-        val = (details.get(key) or "").strip() if isinstance(details, dict) else ""
-        if not val:
-            continue
-        note = _RESEARCHED_NOTE if key == "researched" else ""
-        input_lines.append(f"{label}{note}: {val}")
-    input_lines.append(f"사용자가 매긴 총점: {overall_score}/10 (본문에 숫자로 쓰지는 마라)")
-    input_lines.append(
-        "자유 서술(사용자가 직접 쓴 말 — 이 말투와 표현을 최대한 살려라):\n"
-        + (prose or "(없음)")
+    # --- 재료 블록: 값이 있는 칸만 넣는다(빈 칸은 '모른다'는 뜻이라 아예 안 보인다).
+    #     키워드 조사와 **같은 재료**를 보도록 빌더를 공유한다. ---
+    input_block = build_review_input_block(
+        topic, location, prose, overall_score, details
     )
-    input_block = "\n".join(input_lines)
 
     # --- 사진 재료 — 각 사진의 index(0-based)·캡션·태그를 그대로 준다. 캡션이 없으면
     #     '(설명 없음)'으로 표시하고, 모델이 지어내지 않도록 규칙에서 못박는다. ---
@@ -1253,6 +1440,9 @@ def write_review(topic, location, prose, overall_score, photos, details=None):
         .replace("{{PHOTO_BLOCK}}", photo_block)
         .replace("{{PHOTO_RULE}}", photo_rule)
         .replace("{{PHOTO_COUNT}}", str(len(photos)))
+        # 키워드 조사 결과(없으면 '조사 안 했다' 블록 — 모델이 없는 조사를 인용하지
+        # 않게 한다). 키가 없어도 생성은 그대로 돈다.
+        .replace("{{KEYWORD_BLOCK}}", format_keyword_block(research))
     )
 
     try:

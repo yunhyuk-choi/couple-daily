@@ -72,6 +72,53 @@
   </p>
 </div>
 
+{# 네이버 API HUB 키 — 키워드 조사(블로그 검색·검색어 트렌드)용. **사용자별**이라
+   둘이 각자 넣는다. 화면에는 '설정됨/미설정'만 보이고 값은 절대 다시 안 그린다. #}
+<div class="card">
+  <h2 class="small">네이버 키워드 조사 키 (API HUB)</h2>
+  <p class="muted small">
+    키를 넣으면 후기를 만들 때 <strong>키워드 조사</strong>가 켜져 — 롱테일 후보를
+    뽑아 네이버 블로그 검색·검색어 트렌드로 확인하고, 메인/보조 키워드와 그 이유를
+    후기 상세에 남겨. 없어도 글은 지금처럼 그대로 만들어져.
+  </p>
+  <p class="muted small">
+    발급: <code>console.ncloud.com</code> → NAVER API HUB → Application
+    (검색어트렌드 · 블로그 선택). 키는 사람마다 따로 저장돼.
+  </p>
+  <p class="small" style="margin:6px 0 0;">
+    상태 —
+    {% if naver_keys_set %}<strong>설정됨 ✓</strong>{% else %}<strong>미설정</strong>{% endif %}
+  </p>
+  <form method="post" class="stack" autocomplete="off">
+    <input type="hidden" name="naver_keys_save" value="1" />
+    <label>Client ID (X-NCP-APIGW-API-KEY-ID)
+      <input type="password" name="naver_api_key_id" maxlength="200"
+             autocomplete="off" spellcheck="false"
+             placeholder="{% if naver_keys_set %}설정됨 — 바꿀 때만 새로 입력{% else %}입력{% endif %}" />
+    </label>
+    <label>Client Secret (X-NCP-APIGW-API-KEY)
+      <input type="password" name="naver_api_key" maxlength="400"
+             autocomplete="new-password" spellcheck="false"
+             placeholder="{% if naver_keys_set %}설정됨 — 바꿀 때만 새로 입력{% else %}입력{% endif %}" />
+    </label>
+    <button class="btn primary" type="submit">키 저장</button>
+  </form>
+  <p class="muted small">입력한 값은 서버에만 저장되고 화면에 다시 보이지 않아.</p>
+  {% if naver_keys_set %}
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+    <form method="post">
+      <input type="hidden" name="naver_keys_test" value="1" />
+      <button class="btn ghost" type="submit">연결 확인</button>
+    </form>
+    <form method="post"
+          onsubmit="return confirm('키를 지우면 키워드 조사가 꺼져. 계속할까?');">
+      <input type="hidden" name="naver_keys_clear" value="1" />
+      <button class="btn ghost" type="submit">키 지우기</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+
 {% if me and me.export_key %}
 <div class="card">
   <h2 class="small">네이버 업로더 키</h2>

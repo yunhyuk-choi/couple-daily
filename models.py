@@ -68,6 +68,23 @@ def run_startup_migrations():
             except Exception:  # noqa: BLE001
                 log.exception("startup migration: failed adding users.export_key")
 
+        # 1d) 네이버 API HUB 자격증명(키워드 조사용) — **사용자별**. 두 사람의 키가
+        #     다를 수 있어 커플이 아니라 users에 둔다. 둘 다 nullable이라 기존 행은
+        #     NULL(미설정)로 남고, 조사만 꺼진 채 앱은 지금처럼 그대로 돈다.
+        #     Postgres·SQLite 모두 안전하고 반복 실행에 멱등하다.
+        for col, ddl in (
+            ("naver_api_key_id", "VARCHAR(200)"),
+            ("naver_api_key", "VARCHAR(400)"),
+        ):
+            if col in cols:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
+                log.info("startup migration: added users.%s", col)
+            except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                log.exception("startup migration: failed adding users.%s", col)
+
         # 2) drop NOT NULL on email / password_hash so Kakao users can exist.
         #    SQLite cannot ALTER a column's nullability in place; older SQLite
         #    DBs keep NOT NULL, but Kakao rows simply never touch those columns
@@ -212,6 +229,9 @@ def run_startup_migrations():
                 ("highlight", "VARCHAR(300)"),
                 ("downside", "VARCHAR(300)"),
                 ("researched", "TEXT"),
+                # Step 3 키워드 조사 메모(JSON). 없으면 NULL — 조사 없이 만든
+                # 옛 후기는 메모 카드가 안 그려질 뿐 전부 그대로 동작한다.
+                ("research_json", "TEXT"),
             ):
                 if col in rcols:
                     continue
@@ -270,9 +290,38 @@ class User(db.Model):
     # 네이버 업로더 유저스크립트(공개 pending API) 인증용 개인 토큰. 없으면 최초
     # 접근 시 생성한다. URL-safe(~24자). 추가는 run_startup_migrations가 ALTER로 반영.
     export_key = db.Column(db.String(32), unique=True, nullable=True, index=True)
+    # --- 네이버 API HUB 자격증명 (키워드 조사용, 선택) ------------------------
+    # **사용자별**로 둔다 — 두 사람이 각자 발급받은 키를 쓸 수 있어야 한다.
+    #
+    # 저장 위치·방식의 근거:
+    #   * 브라우저(localStorage)에 두지 않는다 — 평문으로 남고 XSS에 그대로 노출된다.
+    #     이 앱은 로그인 세션이 있으니 서버에 둔다.
+    #   * 컬럼 값 자체는 이 레포의 **기존 비밀 취급 방식과 같다** — OneDrive refresh
+    #     token(`settings.onedrive_refresh_token`)도 DB 평문이고, 앱에 암호화 계층이
+    #     없다. 새 비밀 하나만 암호화하면 더 센 비밀이 평문인 채로 남아 실효는 없이
+    #     키 관리(SECRET_KEY 교체 시 복호 불가) 위험만 는다. 암호화를 한다면 모든
+    #     비밀에 한 번에 적용하는 별도 작업이어야 한다.
+    #   * 실질적인 노출 차단은 **값을 다시 내보내지 않는 것**으로 한다: 화면에는
+    #     '설정됨/미설정'만 그리고, 폼은 쓰기 전용이며, 로그·에러 메시지·조사 메모
+    #     어디에도 값이 들어가지 않는다(`naver_api.NaverApiError` 참고).
+    naver_api_key_id = db.Column(db.String(200), nullable=True)
+    naver_api_key = db.Column(db.String(400), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     answers = db.relationship("Answer", backref="user", lazy="dynamic")
+
+    @property
+    def has_naver_api_keys(self):
+        """키워드 조사를 쓸 수 있는가(값은 돌려주지 않는다 — 화면용 불리언)."""
+        return bool((self.naver_api_key_id or "").strip()
+                    and (self.naver_api_key or "").strip())
+
+    @property
+    def naver_api_credentials(self):
+        """``(client_id, client_secret)`` 또는 ``(None, None)``. 서버 내부 전용."""
+        if not self.has_naver_api_keys:
+            return (None, None)
+        return (self.naver_api_key_id.strip(), self.naver_api_key.strip())
 
     @property
     def partner(self):
@@ -1010,6 +1059,9 @@ class BlogReview(db.Model):
     ai_json = db.Column(db.Text, nullable=True)
     # (P2) 사용자가 편집한 네이버 복사텍스트.
     edited_text = db.Column(db.Text, nullable=True)
+    # (Step 3) 키워드 조사 메모 JSON — 후보·근거·선정 이유·데이터 한계. 키가 없으면
+    # {"status":"skipped"}로 남고 상세 화면이 "키를 넣으면 켜진다"를 안내한다.
+    research_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(16), default="draft", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(
@@ -1088,6 +1140,17 @@ class BlogReview(db.Model):
             return None
         try:
             v = json.loads(self.ai_json)
+            return v if isinstance(v, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def research(self):
+        """research_json을 dict로 디코드(없거나 깨졌으면 None) — 조사 메모 카드용."""
+        if not self.research_json:
+            return None
+        try:
+            v = json.loads(self.research_json)
             return v if isinstance(v, dict) else None
         except (ValueError, TypeError):
             return None

@@ -25,6 +25,9 @@ AI가 자동 생성해 주는 기능이다.
 [작성 폼]  주제/장소 · 위치 · 재료 칸 8개(선택) · 자유 서술 · 별점(0~10 드래그) · 사진 선택+순서
    │  저장 (P1: status='draft')
    ▼
+[키워드 조사] (Step 3, 선택)  롱테일 후보 → 네이버 블로그 검색·트렌드 → 메인/보조 선정
+   │                   키가 없으면 통째로 건너뛴다(죽지 않는다) → research_json
+   ▼
 [백그라운드 AI]  (P2)  claude로 포스트 생성 → ai_json 저장, status 'pending'→'ready'/'failed'
    │                   프롬프트는 prompts/blog-review.md (v2 — 코드에 안 박는다)
    ▼
@@ -56,11 +59,13 @@ AI가 자동 생성해 주는 기능이다.
 | `photo_ids` | Text, nullable | JSON list[int] — 선택한 Photo id, **순서 유지** |
 | `ai_json` | Text, nullable | P2 결과(구조화 JSON) |
 | `edited_text` | Text, nullable | P2 사용자가 편집한 복사텍스트 |
+| `research_json` | Text, nullable | (Step 3) 키워드 조사 메모 JSON — 후보·근거·선정 이유·한계 |
 | `status` | String(16), not-null, default `'draft'` | 'draft'=생성됨·AI 미실행. P2에서 'pending'/'ready'/'failed' |
 | `created_at` / `updated_at` | DateTime | |
 
 - `@property photos_ordered` → `photo_ids` 순서대로 이 커플의 Photo 행을 돌려준다 (JSON 디코드 → 조회 → 순서 유지 → 없는 id 스킵).
 - `@property details` → 채워진 v2 재료 칸만 `{필드: 값}`으로. `ai.write_review(details=...)` 입력.
+- `@property research` → `research_json` 디코드(없거나 깨졌으면 None). 조사 메모 카드 입력.
 - `BlogReview.DETAIL_FIELDS` = 재료 칸 이름 튜플(단일 원천). **순서가 곧 글의 흐름 순서**다.
 - 테이블 자체는 `db.create_all()`가 만들지만, **v2 컬럼 8개는 운영 DB에 이미 있는 테이블에
   붙여야 하므로** `models.run_startup_migrations()` §7이 없는 컬럼만 `ALTER TABLE ... ADD
@@ -171,7 +176,9 @@ v2에서 바뀐 것:
 ## 5.2 백그라운드 워커 · 라우트 (P2)
 
 - `generate_review(app, review_id)` — 데몬 스레드, review_id 가드로 중복 차단, 자체
-  `app_context`, `_CAPTION_SEM`으로 `ai.write_review` 직렬화(512MB: 동시에 claude 하나).
+  `app_context`, `_CAPTION_SEM` 안에서 **(1) 키워드 조사(선택) → (2) `ai.write_review`**를
+  직렬화해 돈다(512MB: 동시에 claude 하나). 조사 결과는 성패와 무관하게 `research_json`에
+  남는다 — 사람이 '왜 조사가 안 붙었는지'를 화면에서 봐야 하기 때문이다.
   성공 시 `ai_json`+`status='ready'`, 실패 시 `'failed'`(단 직전 성공 초안 있으면 유지).
   커밋 rollback 가드, 절대 raise 안 함. **claude는 오직 이 워커에서만.**
 - 라우트: `review_new` POST → `status='pending'` + 스폰 → 상세로. `review_edit` POST →
@@ -294,3 +301,88 @@ v2에서 바뀐 것:
   **스스로 웹 검색을 하지 않는다**(`_run_claude(allow_web=False)`).
 - **Step 4 — 썸네일 생성.** Render 무료티어(512MB)에 Playwright/Chromium을 올리는 문제가
   선행 판단이다.
+
+
+---
+
+## 11. Step 3 — NAVER API HUB 키워드 조사 (노선 2 Step 3)
+
+### 11.1 파이프라인에서의 자리
+
+```
+리뷰 저장 → [키워드 조사] → 본문 생성 → 제목 후보
+              ↑ 신규 (선택 — 키가 없으면 통째로 건너뛴다)
+```
+
+`generate_review` 워커가 `_CAPTION_SEM` 안에서 **조사 → 생성** 순으로 돈다. 조사는 claude를
+두 번 쓰고(후보 생성 / 증거 보고 선정), 그 사이에 네이버를 친다.
+
+| 단계 | 무엇 | 어디 |
+|---|---|---|
+| 1 | 후기가 **직접 답할 수 있는** 롱테일 후보 3~5개 | `ai.suggest_keyword_candidates` + `prompts/keyword-candidates.md` |
+| 2 | 후보별 블로그 검색(연관순·최신순) + 트렌드 **52주·8주** | `keyword_research.collect_evidence` → `naver_api` |
+| 3 | 메인 1 + 보조 2~4 선정 · 선정/제외 이유 · 한계 기록 | `ai.select_keywords` + `prompts/keyword-select.md` |
+| 4 | 조사 결과를 본문 프롬프트에 주입 | `ai.format_keyword_block` → `{{KEYWORD_BLOCK}}` |
+
+조사 결과는 `blog_reviews.research_json`에 저장되고 상세 화면이 **조사 메모 카드**로 보여준다.
+
+### 11.2 호출 형태 (gf-blog `{맛집명}/research/collect.py` 실물에서 확인)
+
+```
+base    https://naverapihub.apigw.ntruss.com
+headers X-NCP-APIGW-API-KEY-ID / X-NCP-APIGW-API-KEY
+GET  /search/v1/blog           query, display=20, sort=sim|date, format=json
+POST /search-trend/v1/search   {startDate,endDate,timeUnit,keywordGroups[<=5][keywords<=20]}
+                               -> results[].data[].ratio (구간별 상대값, 최대 100)
+```
+
+### 11.3 지표 오독 금지 (코드 주석·프롬프트·화면 **세 곳 모두**에 박는다)
+
+- **검색 결과 수(`total`) != 검색량.** 그 말로 쓰인 글 편수일 뿐이다.
+- **트렌드 상대지수(`ratio`) != 절대 검색 횟수.** 같이 조회한 그룹 안에서 최댓값을 100으로
+  둔 상대값이라 그룹이 바뀌면 숫자도 바뀐다.
+- **롱테일 트렌드가 빈 배열 = "수요 없음"이 아니라 "정량 확인 실패".** `parse_trend`가
+  0이 아니라 `None`을 돌려주는 이유다(0으로 떨어뜨리면 그 자체가 오독이 된다).
+- "긴 검색어라 상위 노출이 쉽다"는 주장 금지 — 근거가 없다.
+- 넓은 검색어의 상대 관심도가 높다는 이유만으로 `지역+상호`를 메인으로 되돌리지 않는다.
+- 선정 스키마에 **숫자 경쟁 점수 필드가 없다** — 받을 자리를 안 만들어 지어낼 수 없게 한다.
+- 제목에 **롱테일 전체를 그대로 넣도록 강제하지 않는다**(gf-blog [검색어와 글의 방향] 7번).
+  메인 키워드는 *정보 방향*이고, 제목 규칙은 §5의 것이 그대로 이긴다.
+
+### 11.4 자격증명 — 사용자별 · 서버 저장 · 쓰기 전용 UI
+
+- 컬럼: `users.naver_api_key_id` / `users.naver_api_key` (둘 다 nullable,
+  `run_startup_migrations()` §1d가 ADD COLUMN). **두 사람의 키가 다를 수 있어** 커플이
+  아니라 사용자에 붙인다.
+- **localStorage에 두지 않는다** — 평문으로 남고 XSS에 그대로 노출된다. 이 앱은 로그인
+  세션이 있으니 서버에 둔다.
+- **컬럼 암호화는 하지 않는다.** 근거: 이 레포의 기존 비밀 취급 방식과 같게 맞춘 것이다
+  (OneDrive refresh token도 `settings` 테이블 DB 평문이고 앱에 암호화 계층이 없다).
+  새로 들어온 더 약한 비밀 하나만 암호화하면 **더 센 비밀이 평문인 채 남아 실효는 없고**,
+  `SECRET_KEY` 교체 시 복호 불가라는 운영 위험만 는다. 암호화를 한다면 *모든 비밀에 한 번에*
+  적용하는 별도 작업이어야 한다(그때 바꿀 자리는 이 두 컬럼 + `onedrive._SETTING_KEY`).
+- 실질적인 노출 차단은 **값을 다시 내보내지 않는 것**으로 한다:
+  - 설정 화면은 `설정됨 / 미설정`만 그린다. 라우트가 템플릿에 넘기는 건 **불리언뿐**이다.
+  - 입력은 `type="password"` + `autocomplete=off`. 한 칸만 채우면 **그 칸만** 갱신한다.
+  - `naver_api.NaverApiError`는 상태코드와 네이버가 준 짧은 메시지만 담는다 — 요청 헤더를
+    실어 나르지 않아 스택트레이스에 키가 찍히지 않는다.
+  - 조사 메모(`research_json`)·프롬프트·flash 메시지 어디에도 값이 들어가지 않는다
+    (회귀 테스트가 이걸 문자열 부재로 검증한다).
+- 어느 키를 쓰나: **작성자 키 우선 → 없으면 같은 커플의 파트너 키**. 누구 키로 조사했는지는
+  메모에 이름으로 남는다(`key_owner`).
+- `연결 확인` 버튼 = `display=1` 블로그 검색 1회(쿼터를 거의 안 쓴다).
+
+### 11.5 키가 없을 때 — **죽지 않는다**
+
+`keyword_research.research()`가 `{"status": "skipped", "reason": "no_credentials"}`를 돌려주고
+**claude도 부르지 않는다.** 본문 생성은 지금까지와 똑같이 돌고, 프롬프트에는
+`ai.NO_KEYWORD_BLOCK`("조사를 하지 않았다 — 검색량·경쟁·노출 언급 금지")이 들어간다.
+상세 화면에는 "설정에서 키를 넣으면 조사가 켜진다" 안내 카드가 뜬다.
+조사가 실패했을 때(`status: "failed"`)도 같다 — 생성은 진행되고 화면이 실패를 알린다.
+
+### 11.6 테스트
+
+`tests/test_keyword_research.py` — **네트워크를 타지 않는다.** 실제 응답은
+`tests/fixtures/naver_blog_search.json` · `naver_trend_52w.json` · `naver_trend_8w.json`에
+저장했고(픽스처에 키가 없다는 것도 테스트한다), 파싱·선정·프롬프트·키 취급·화면을 검증한다.
+롱테일 트렌드가 빈 배열인 실제 케이스가 픽스처에 들어 있다.
