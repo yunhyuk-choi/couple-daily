@@ -2677,10 +2677,13 @@ def review_progress_view(app_obj, review, resumed=False):
     except Exception:  # noqa: BLE001
         n_photos = 0
     calls, worst_min = _review_eta(n_photos)
+    how_many = (
+        f"사진 {n_photos}장이면 claude 를 {calls}번 불러"
+        if n_photos else f"사진이 없으니 claude 를 {calls}번 불러"
+    )
     base_hint = (
-        f"사진 {n_photos}장이면 claude 를 {calls}번 불러 — 서버가 느려서 "
-        f"보통 3분쯤, 느릴 땐 {worst_min}분까지도 정상이야(추정이야). "
-        f"{limit_min}분을 넘기면 중단된 걸로 보고 알려줄게."
+        f"{how_many} — 서버가 느려서 보통 3분쯤, 느릴 땐 {worst_min}분까지도 "
+        f"정상이야(추정이야). {limit_min}분을 넘기면 중단된 걸로 보고 알려줄게."
     )
     out["hint"] = base_hint
 
