@@ -18,10 +18,14 @@
   4. 영상 프록시는 응답을 버퍼링하지 않는다(게으른 제너레이터 + 반드시 close).
 """
 import io
+import os
+import tempfile
+import time
 
 import pytest
 
 import app as app_module
+import bytecache
 import onedrive
 from models import Video, db
 
@@ -43,13 +47,15 @@ def photo_bytes():
 
 
 @pytest.fixture(autouse=True)
-def _clean_caches():
-    app_module._blog_proc_cache.clear()
-    onedrive._bytes_cache.clear()
+def _clean_caches(tmp_path, monkeypatch):
+    # 바이트 캐시 둘(가공완료·OneDrive 원본)은 **디스크**에 산다 — 테스트마다 빈
+    # 임시 디렉토리로 격리한다(레포 워킹트리에는 어떤 경우에도 쓰지 않는다).
+    monkeypatch.setattr(app_module._blog_proc_cache, "dir", str(tmp_path / "proc"))
+    monkeypatch.setattr(onedrive._bytes_cache, "dir", str(tmp_path / "orig"))
+    onedrive._bytes_ctype.clear()
     onedrive._thumb_cache.clear()
     yield
-    app_module._blog_proc_cache.clear()
-    onedrive._bytes_cache.clear()
+    onedrive._bytes_ctype.clear()
     onedrive._thumb_cache.clear()
 
 
@@ -57,60 +63,102 @@ def _held(cache, idx=0):
     return sum(len(v[idx]) for v in cache.values())
 
 
+def _disk_held(cache=None):
+    return (cache or app_module._blog_proc_cache).stats()[1]
+
+
+def _disk_entries(cache=None):
+    return (cache or app_module._blog_proc_cache).stats()[0]
+
+
 # --------------------------------------------------------------------------- #
-# 1. 가공완료 캐시 — 개수가 아니라 바이트로 묶인다
+# 1. 가공완료 캐시 — RAM 이 아니라 디스크에 산다 (용량은 오히려 늘었다)
 # --------------------------------------------------------------------------- #
-def test_proc_cache_is_bounded_by_bytes_not_entries():
-    """옛 상한(200개)이었다면 3.3MB 짜리 hq 엔트리 60개 = 196MB 가 상주했다."""
-    big = b"x" * (3 * 1024 * 1024)
-    for i in range(60):
-        app_module._blog_proc_cache_put((i, "", "hq"), big)
-    held = _held(app_module._blog_proc_cache)
-    assert held <= app_module._BLOG_PROC_CACHE_BUDGET, (
-        f"가공완료 캐시가 예산을 넘었다: {held} > "
-        f"{app_module._BLOG_PROC_CACHE_BUDGET}"
+def test_proc_cache_keeps_nothing_in_memory():
+    """가공 바이트가 프로세스 메모리에 남으면 안 된다 — 656MB 상주의 원인이었다."""
+    assert isinstance(app_module._blog_proc_cache, bytecache.DiskByteCache), (
+        "가공완료 바이트가 다시 RAM(dict)으로 돌아갔다"
     )
-    assert len(app_module._blog_proc_cache) < 60  # 축출이 실제로 일어났다
+    data = b"z" * (1024 * 1024)
+    app_module._blog_proc_cache_put((1, "", "hq"), data)
+    assert _disk_held() >= len(data), "디스크에 안 쓰였다"
 
 
-def test_proc_cache_holds_many_small_entries():
-    """작은 엔트리는 여전히 많이 담긴다 — 바이트 예산은 기능을 약화시키지 않는다."""
-    small = b"y" * (600 * 1024)
-    for i in range(300):
-        app_module._blog_proc_cache_put((i, "", "std"), small)
-    assert len(app_module._blog_proc_cache) >= 70, "작은 미리보기를 너무 적게 담는다"
-    assert _held(app_module._blog_proc_cache) <= app_module._BLOG_PROC_CACHE_BUDGET
-
-
-def test_proc_cache_still_hits():
-    data = b"z" * 1024
+def test_proc_cache_round_trips():
+    data = b"\xff\xd8" + b"z" * 4096
     app_module._blog_proc_cache_put((1, "", "std"), data)
     assert app_module._blog_proc_cache_get((1, "", "std")) == data
     assert app_module._blog_proc_cache_get((2, "", "std")) is None
+    assert app_module._blog_proc_cache_get((1, "0,0,1,1", "std")) is None  # 키 분리
 
 
-def test_proc_cache_refuses_an_entry_larger_than_the_budget():
-    """한 장이 캐시 전체를 비우고 눌러앉지 않는다."""
-    app_module._blog_proc_cache_put((1, "", "std"), b"k" * 1024)
-    huge = b"h" * (app_module._BLOG_PROC_CACHE_BUDGET + 1)
-    app_module._blog_proc_cache_put((2, "", "hq"), huge)
-    assert app_module._blog_proc_cache_get((2, "", "hq")) is None
-    assert app_module._blog_proc_cache_get((1, "", "std")) is not None
+def test_proc_cache_is_bounded_by_bytes_on_disk(monkeypatch):
+    """예산을 넘기면 **오래된 것부터** 지운다(개수가 아니라 바이트 기준)."""
+    monkeypatch.setattr(app_module._blog_proc_cache, "budget", 8 * 1024 * 1024)
+    big = b"x" * (1024 * 1024)
+    for i in range(40):
+        app_module._blog_proc_cache_put((i, "", "hq"), big)
+    assert _disk_held() <= app_module._blog_proc_cache.budget, "디스크 예산을 넘었다"
+    assert _disk_entries() < 40, "축출이 일어나지 않았다"
+    assert app_module._blog_proc_cache_get((39, "", "hq")) == big  # 최근 것은 산다
+
+
+def test_proc_cache_holds_far_more_than_the_old_entry_cap():
+    """용량을 깎은 게 아니라 자리를 옮긴 것 — 옛 상한(200개)보다 많이 담긴다."""
+    std_entry = 600 * 1024  # 실측 std(1280·q92) 엔트리 크기
+    fits = app_module._BLOG_PROC_DISK_BUDGET // std_entry
+    assert fits > 200, (
+        f"std 미리보기를 {fits}장밖에 못 담는다 — 옛 개수 상한(200)보다 적다"
+    )
+
+
+def test_proc_cache_entries_expire():
+    data = b"old" * 100
+    app_module._blog_proc_cache_put((1, "", "std"), data)
+    path = app_module._blog_proc_cache.path((1, "", "std"))
+    old = time.time() - app_module._BLOG_PROC_CACHE_TTL - 60
+    os.utime(path, (old, old))
+    assert app_module._blog_proc_cache_get((1, "", "std")) is None
+
+
+def test_proc_cache_survives_an_unwritable_dir(monkeypatch):
+    """디스크를 못 쓰는 환경이면 조용히 '항상 미스' — 절대 요청을 깨뜨리지 않는다."""
+    monkeypatch.setattr(app_module._blog_proc_cache, "dir", "\0bad\0dir")
+    app_module._blog_proc_cache_put((1, "", "std"), b"data")  # 예외 없이 통과해야
+    assert app_module._blog_proc_cache_get((1, "", "std")) is None
+
+
+def test_proc_cache_default_dir_is_outside_the_repo():
+    """레포 워킹트리에 캐시 파일을 흘리지 않는다."""
+    default = os.environ.get("BLOG_PROC_CACHE_DIR") or os.path.join(
+        tempfile.gettempdir(), "couple-daily-blog-proc")
+    repo = os.path.dirname(os.path.abspath(app_module.__file__))
+    for d in (default, bytecache.DiskByteCache("x", 1, 1).dir):
+        assert not os.path.abspath(d).startswith(os.path.abspath(repo) + os.sep)
 
 
 # --------------------------------------------------------------------------- #
 # 2. OneDrive 원본 바이트 캐시 — 같은 계약
 # --------------------------------------------------------------------------- #
-def test_bytes_cache_is_bounded_by_bytes(monkeypatch, photo_bytes):
+def test_bytes_cache_lives_on_disk_and_is_bounded(monkeypatch, photo_bytes):
+    """원본 캐시도 RAM 이 아니라 디스크다 — 옛 '64개' 상한은 197MB 상주였다."""
+    monkeypatch.setattr(onedrive._bytes_cache, "budget", 12 * 1024 * 1024)
     monkeypatch.setattr(onedrive, "get_photo_content",
                         lambda item_id: (bytes(photo_bytes), "image/jpeg"))
     for i in range(40):
         onedrive.get_photo_content_cached(f"item-{i}")
-    held = _held(onedrive._bytes_cache)
-    assert held <= onedrive._BYTES_CACHE_BUDGET, (
-        f"원본 바이트 캐시가 예산을 넘었다: {held} > {onedrive._BYTES_CACHE_BUDGET}"
+    n, held = onedrive._bytes_cache.stats()
+    assert held <= onedrive._bytes_cache.budget, (
+        f"원본 바이트 캐시가 예산을 넘었다: {held} > {onedrive._bytes_cache.budget}"
     )
-    assert len(onedrive._bytes_cache) < 40
+    assert 0 < n < 40, "축출이 일어나지 않았다"
+
+
+def test_bytes_cache_holds_as_many_originals_as_the_old_cap_did():
+    """용량을 깎지 않았다 — 옛 개수 상한(64개)과 같은 급을 디스크에 담는다."""
+    original = 3.03 * 1024 * 1024  # 실측 아이폰 12MP 원본
+    fits = onedrive._BYTES_CACHE_BUDGET / original
+    assert fits >= 30, f"원본을 {fits:.0f}장밖에 못 담는다"
 
 
 def test_bytes_cache_still_absorbs_a_refetch_storm(monkeypatch, photo_bytes):
