@@ -6,6 +6,7 @@
     <button type="button" class="photo-open"
             data-id="{{ p.id }}"
             data-full="{{ url_for('memory_image', photo_id=p.id) }}"
+            data-thumb="{{ url_for('memory_thumb', photo_id=p.id) }}"
             data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
             data-delete="{{ url_for('memories_delete', photo_id=p.id) }}"
             data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"

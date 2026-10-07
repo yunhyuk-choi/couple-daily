@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -32,6 +33,7 @@ except ImportError:  # pragma: no cover
     pywebpush = None
 from flask import (
     Flask,
+    Response,
     abort,
     current_app,
     flash,
@@ -335,7 +337,46 @@ def compute_crop_rect(img_w, img_h, focus_box, target_aspect):
     return [x0 / W, y0 / H, crop_w / W, crop_h / H]
 
 
-def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
+def _round_aspect(number, key):
+    """Pillow ``Image.thumbnail`` 내부의 반올림 — **같은 크기**를 내기 위한 사본."""
+    return max(min(math.floor(number), math.ceil(number), key=key), 1)
+
+
+def _thumbnail_size(w, h, max_edge):
+    """``img.thumbnail((max_edge, max_edge))`` 가 만들 크기를 **미리** 계산한다.
+
+    Pillow 의 계산을 그대로 옮긴 것이다. 왜 필요한가: 같은 결과를 원본에서 만들 때와
+    렌디션에서 만들 때, 크롭 박스의 픽셀 반올림이 달라 **세로가 1px 어긋났다**
+    (실측: 1280x960 vs 1280x961). 1px 이라도 '출력이 달라졌다'는 사실이 중요하므로,
+    렌디션 경로는 **원본 기준으로 계산한 크기**로 정확히 리사이즈한다.
+    """
+    x = y = int(max_edge)
+    if w <= 0 or h <= 0:
+        return (max(1, x), max(1, y))
+    aspect = w / h
+    if x / y >= aspect:
+        x = _round_aspect(y * aspect, key=lambda n: abs(aspect - n / y))
+    else:
+        y = _round_aspect(
+            x / aspect, key=lambda n: 0 if n == 0 else abs(aspect - x / n)
+        )
+    return (x, y)
+
+
+def _crop_box_px(img_w, img_h, crop):
+    """정규화 crop → 픽셀 박스 (left, top, right, bottom). ``_blog_img_process`` 와
+    **같은 반올림**을 쓴다(그래야 원본 경로와 결과 크기가 같다)."""
+    W, H = int(img_w), int(img_h)
+    x, y, w, h = (float(v) for v in crop)
+    left = int(max(0, min(W - 1, round(x * W))))
+    top = int(max(0, min(H - 1, round(y * H))))
+    right = int(max(left + 1, min(W, round((x + w) * W))))
+    bottom = int(max(top + 1, min(H, round((y + h) * H))))
+    return left, top, right, bottom
+
+
+def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92,
+                      target_size=None):
     """블로그 서빙용으로 원본 바이트를 (선택적 크롭 →) 다운스케일한 JPEG로.
 
     EXIF 방향 보정 → crop(정규화 [x,y,w,h], 있으면) → 긴 변 ≤ max_edge(업스케일
@@ -365,7 +406,16 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
                     right = int(max(left + 1, min(W, round((x + w) * W))))
                     bottom = int(max(top + 1, min(H, round((y + h) * H))))
                     img = img.crop((left, top, right, bottom))
-            if max_edge:
+            if target_size:
+                # 소스가 렌디션일 때 — '원본에서 만들었다면 나왔을 크기'로 정확히.
+                # (업스케일은 하지 않는다: 요구 해상도를 못 채우는 렌디션은
+                #  _blog_std_source 가 애초에 거절하고 원본으로 폴백한다.)
+                tw, th = int(target_size[0]), int(target_size[1])
+                if (tw, th) != img.size and tw <= img.size[0] and th <= img.size[1]:
+                    img = img.resize((tw, th), resample)
+                elif (tw, th) != img.size:
+                    img.thumbnail((max_edge, max_edge), resample)
+            elif max_edge:
                 img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
             rgb = _as_rgb(img)
             out = _BytesIO()
@@ -374,6 +424,265 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원 → 원본 폴백
         log.warning("blog-img 크롭/리사이즈 실패 — 원본 바이트로 폴백", exc_info=True)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# ⛔ 이미지 소스 등급 — **원본을 아무 데나 부르지 않는다**
+# --------------------------------------------------------------------------- #
+# 사진 한 장에는 '하나의 URL'이 아니라 **용도별 등급**이 있다. 전부 원본으로
+# 통일하면 코드는 간단해지지만, 0.1 CPU · 512MB 에서 그 간단함의 값을 사용자가
+# 체감 속도로 치른다. 등급은 셋이다:
+#
+#   | 용도                               | 소스                      | 서버 비용 |
+#   |------------------------------------|---------------------------|-----------|
+#   | 갤러리 그리드 (작은 그림)           | Graph 썸네일 medium (4.4KB)| 0 (중계)  |
+#   | 상세 화면·크롭 UI·비전 판단 (미리보기) | Graph 렌디션 c1280/c1600   | 0 (중계)  |
+#   | 발행용 크롭 산출 (실제 결과물)       | **그때만** 원본           | 0 (스트리밍)|
+#
+# Graph 렌디션(`c{W}x{H}`)은 **Microsoft 가 서버에서** 비율을 지켜 줄여 준다 —
+# 우리 CPU·메모리는 0이고, HEIC 도 JPEG 로 받아 브라우저 호환 문제까지 같이 풀린다.
+# 상한은 문서에 없어 `onedrive.get_rendition` 이 **돌아온 크기를 보고** 판정한다
+# (`tools/probe_graph_renditions.py` 로 운영에서 한 번 재면 실제 한도를 알 수 있다).
+_RENDITION_PREVIEW_EDGE = 1280   # 상세 화면·크롭 UI 미리보기
+_RENDITION_VISION_EDGE = 1600    # claude 비전의 크롭 '판단'용 (판단은 정규화 좌표라
+                                 # 해상도 독립 — 12MP 를 보여 줄 이유가 없다)
+
+# --------------------------------------------------------------------------- #
+# std(미리보기·클립보드) 가공의 **입력**을 무엇으로 할 것인가 — 측정해서 고를 일
+# --------------------------------------------------------------------------- #
+# 'rendition'(기본) : 필요한 만큼만 받은 렌디션에서 자른다.
+#     메모리  실측 RSS 봉우리 **90.7MB → 10.2MB** (3.03MB·3024x4032 기준)
+#     화질    원본에서 자른 것과 **완전히 같지는 않다**(리샘플이 두 번 + 중간 JPEG):
+#               사진형 이미지   PSNR 45.6 dB · 채널 평균차 0.76/255  (육안 동일)
+#               순수 노이즈      PSNR 31.0 dB · 채널 평균차 6.1/255  (최악 케이스)
+#             출력 **해상도는 완전히 동일**하다(_thumbnail_size 로 맞춘다).
+# 'original'        : 예전과 똑같이 원본에서 자른다. 출력은 **바이트까지 동일**하고
+#     메모리는 90.7MB 봉우리로 돌아간다.
+#
+# 기본을 rendition 으로 둔 근거: 이 경로가 내는 것은 **최종 발행본이 아니다.**
+# 실제로 네이버에 올라가는 바이트는 브라우저가 **원본에서** 잘라 업로드하고(그쪽은
+# 화질이 오히려 좋아졌다 — 서버 재인코딩 한 세대가 사라졌다), 이 std URL 은
+# (a) 상세 화면 미리보기와 (b) 유저스크립트 없이 붙여넣었을 때의 **24시간 만료**
+# 임시 외부 이미지에 쓰인다. 1280px 미리보기에서 0.76/255 는 보이지 않는다.
+# 그래도 '바뀌었다'는 사실은 사실이므로, 한 줄로 되돌릴 수 있게 열어 둔다.
+_BLOG_STD_SOURCE = (os.environ.get("BLOG_STD_SOURCE") or "rendition").strip().lower()
+
+
+def _rendition_long_edge_for(img_w, img_h, crop, max_edge):
+    """긴 변 ``max_edge`` 짜리 결과를 **원본에서 만든 것과 같은 픽셀 수**로 내려면
+    소스 이미지의 긴 변이 최소 얼마여야 하는가. 모르면 None.
+
+    크롭은 정규화 [x,y,w,h]이므로 잘라낸 영역의 픽셀 긴 변은 ``max(w·W, h·H)``다.
+    그 값이 ``max_edge`` 이상이면 결과는 거기서 축소돼 나오므로, 소스는
+    ``max(W,H) × max_edge / max(w·W, h·H)`` 만 있으면 **화질 손실이 0**이다.
+
+    ⚠️ ``image`` 패싯의 W·H 는 EXIF 회전 전 값일 수 있다. 어느 쪽이 맞는지 모르는
+    채로 작은 쪽을 고르면 해상도가 모자라므로, **두 방향 모두 계산해 더 큰 요구치**를
+    택한다(모자라느니 조금 크게 받는다 — 바이트 몇십 KB 차이다).
+    """
+    try:
+        W, H = float(img_w or 0), float(img_h or 0)
+        E = float(max_edge or 0)
+    except (TypeError, ValueError):
+        return None
+    if W <= 0 or H <= 0 or E <= 0:
+        return None
+    cw, ch = (float(crop[2]), float(crop[3])) if crop else (1.0, 1.0)
+    if cw <= 0 or ch <= 0:
+        cw = ch = 1.0
+    # 방향 두 가지: (W,H) 와 (H,W). 각각의 '잘라낸 영역 긴 변'.
+    longs = [max(cw * W, ch * H), max(cw * H, ch * W)]
+    crop_long = min(l for l in longs if l > 0)
+    if crop_long <= E:
+        return int(max(W, H))        # 원본에서도 확대하지 않는다 → 원본이 곧 소스
+    return int(math.ceil(max(W, H) * E / crop_long))
+
+
+def _blog_std_source(photo, crop, max_edge):
+    """std(미리보기·클립보드) 가공의 **입력 바이트** — 가능하면 Graph 렌디션.
+
+    ``(data, source_label, target_size)``. 렌디션을 쓰면 12MP 를 디코드할 일이
+    사라진다. 렌디션이 없거나 요구 해상도에 못 미치면 **원본으로 폴백**한다 —
+    화질을 몰래 깎지 않는다.
+
+    ``target_size`` 는 **원본에서 만들었다면 나왔을 출력 크기**다(렌디션일 때만).
+    크롭 박스의 픽셀 반올림이 소스 해상도에 따라 달라져 결과가 1px 어긋나는 것을
+    막는다 — 실측으로 잡은 차이다(1280x960 vs 1280x961).
+    """
+    item_id = photo.onedrive_item_id
+    meta = None
+    if _BLOG_STD_SOURCE == "rendition":
+        try:
+            meta = onedrive.get_item_meta(item_id)
+        except onedrive.OneDriveError:
+            log.debug("blog-img: 아이템 메타 조회 실패 — 원본 경로로 간다",
+                      exc_info=True)
+    if meta and meta.get("width") and meta.get("height"):
+        need = _rendition_long_edge_for(meta["width"], meta["height"], crop,
+                                        max_edge)
+        full = max(meta["width"], meta["height"])
+        if need and need < full:
+            try:
+                got = onedrive.get_rendition(item_id, need, min_long_edge=need)
+            except onedrive.OneDriveError:
+                got = None
+            if got:
+                rw, rh = got[2]
+                mw, mh = meta["width"], meta["height"]
+                # ``image`` 패싯은 EXIF 회전 전일 수 있다. 렌디션은 이미 똑바로
+                # 서 있으므로, 둘의 방향이 다르면 원본 표시 크기는 뒤집힌 쪽이다.
+                if (rw > rh) != (mw > mh) and rw != rh and mw != mh:
+                    mw, mh = mh, mw
+                if crop:
+                    left, top, right, bottom = _crop_box_px(mw, mh, crop)
+                    cw, ch = right - left, bottom - top
+                else:
+                    cw, ch = mw, mh
+                target = _thumbnail_size(cw, ch, max_edge)
+                return got[0], f"rendition c{need} ({rw}x{rh})", target
+    data, _ctype = onedrive.get_photo_content_cached(item_id)
+    return data, "original", None
+
+
+# --------------------------------------------------------------------------- #
+# 왜 OneDrive URL 로 **302 하지 않는가** (재서 내린 결론 — 바꾸기 전에 읽을 것)
+# --------------------------------------------------------------------------- #
+# "서버가 바이트를 들지 말고 브라우저를 OneDrive 로 리다이렉트하면 되잖아"는 맞는
+# 직관이고, 메모리 목표도 달성한다. 그런데 **클라이언트 캐시 목표를 정면으로
+# 깨뜨린다** — 그게 이 변경의 또 다른 절반이라 결론이 뒤집혔다:
+#
+#  1. Graph 의 pre-auth 다운로드 URL 은 **발급할 때마다 다른 URL** 이다(쿼리에
+#     1회용 토큰이 박힌다). 브라우저 캐시의 키는 '최종 URL' 이므로, 302 로 보내면
+#     같은 사진을 다시 봐도 **매번 캐시 미스**다. 지금처럼 `/memories/<id>/image`
+#     라는 **고정 URL** 을 주고 `Cache-Control`+`ETag` 를 붙이면 재방문이 304 다.
+#     (302 자체를 캐시시키면 만료된 CDN URL 을 계속 쓰게 돼 깨진 이미지가 된다.)
+#  2. 302 는 Graph 왕복을 **늘린다**. 리다이렉트하려면 먼저 `/items/<id>` 를 쳐서
+#     URL 을 받아야 하는데, 그 뒤 브라우저가 CDN 을 또 친다. 중계는 한 번이다.
+#  3. 그 URL 은 **자격증명이다** — 쿼리의 토큰만으로 그 파일이 열린다. 우리 코드는
+#     이미 영상 경로에서 같은 판단을 내려 뒀다(`onedrive.probe_direct_cors` 머리말:
+#     "반환값에 URL을 절대 담지 않는다"). 브라우저 히스토리·확장·공유로 새어 나갈
+#     수 있는 값을 굳이 내보낼 이유가, 위 1·2 때문에 **아예 없다.**
+#
+# 그래서 택한 길: **고정 URL + 제너레이터 중계 + 강한 클라이언트 캐시**. 메모리는
+# 302 와 똑같이 평평하고(한 번에 64KB), 캐시는 오히려 살아난다.
+# (영상은 다르다 — `<video>` 의 Range seek 때문에 `video_source` 가 CORS 를 실측해
+#  가능하면 직접 URL 을 쓴다. 거기선 캐시가 아니라 대역폭이 관심사다.)
+# --------------------------------------------------------------------------- #
+
+# 사진 중계 청크. 영상(_VIDEO_CHUNK=256KB)과 같은 사상 — 한 번에 이만큼만 메모리에
+# 있다. 사진은 영상보다 작으므로 64KB면 충분하고 첫 바이트가 더 빨리 나간다.
+_IMAGE_STREAM_CHUNK = 64 * 1024
+
+
+def _photo_etag(photo, download=False):
+    """사진 응답의 ETag — 재방문을 **304 로** 끝내기 위한 값.
+
+    이 앱에서 Photo 행의 바이트는 **절대 바뀌지 않는다**(수정 업로드가 없다 — 새
+    업로드는 새 행이다). 그래서 OneDrive item id 로 충분하고, 표시본/다운로드본이
+    포맷이 다르므로 그 구분만 섞는다.
+    """
+    item_id = getattr(photo, "onedrive_item_id", None)
+    if not item_id:
+        return None
+    mode = "dl" if download else "disp"
+    h = hashlib.sha256(f"{item_id}:{mode}".encode("utf-8")).hexdigest()[:24]
+    return f'"{h}"'
+
+_EXT_CTYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".heic": "image/heic", ".heif": "image/heif",
+}
+# 브라우저가 <img>·Canvas 로 바로 그릴 수 있는 포맷. HEIC/HEIF 는 여기 없다 —
+# 사파리 말고는 못 연다.
+_WEB_DRAWABLE = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+def _ctype_for_name(name):
+    return _EXT_CTYPES.get(os.path.splitext(name or "")[1].lower(), "image/jpeg")
+
+
+def _stream_original(photo, want_web_format=False, disposition=None):
+    """원본 바이트를 **열지 않고 흘려보낸다** — 응답은 게으른 제너레이터다.
+
+    ``/videos/<id>/stream`` 이 쓰는 것과 같은 설비(``onedrive.open_range``)다.
+    한 번에 메모리에 있는 것은 ``_IMAGE_STREAM_CHUNK`` 뿐이라, 50MB 사진을 내보내도
+    워커 메모리는 평평하다. 예전엔 바이트를 통째로 변수에 담아 응답을 만들었다.
+
+    ``want_web_format=True`` 면 브라우저가 그릴 수 있는 포맷을 보장한다:
+    HEIC/HEIF 원본은 **같은 해상도의 Graph 렌디션(JPEG)** 으로 바꿔 내고(우리 CPU 0),
+    Graph 가 그 크기를 못 만들면 그때만 Pillow 로 변환한다(기존 동작 — 화질 후퇴 없음).
+    """
+    name = photo.original_name or photo.filename or ""
+    ctype = _ctype_for_name(name)
+
+    if want_web_format and ctype not in _WEB_DRAWABLE:
+        data = _web_format_bytes(photo)
+        if data is not None:
+            return Response(data, mimetype="image/jpeg")
+        # 변환이 전부 실패하면 원본을 그대로 흘린다(사파리는 연다, 다른 곳은 못 연다 —
+        # 예전과 같은 최후 폴백이다).
+
+    try:
+        status, headers, upstream = onedrive.open_range(photo.onedrive_item_id)
+    except onedrive.OneDriveError:
+        log.exception("이미지 스트림을 열지 못했다 (photo=%s)", photo.id)
+        abort(502)
+    if upstream is None:
+        abort(404)  # OneDrive 에서 사라짐
+
+    def _pump():
+        try:
+            for chunk in upstream.iter_content(chunk_size=_IMAGE_STREAM_CHUNK):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()  # 끊긴 연결에서도 소켓을 반드시 거둔다
+
+    up_ctype = headers.get("Content-Type")
+    if up_ctype and up_ctype.startswith("image/"):
+        ctype = up_ctype
+    resp = Response(_pump(), status=status, mimetype=ctype)
+    if headers.get("Content-Length"):
+        resp.headers["Content-Length"] = headers["Content-Length"]
+    if disposition:
+        resp.headers["Content-Disposition"] = disposition
+    return resp
+
+
+def _web_format_bytes(photo):
+    """HEIC/HEIF 원본을 브라우저가 여는 JPEG 로 — **해상도를 깎지 않고**.
+
+    1순위는 Graph 렌디션(원본과 같은 긴 변으로 요청 — Microsoft 가 서버에서 만든다).
+    Graph 가 그만한 크기를 못 내면(문서화되지 않은 상한) 그때만 Pillow 로 변환한다.
+    둘 다 안 되면 None(호출부가 원본을 그대로 흘린다). 절대 raise 하지 않는다.
+    """
+    item_id = photo.onedrive_item_id
+    try:
+        meta = onedrive.get_item_meta(item_id)
+    except onedrive.OneDriveError:
+        meta = None
+    full = None
+    if meta and meta.get("width") and meta.get("height"):
+        full = max(meta["width"], meta["height"])
+    if full:
+        try:
+            got = onedrive.get_rendition(item_id, full, min_long_edge=full)
+        except onedrive.OneDriveError:
+            got = None
+        if got:
+            return got[0]
+        log.info(
+            "HEIC: Graph 가 원본 해상도(%spx) 렌디션을 못 냈다 — Pillow 로 변환한다 "
+            "(photo=%s)", full, photo.id,
+        )
+    try:
+        data, _ctype = onedrive.get_photo_content_cached(item_id)
+    except onedrive.OneDriveError:
+        return None
+    if not data:
+        return None
+    return _heic_to_jpeg(data)
 
 
 # ---- Kakao OAuth 2.0 config (read from env; never hardcode secrets) ----
@@ -2139,6 +2448,58 @@ def resume_review_if_orphaned(app_obj, review):
     return True
 
 
+# 'failed' 로 끝난 초안을 **이 프로세스에서 한 번** 자동 재시도했는지 기록한다.
+# 프로세스가 재시작되면 비워진다 — 그게 맞다(재시작 자체가 '환경이 달라졌다'는
+# 신호다). 무한 루프는 이 집합이 막는다.
+_refailed_reviews_lock = threading.Lock()
+_refailed_reviews: set[int] = set()
+
+
+def resume_review_if_failed(app_obj, review):
+    """'failed' 로 끝난 초안을 **한 번** 자동으로 다시 돌린다(돌렸으면 True).
+
+    왜 이게 필요한가 — 2026-10-07 사고에서 후기 **두 건이 같은 원인(메모리 초과)**
+    으로 멈췄는데 **결과가 서로 달랐다.** 리눅스 OOM 킬러는 cgroup 에서 가장 큰
+    프로세스를 고르는데, 이 앱에서 그건 보통 ``claude``(Node, 실측 ~400MB)지
+    gunicorn 워커(~95MB)가 아니다. 그래서:
+
+      * 워커째 죽은 쪽 → 행은 ``pending`` 으로 남고, 인프로세스 가드가 비어 있어
+        ``resume_review_if_orphaned`` 가 **자동 복구**했다(사용자가 본 '복구 메시지').
+      * ``claude`` 자식만 죽은 쪽 → 워커는 살아서 ``_run_claude`` 가 "exited -9" 로
+        RuntimeError 를 던졌고, ``write_review`` 가 None 을 돌려줘 ``failed`` 로
+        **종결**됐다. 자동 복구 경로가 없어 사람이 ↻ 를 누를 때까지 그대로 남는다.
+
+    원인이 하나인데 복구가 한쪽만 되는 **비대칭**이 문제다. 사용자 입장에서 둘은
+    구분할 수 없는 같은 사고다. 그래서 'failed' 도 고아 복구와 **같은 자리에서 같은
+    모양으로** 한 번 되살린다. 'failed' 가 사라지는 게 아니라, 한 번 더 해 보고도
+    실패하면 그때 ``failed`` 로 남아 기존 탈출구(↻ 다시 생성 버튼)를 보여 준다.
+
+    ⚠️ ``ai_json``·``edited_text``·``research_json`` 을 **건드리지 않는다**
+    (``resume_review_if_orphaned`` 와 같은 규율). 직전 초안이 있는 행은 애초에
+    ``failed`` 가 되지 않으므로(위 generate_review 의 prior_ok) 잃을 산출물도 없다.
+    """
+    if review is None or review.status != "failed":
+        return False
+    with _refailed_reviews_lock:
+        if review.id in _refailed_reviews:
+            return False
+        _refailed_reviews.add(review.id)
+    review.status = "pending"
+    review.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001 — 복구가 요청을 깨뜨리면 안 된다
+        db.session.rollback()
+        log.exception("실패한 후기 초안 자동 재시도 커밋 실패 (review=%s)", review.id)
+        return False
+    log.warning(
+        "실패로 끝난 후기 초안을 자동으로 한 번 더 돌린다 (review=%s) — "
+        "메모리 압박에 claude 자식이 죽은 경우가 이렇게 보인다", review.id,
+    )
+    _spawn_generate_review(app_obj, review.id)
+    return True
+
+
 def _crop_hint_for_image(blocks, idx):
     """image 블록(blocks[idx]) 주변에서 크롭 힌트(그 사진이 말하는 대상)를 뽑는다.
 
@@ -2165,15 +2526,113 @@ def _crop_hint_for_image(blocks, idx):
     return (heading + " — " + para).strip(" —").strip()
 
 
+# claude 에게 그림을 보여 주는 길. 'file'(기본) = 렌디션을 임시파일로 떨궈 Read,
+# 'url' = 만료 서명 URL 을 주고 WebFetch 로 가져가게 한다.
+#
+# ⚠️ 실측으로 기본값을 골랐다(2026-10-07, `claude -p --allowedTools WebFetch Read`):
+#   * URL 경로는 **된다** — WebFetch 가 JPEG 를 자기 쪽에 내려받고 Read 가 픽셀을
+#     본다. 320x240/1600x1200/4000x3000 전부 정확히 묘사했다.
+#   * 다만 **사진 한 장에 30~33초**가 더 든다(WebFetch 왕복). 사진 5장이면 +2분 반.
+#   * 10MB JPEG 한 건은 WebFetch 가 텍스트로 변환해 **픽셀을 못 봤다** — 큰 이미지엔
+#     못 믿는다(작은 렌디션만 안전).
+#   * 아낄 수 있는 메모리는 렌디션 한 장치(수백 KB)뿐이다 — 큰 건 이미 원본 디코드를
+#     없애서 가져왔다.
+# 즉 **속도를 크게 내주고 메모리를 조금 얻는** 교환이라 기본은 'file' 이다. URL 경로는
+# 그대로 살아 있고(만료 5분 서명 URL — 네이버 발행이 쓰는 그 설비), 환경변수로 켠다.
+_CROP_VISION_SOURCE = (os.environ.get("CROP_VISION_SOURCE") or "file").strip().lower()
+# claude 콜 하나가 끝나기에 충분한 최소 만료(ai.CAPTION_TIMEOUT 180s + 여유).
+_CROP_VISION_URL_TTL = 300
+
+
+def _public_base_url():
+    """이 앱의 **외부에서 접근 가능한** 베이스 URL(끝 슬래시 없음) 또는 None.
+
+    백그라운드 스레드에는 요청 컨텍스트가 없어 ``url_for(_external=True)`` 를 쓸 수
+    없다. Render 는 ``RENDER_EXTERNAL_URL`` 을 자동으로 넣어 준다.
+    """
+    base = (os.environ.get("PUBLIC_BASE_URL")
+            or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+    return base.rstrip("/") or None
+
+
+def _crop_vision_dims(photo):
+    """크롭 계산에 쓸 **표시 기준** (w, h) — 픽셀을 한 바이트도 받지 않는다.
+
+    1순위는 렌디션 메타다: Graph 렌디션은 이미 EXIF 로 똑바로 세워져 오므로 그
+    가로세로가 곧 '표시 기준'이고, claude 가 볼 그림과도 **같은 방향**이다.
+    (``image`` 패싯은 회전 전 값일 수 있어 2순위.) 둘 다 없으면 None.
+    """
+    item_id = photo.onedrive_item_id
+    try:
+        rm = onedrive.get_rendition_meta(
+            item_id, onedrive.rendition_name(_RENDITION_VISION_EDGE)
+        )
+    except onedrive.OneDriveError:
+        rm = None
+    if rm:
+        return (rm["width"], rm["height"])
+    try:
+        meta = onedrive.get_item_meta(item_id)
+    except onedrive.OneDriveError:
+        meta = None
+    if meta and meta.get("width") and meta.get("height"):
+        return (meta["width"], meta["height"])
+    return None
+
+
+def _crop_vision_image(photo):
+    """claude 에게 보여 줄 ``(bytes, ext)`` — 렌디션(수백 KB) 우선, 없으면 원본."""
+    item_id = photo.onedrive_item_id
+    try:
+        got = onedrive.get_rendition(item_id, _RENDITION_VISION_EDGE)
+    except onedrive.OneDriveError:
+        got = None
+    if got:
+        return got[0], ".jpg"
+    try:
+        data, _ctype = onedrive.get_photo_content(item_id)
+    except onedrive.OneDriveError:
+        log.exception("crop: OneDrive fetch 실패 (photo=%s)", photo.id)
+        return None, ".jpg"
+    name = photo.original_name or photo.filename or ""
+    return data, os.path.splitext(name)[1].lower()
+
+
+def _crop_vision_url(photo):
+    """claude 가 WebFetch 로 가져갈 **만료 있는 서명 URL**(렌디션) 또는 None.
+
+    새 메커니즘을 만들지 않고 네이버 발행이 쓰는 ``_blog_img_sig`` 를 그대로 쓴다 —
+    같은 HMAC·같은 만료 규약이고, 가리키는 것은 원본이 아니라 **작은 렌디션**이다.
+    만료는 claude 콜 하나가 끝날 만큼만(5분).
+    """
+    if _CROP_VISION_SOURCE != "url":
+        return None
+    base = _public_base_url()
+    if not base:
+        return None  # 외부에서 못 닿는 환경(로컬 개발 등) → 파일 경로로 간다
+    exp = int(time.time()) + _CROP_VISION_URL_TTL
+    sig = _blog_img_sig(photo.id, exp, None)
+    return (f"{base}/blog-img/{photo.id}?e={exp}&t={sig}"
+            f"&v=r{_RENDITION_VISION_EDGE}")
+
+
 def _attach_section_crops(result, photos_ordered):
     """result['blocks']의 각 image 블록에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
 
-    유효 photo_index마다: 원본 바이트 → 표시 크기 → ``ai.suggest_crop``(비전으로
-    '이 사진이 말하는 대상' focus 박스, 힌트는 주변 heading·para) →
-    ``compute_crop_rect``(결정론적 목표비율) → ``block['crop']``. suggest_crop이
-    None이어도 focus=None(중앙 크롭)으로 크롭을 저장해 서빙이 항상 랜드스케이프가
-    되게 한다. 사진당 실패는 그 사진만 크롭 없이 넘어간다(전체 실패로 번지지 않게).
-    각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로 직렬화한다. 저장 원본은 안 건드린다.
+    ⛔ **원본 바이트를 받지 않는다.** 크롭 박스는 0~1 정규화 좌표라 **해상도와
+    무관**하고, 비율만 알면 ``compute_crop_rect`` 가 돈다. 그래서 사진당:
+
+      * 크기  — Graph 렌디션이 알려 주는 가로세로(이미 EXIF 로 똑바로 서 있다).
+        예전엔 3MB 원본을 받아 Pillow 로 열었다(실측 봉우리 ~90MB).
+      * 비전  — 같은 렌디션(수백 KB)을 claude 에게 보여 준다. '어디를 남길지'를
+        정하는 데 12MP 는 필요 없다 — 디스크·전송·토큰이 전부 싸진다. 실제 크롭은
+        나중에 **원본 픽셀에서** 브라우저가 한다(화질 손실 0).
+
+    렌디션을 못 받으면 그때만 원본으로 폴백한다(동작은 예전과 동일).
+    suggest_crop이 None이어도 focus=None(중앙 크롭)으로 크롭을 저장해 서빙이 항상
+    랜드스케이프가 되게 한다. 사진당 실패는 그 사진만 크롭 없이 넘어간다(전체 실패로
+    번지지 않게). 각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로 직렬화한다.
+    저장 원본은 안 건드린다.
     """
     if not result or not isinstance(result, dict):
         return
@@ -2190,23 +2649,23 @@ def _attach_section_crops(result, photos_ordered):
             if not isinstance(pi, int) or pi < 0 or pi >= n:
                 continue
             p = photos_ordered[pi]
-            try:
-                data, _ctype = onedrive.get_photo_content(p.onedrive_item_id)
-            except onedrive.OneDriveError:
-                log.exception("crop: OneDrive fetch 실패 (photo=%s)", p.id)
-                data = None
-            if not data:
-                continue
-            dims = _image_display_size(data)
+            dims = _crop_vision_dims(p)   # 픽셀 0바이트
             if not dims:
-                continue  # Pillow 부재/디코드 실패 → 크롭 없이(다운스케일만 서빙)
+                continue  # 크기를 못 알아냄 → 크롭 없이(서빙은 다운스케일만)
             img_w, img_h = dims
             hint = _crop_hint_for_image(blocks, i)
-            name = p.original_name or p.filename or ""
-            ext = os.path.splitext(name)[1].lower()
+            vision_url = _crop_vision_url(p)
+            if vision_url:
+                data, ext = None, ".jpg"   # 바이트를 아예 안 만진다
+            else:
+                data, ext = _crop_vision_image(p)
+                if not data:
+                    continue  # 보여 줄 그림이 없다 → 이 사진만 건너뛴다
             _CAPTION_SEM.acquire()
             try:
-                focus = ai.suggest_crop(data, hint, _BLOG_CROP_ASPECT, ext=ext)
+                focus = ai.suggest_crop(
+                    data, hint, _BLOG_CROP_ASPECT, ext=ext, image_url=vision_url,
+                )
             except Exception:  # noqa: BLE001 — 비전 실패는 중앙 크롭으로 폴백
                 log.exception("suggest_crop raised (photo=%s)", p.id)
                 focus = None
@@ -2318,6 +2777,15 @@ def generate_review(app, review_id):
                 finally:
                     _CAPTION_SEM.release()
 
+                # ⛔ **본문을 먼저 확정해 둔다 — 크롭 전에.**
+                # 크롭 단계는 사진마다 claude 비전 콜이라 이 작업에서 가장 긴 구간이고
+                # (사진 5장이면 최악 15분), 2026-10-07 처럼 그 사이에 프로세스가 죽으면
+                # **이미 끝난 120초짜리 본문 생성이 통째로 버려졌다**(행은 pending 으로
+                # 남아 처음부터 다시 돌았다). 본문을 먼저 커밋해 두면 그 구간에서 죽어도
+                # 사람은 쓸 수 있는 초안을 보고, 크롭만 다시 붙이면 된다.
+                if result:
+                    _save_review_result(review_id, result, research, status="ready")
+
                 # 각 섹션 사진에 '내용 인지' 크롭을 계산해 result에 심는다(서빙 시
                 # 적용). 크롭 실패는 초안 저장을 막지 않는다(사진당 격리 + 여기서도
                 # 감싼다). suggest_crop은 위 write_review와 같은 _CAPTION_SEM으로
@@ -2363,6 +2831,30 @@ def generate_review(app, review_id):
     finally:
         with _generating_reviews_lock:
             _generating_reviews.discard(review_id)
+
+
+def _save_review_result(review_id, result, research, status):
+    """후기 행에 초안(+조사 메모)을 쓰고 커밋한다. 절대 raise 하지 않는다.
+
+    ``generate_review`` 가 **두 번** 부른다 — 본문이 나온 직후(크롭 전)와 크롭을
+    붙인 뒤. 두 번째가 첫 번째를 같은 모양으로 덮으므로 멱등하다.
+    """
+    review = db.session.get(BlogReview, review_id)
+    if review is None:
+        return
+    try:
+        review.research_json = json.dumps(research, ensure_ascii=False)
+    except (TypeError, ValueError):
+        review.research_json = None
+    if result is not None:
+        review.ai_json = json.dumps(result, ensure_ascii=False)
+    review.status = status
+    review.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception("commit failed for blog review (review=%s)", review_id)
 
 
 def _spawn_generate_review(app, review_id):
@@ -2864,19 +3356,24 @@ def _ensure_export_key(u):
     return getattr(u, "export_key", None)
 
 
-def _hq(url):
-    """서명 blog-img URL에 &hq=1(원본 해상도)을 붙인다 — 유저스크립트가 풀해상도로 가져가게."""
+def _variant(url, v):
+    """서명 blog-img URL 에 등급(``&v=``)을 붙인다 — ``orig`` 또는 ``r<N>``.
+
+    ``v`` 는 서명 대상이 아니다(어느 등급이든 같은 사진 한 장이다 — blog_img 머리말).
+    """
     if not url:
         return url
-    return url + ("&" if "?" in url else "?") + "hq=1"
+    return url + ("&" if "?" in url else "?") + f"v={v}"
 
 
 def _build_export_payload(review):
     """준비된 후기 → (doc_data, images). cd-doc-data(온페이지)와 공개 pending API 공용.
 
-    image 블록엔 hq blog-img URL을 ``__src``로 붙이고, ``images``는 ``{src,url}``(둘 다
-    hq)로 낸다. 유저스크립트는 ``images[i].url``로 풀해상도 바이트를 받아 파일을 만들고,
-    ``images[i].src``↔블록 ``__src``를 iK(사진 id+크롭)로 매칭한다(쿼리/토큰 무시라 hq 무해).
+    ⛔ ``images[i].url`` 은 이제 **크롭되지 않은 원본**(``v=orig``)이고, 잘라낼
+    자리는 ``images[i].crop``(정규화 [x,y,w,h])으로 **좌표만** 함께 내려간다.
+    유저스크립트가 받은 뒤 **Canvas 로 자른다** — 서버는 픽셀을 만지지 않고, 결과
+    화질은 *원본 픽셀 그대로*다(서버가 1280 다운스케일본에서 자르던 것보다 낫다).
+    ``images[i].src``↔블록 ``__src``는 iK(사진 id+크롭)로 매칭한다(쿼리/등급 무시).
     준비 안 됐으면 (None, None).
     """
     if not (review.status == "ready" and review.ai):
@@ -2892,9 +3389,14 @@ def _build_export_payload(review):
         if not (isinstance(pi, int) and 0 <= pi < len(photos_ordered)):
             continue
         p = photos_ordered[pi]
-        hq = _hq(blog_img_url(p, crop=blk.get("crop")))
-        blk["__src"] = hq
-        images.append({"src": hq, "url": hq})
+        crop = blk.get("crop")
+        key_src = blog_img_url(p, crop=crop)      # 매칭 키(크롭까지 서명된 std URL)
+        blk["__src"] = key_src
+        images.append({
+            "src": key_src,
+            "url": _variant(blog_img_url(p), "orig"),  # 자르지 않은 원본
+            "crop": [round(float(v), 6) for v in crop] if crop else None,
+        })
     created = review.created_at
     visit_ymd = f"{created.year}년 {created.month}월" if created else ""
     visit_foot = created.strftime("%Y. %m") if created else ""
@@ -5007,6 +5509,10 @@ def _register_routes(app: Flask):
     # ---- 추억 (memories): photos stored in OneDrive ----
     _ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
     _MAX_PHOTO_BYTES = 50 * 1024 * 1024  # 50 MB (대용량 HEIC/JPEG 대응, OneDrive 단순 업로드 250MB 한참 아래)
+    # EXIF 촬영일시를 찾기 위해 읽는 **머리 조각**. JPEG 의 APP1(Exif) 세그먼트는
+    # SOI 바로 뒤라 수 KB 안이고, HEIC 의 meta 박스도 보통 파일 앞머리에 있다.
+    # 256KB 면 넉넉하고(실패해도 Graph 메타가 받친다) 메모리는 사진 크기와 무관하다.
+    _EXIF_HEAD_BYTES = 256 * 1024
     _MAX_UPLOAD_BATCH = 20               # 요청당 사진 수 안전 상한 (JS는 이제 1장씩 보냄)
     _EXT_CONTENT_TYPES = {
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -5160,52 +5666,47 @@ def _register_routes(app: Flask):
     @app.route("/memories/<int:photo_id>/image")
     @active_couple_required
     def memory_image(photo_id):
-        """Backend image proxy: stream a photo's bytes from OneDrive.
+        """원본 사진 중계 — **바이트를 변수에 담지 않고 흘려보낸다.**
 
-        The browser never sees a OneDrive URL. We fetch the bytes server-side
-        with a FRESH link every time (``get_photo_content`` hits /content, which
-        302s to a fresh pre-auth URL) so we can't serve an expired 401 body. A
-        brief in-process bytes cache absorbs refetch storms; ``Cache-Control:
-        private, max-age=3600`` lets the browser cache each image for an hour.
+        브라우저는 OneDrive URL 을 절대 보지 않는다. 매번 신선한 링크로
+        (``open_range`` → ``/content`` 302) 열어 **제너레이터로 중계**하므로,
+        50MB 사진을 내보내도 워커 메모리는 64KB 대에서 평평하다. 예전엔 바이트를
+        통째로 읽어 응답을 만들고 그걸 또 16MB 캐시에 담았다.
+
+        캐시는 **브라우저가** 한다 — 이 URL 은 사진당 고정이고 ``Cache-Control:
+        private, max-age=3600`` + ``ETag`` 가 붙으므로, 재방문은 304 로 끝난다
+        (서버는 아무것도 들고 있지 않다). ⛔ **OneDrive URL 로 302 하지 않는 이유**는
+        파일 머리말 §'왜 302 를 안 쓰는가' 참고 — 그 URL 은 발급마다 달라져서
+        브라우저 캐시 키가 매번 깨지고(= 캐시가 아예 안 먹는다), 자격증명이 박혀 있다.
+
+        HEIC/HEIF 는 사파리 말고는 ``<img>`` 로 못 여므로 표시 경로에서만 JPEG 로
+        바꾼다 — 1순위는 Graph 렌디션(우리 CPU 0), 안 되면 Pillow(기존 동작).
+        다운로드(``?download=1``)는 **원본 파일명·원본 바이트 그대로**다.
         404 unless the photo belongs to the requester's couple.
         """
         u = current_user()
         photo = db.session.get(Photo, photo_id)
         if photo is None or photo.couple_id != u.couple_id:
             abort(404)
-        try:
-            data, ctype = onedrive.get_photo_content_cached(photo.onedrive_item_id)
-        except onedrive.OneDriveError:
-            log.exception("could not fetch image bytes for photo %s", photo.id)
-            abort(502)
-        if data is None:
-            abort(404)  # gone from OneDrive
-        if not ctype or not ctype.startswith("image/"):
-            ctype = _content_type_for(photo.filename or photo.original_name)
-        # HEIC/HEIF는 갤럭시·PC 브라우저가 <img>로 못 본다 → JPEG로 변환해 서빙한다.
-        # 변환 불가/실패 시 원본 바이트로 폴백(_heic_to_jpeg가 None) — 절대 500 없음.
-        # 다운로드(?download=1)는 원본 파일명·바이트를 그대로 유지한다(.heic 이름에
-        # JPEG를 담지 않도록) — 표시 경로만 변환한다.
-        name = photo.original_name or photo.filename or ""
-        ext = os.path.splitext(name)[1].lower()
-        # ctype가 이미 웹에서 그려지는 포맷이면 그대로 통과(재인코딩 금지). 확장자
-        # (.heic/.heif)는 ctype가 없거나 일반적일 때만 HEIC 신호로 쓴다.
-        web_ok = ctype in ("image/jpeg", "image/png", "image/webp", "image/gif")
-        is_heic = ctype in ("image/heic", "image/heif") or (
-            ext in (".heic", ".heif") and not web_ok
-        )
-        if is_heic and not request.args.get("download"):
-            jpeg = _heic_to_jpeg(data)
-            if jpeg is not None:
-                data, ctype = jpeg, "image/jpeg"
-        resp = app.response_class(data, mimetype=ctype)
-        resp.headers["Cache-Control"] = "private, max-age=3600"
-        # ?download=1 → force a browser download of the ORIGINAL file bytes with
-        # the user's original filename (the lightbox 다운로드 button uses this).
-        if request.args.get("download"):
-            resp.headers["Content-Disposition"] = _attachment_disposition(
+        download = bool(request.args.get("download"))
+        disposition = None
+        if download:
+            disposition = _attachment_disposition(
                 photo.original_name or photo.filename or f"photo-{photo.id}.jpg"
             )
+        # 조건부 요청 — 바뀌지 않았으면 바이트를 한 톨도 보내지 않는다(304).
+        etag = _photo_etag(photo, download)
+        if etag and request.headers.get("If-None-Match") == etag:
+            resp = app.response_class(status=304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "private, max-age=3600"
+            return resp
+        resp = _stream_original(
+            photo, want_web_format=not download, disposition=disposition
+        )
+        resp.headers["Cache-Control"] = "private, max-age=3600"
+        if etag:
+            resp.headers["ETag"] = etag
         return resp
 
     @app.route("/blog-img/<int:photo_id>")
@@ -5215,10 +5716,26 @@ def _register_routes(app: Flask):
         ``@active_couple_required`` 없음(공개). ``?e=<exp>&t=<sig>``의 만료시각과
         HMAC 토큰을 ``hmac.compare_digest``로 대조하고(불일치/누락/만료 → 404),
         토큰이 곧 인가라 어느 커플의 Photo든 로드한다. 선택적 ``&c=x,y,w,h``(정규화
-        크롭)도 서명에 포함되므로 변조 시 404다. 바이트는 한 경로로 처리한다:
-        (크롭 →) 긴 변 ≤1280px 다운스케일 → JPEG(q92). ``&hq=1``(서명 무관)이면
-        다운스케일 없이 원본 해상도 + q95로 낸다(네이버 export용). HEIC도 같은
-        open으로 처리. Pillow 실패 시 원본 바이트로 폴백(절대 500 안 남). 조회 실패 → 404.
+        크롭)도 서명에 포함되므로 변조 시 404다.
+
+        ⛔ **등급(``&v=``)으로 소스를 가른다 — 원본을 아무 데나 내보내지 않는다.**
+
+        | ``v``        | 무엇                         | 서버가 픽셀을 만지나 |
+        |--------------|------------------------------|----------------------|
+        | (없음)       | 미리보기·클립보드용 std:      | **예 — 여기 한 곳뿐** |
+        |              | (크롭→) 긴 변 ≤1280 · q92     | 입력은 **렌디션**     |
+        | ``orig``     | 원본 바이트 **그대로 중계**    | 아니오 (스트리밍)     |
+        | ``r<N>``     | Graph 렌디션 **그대로 중계**   | 아니오 (중계)         |
+
+        ``v=orig`` 는 **브라우저가 Canvas 로 발행용 크롭을 굽기 위한** 소스다 —
+        크롭을 서버가 하지 않으므로 결과 화질은 *원본 픽셀 그대로*이고(다운스케일본에서
+        자르는 것보다 낫다), 0.1 CPU 워커는 바이트를 흘려보내기만 한다. HEIC 원본은
+        브라우저가 못 열므로 같은 해상도의 Graph 렌디션(JPEG)으로 대체하고, 그것도
+        안 되면 그때만 Pillow 로 변환한다(기존 동작 — 화질 후퇴 없음).
+
+        ``v`` 는 서명 대상이 아니다(``t``/``e``/``c`` 만 대조) — 어느 등급이든 **같은
+        사진 한 장**을 공개하므로 노출 범위가 달라지지 않는다. 예전 ``&hq=1`` 이
+        하던 일(원본 해상도 서버 크롭)은 ``v=orig`` + 브라우저 크롭으로 대체됐다.
 
         보안: 이 서명 URL은 (만료 전까지) 링크를 가진 누구에게나 그 사진 하나를
         공개로 노출한다 — 이 사진들은 공개 블로그에 게시되는 것이므로 허용된다.
@@ -5238,29 +5755,48 @@ def _register_routes(app: Flask):
             abort(404)
         if exp <= int(time.time()):  # 만료 → 404(존재 누설 방지로 410 대신)
             abort(404)
-        hq = bool(request.args.get("hq"))
-        # 가공완료 캐시 히트면 OneDrive·재인코딩 없이 즉시 반환((photo,crop,mode) 불변).
-        proc_key = (photo_id, crop_str or "", "hq" if hq else "std")
-        cached = _blog_proc_cache_get(proc_key)
-        if cached is not None:
-            resp = app.response_class(cached, mimetype="image/jpeg")
+        variant = (request.args.get("v") or "").strip().lower()
+
+        def _public(resp):
+            # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
+            # 네이버 유저스크립트가 cross-origin 으로 받아 Canvas 에 그리므로 ACAO 도.
             resp.headers["Cache-Control"] = "public, max-age=86400"
-            # 네이버(blog.naver.com) 유저스크립트가 hq 바이트를 cross-origin fetch하므로
-            # 공개 서명 URL엔 CORS 허용을 붙인다(이미 공개 링크라 안전).
             resp.headers["Access-Control-Allow-Origin"] = "*"
             return resp
+
+        # ---- 중계 등급(v=orig / v=rN) — 서버는 바이트를 **열지 않는다** --------
+        if variant == "orig" or variant.startswith("r"):
+            photo = db.session.get(Photo, photo_id)
+            if photo is None:
+                abort(404)
+            if variant != "orig":
+                try:
+                    edge = int(variant[1:] or 0)
+                except ValueError:
+                    edge = 0
+                if edge <= 0:
+                    abort(404)
+                try:
+                    got_r = onedrive.get_rendition(photo.onedrive_item_id, edge)
+                except onedrive.OneDriveError:
+                    got_r = None
+                if got_r is None:  # 렌디션을 못 만들면 원본 중계로 조용히 내려간다
+                    return _public(_stream_original(photo))
+                return _public(app.response_class(got_r[0], mimetype=got_r[1]))
+            return _public(_stream_original(photo, want_web_format=True))
+
+        # ---- std 등급 — 이 앱에서 서버가 픽셀을 만지는 **유일한** 자리 ---------
+        # 왜 여기만 남았나: 이 바이트는 네이버 스마트에디터에 **붙여넣는 HTML 의
+        # `<img src>`** 가 가리킨다. 그 경로에는 브라우저가 끼어들 자리가 없어서
+        # (네이버가 URL 을 그대로 가져간다) 잘린 그림이 URL 끝에 있어야 한다.
+        # 대신 **입력을 렌디션으로 바꿔** 12MP 디코드를 없앴다 — 출력 픽셀은 동일.
+        proc_key = (photo_id, crop_str or "", "std")
+        cached = _blog_proc_cache_get(proc_key)
+        if cached is not None:
+            return _public(app.response_class(cached, mimetype="image/jpeg"))
         photo = db.session.get(Photo, photo_id)  # 토큰이 인가 — 커플 불문
         if photo is None:
             abort(404)
-        try:
-            data, ctype = onedrive.get_photo_content_cached(photo.onedrive_item_id)
-        except onedrive.OneDriveError:
-            log.exception("blog-img: 이미지 바이트 조회 실패 photo=%s", photo.id)
-            abort(404)
-        if data is None:
-            abort(404)  # OneDrive에서 사라짐
-        if not ctype or not ctype.startswith("image/"):
-            ctype = _content_type_for(photo.filename or photo.original_name)
         # 크롭 파싱(서명이 이미 검증된 값) — 4개 float, 아니면 크롭 없음.
         crop = None
         if crop_str:
@@ -5270,25 +5806,25 @@ def _register_routes(app: Flask):
                     crop = [float(v) for v in parts]
                 except ValueError:
                     crop = None
-        # 단일 경로: (크롭 →) 다운스케일 → JPEG. HEIC도 여기서 열린다. 실패 시 원본.
-        # hq(네이버 export용): 다운스케일 없이 원본 해상도(EXIF·crop만) + q95.
-        # hq는 서명 대상이 아니라(위 검증은 t/e/c만 대조) 서명된 URL에 &hq=1을
-        # 덧붙여도 그대로 통과한다.
-        if hq:
-            processed = _blog_img_process(data, crop=crop, max_edge=None, quality=95)
-        else:
-            processed = _blog_img_process(
-                data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE, quality=92
+        try:
+            data, src_label, target = _blog_std_source(
+                photo, crop, _BLOG_IMG_MAX_EDGE
             )
+        except onedrive.OneDriveError:
+            log.exception("blog-img: 이미지 바이트 조회 실패 photo=%s", photo.id)
+            abort(404)
+        if data is None:
+            abort(404)  # OneDrive에서 사라짐
+        ctype = _content_type_for(photo.filename or photo.original_name)
+        processed = _blog_img_process(
+            data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE, quality=92,
+            target_size=target,
+        )
         if processed is not None:
+            log.debug("blog-img std photo=%s source=%s", photo.id, src_label)
             data, ctype = processed, "image/jpeg"
             _blog_proc_cache_put(proc_key, processed)  # 가공 성공분만 캐시
-        resp = app.response_class(data, mimetype=ctype)
-        # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
-        resp.headers["Cache-Control"] = "public, max-age=86400"
-        # 네이버 유저스크립트의 cross-origin hq fetch 허용(공개 서명 URL이라 안전).
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
+        return _public(app.response_class(data, mimetype=ctype))
 
     @app.route("/memories/<int:photo_id>/thumb")
     @active_couple_required
@@ -5555,30 +6091,60 @@ def _register_routes(app: Flask):
                 skipped += 1
                 reason = "이미지 파일만 올릴 수 있어."
                 continue
-            # 원본 바이트를 그대로 읽어 그대로 업로드한다 — 재인코딩/리사이즈 없음.
-            data = file.read()
-            if not data:
+            # ⛔ **바이트를 통째로 읽지 않는다.** 예전엔 `file.read()` 로 최대 50MB 를
+            #    파이썬 힙에 올렸다(한 번에 여러 장이면 그만큼 곱절). werkzeug 가 큰
+            #    업로드를 **디스크로 스풀**해 두므로, 그 스트림을 그대로 OneDrive 로
+            #    흘리면 워커 메모리는 사진 크기와 무관하게 평평하다 — 영상 업로드가
+            #    이미 쓰는 길이다(onedrive.upload_stream).
+            stream = file.stream
+            try:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(0)
+            except (OSError, ValueError):
+                size = -1
+            if size == 0:
                 skipped += 1
                 reason = "빈 파일이야."
                 continue
-            if len(data) > _MAX_PHOTO_BYTES:
+            if size > _MAX_PHOTO_BYTES:
                 skipped += 1
                 reason = "사진 1장은 50MB 이하만 올릴 수 있어."
                 continue
-            # EXIF 촬영일시(DateTimeOriginal; HEIC 포함)를 뽑아 둔다 — 빠른 헤더
-            # 읽기라 업로드 경로에서 동기로 한다. 어떤 실패도 업로드를 깨면 안 되므로
-            # 방어적으로 감싼다(헬퍼도 이미 None을 돌려주지만 이중 안전).
+            # EXIF 촬영일시(DateTimeOriginal; HEIC 포함)는 **앞부분 몇십 KB** 안에
+            # 있다(JPEG 는 SOI 바로 뒤 APP1, HEIC 는 meta 박스). 헤더 조각만 읽어
+            # 뽑고, 거기서 못 찾으면 **업로드 뒤 Graph 가 서버에서 읽어 둔 값**
+            # (photo.takenDateTime)으로 메운다 — 바이트를 다시 읽지 않는다.
+            # 어떤 실패도 업로드를 깨면 안 되므로 방어적으로 감싼다.
+            taken = None
             try:
-                taken = exifutil.extract_taken_at(data)
+                head = stream.read(_EXIF_HEAD_BYTES)
+                stream.seek(0)
+                taken = exifutil.extract_taken_at(head)
             except Exception:  # noqa: BLE001 - EXIF 추출은 best-effort
                 taken = None
+                try:
+                    stream.seek(0)
+                except (OSError, ValueError):
+                    pass
             try:
-                item_id, stored_name = onedrive.upload_photo(data, file.filename)
+                item_id, stored_name = onedrive.upload_photo_stream(
+                    stream, size, file.filename
+                )
             except onedrive.OneDriveError:
                 log.exception("OneDrive upload failed for couple %s", u.couple_id)
                 failed += 1
                 reason = "OneDrive 업로드에 실패했어."
                 continue
+            if taken is None:
+                # 헤더 조각에서 못 찾았다 — Graph 가 이미 EXIF 를 읽어 뒀는지 본다
+                # (메타데이터 1KB, 픽셀 0바이트). 예전 구현은 여기서 포기했는데,
+                # 이쪽이 오히려 **더 많이** 채운다.
+                try:
+                    meta = onedrive.get_item_meta(item_id)
+                    taken = (meta or {}).get("taken_at")
+                except Exception:  # noqa: BLE001 - best-effort
+                    taken = None
 
             # A manual caption is treated as final ('ready'); otherwise the row
             # starts 'pending' and a background thread captions it via claude.
@@ -6680,6 +7246,9 @@ def _register_routes(app: Flask):
         # 것과 같은 자리·같은 패턴이다. 산출물은 건드리지 않는다(함수 docstring).
         app_obj = current_app._get_current_object()
         review_resumed = resume_review_if_orphaned(app_obj, review)
+        # 'failed' 도 같은 자리에서 한 번 되살린다 — 같은 사고가 pending/failed 로
+        # 갈리는 비대칭을 없앤다(resume_review_if_failed 머리말).
+        review_resumed = resume_review_if_failed(app_obj, review) or review_resumed
         thumb_resumed = resume_thumbnail_if_orphaned(app_obj, review)
         # 네이버 복사본: 사용자가 편집한 게 있으면 그걸(이제 HTML), 없으면 생성
         # 초안에서 HTML을 조립. edited_text는 이제 HTML을 담는다. 뷰 시점에 이미지
@@ -6712,20 +7281,25 @@ def _register_routes(app: Flask):
                     {
                         "index": i,  # 블록 인덱스(crop-save가 target)
                         "heading": _crop_hint_for_image(blocks, i)[:40],
-                        "img_url": blog_img_url(p),  # 크롭 없는 풀이미지
+                        # 크롭 조정 UI 는 **화면에서 드래그**하는 미리보기다 —
+                        # 원본(수 MB)을 부를 이유가 없다. Graph 렌디션(수백 KB)을
+                        # 중계로 받아 CSS 로 자른 모습을 보여 준다.
+                        "img_url": _variant(blog_img_url(p),
+                                            f"r{_RENDITION_PREVIEW_EDGE}"),
                         "crop": crop,
                     }
                 )
         # 썸네일(Step 4) 재료. 서버는 스펙(template.css에서 읽은 수치)과 사진 URL만
-        # 넘기고, 그림은 브라우저가 그린다. 사진은 hq(원본 해상도)로 받는다 —
-        # 1080×1350 캔버스에 1280px 다운스케일본을 늘려 쓰면 흐려진다.
+        # 넘기고, 그림은 브라우저가 그린다. 사진은 **원본 중계**(v=orig)로 받는다 —
+        # 1080×1350 캔버스에 1280px 다운스케일본을 늘려 쓰면 흐려진다. 예전엔
+        # &hq=1 이 서버에서 원본을 디코드·재인코딩해 줬는데, 그냥 흘려보내면 된다
+        # (화질은 오히려 재인코딩 한 세대가 빠져 더 좋다).
         thumb_photos = []
         for i, p in enumerate(review.photos_ordered):
-            url = blog_img_url(p)
             thumb_photos.append(
                 {
                     "index": i,
-                    "url": url + ("&" if "?" in url else "?") + "hq=1",
+                    "url": _variant(blog_img_url(p), "orig"),
                     "name": (p.caption or p.original_name or f"사진 {i + 1}")[:40],
                 }
             )
@@ -6754,6 +7328,7 @@ def _register_routes(app: Flask):
             copy_html=copy_html,
             crop_sections=crop_sections,
             doc_data=doc_data,
+            export_images=_export_images,
             thumb=review.thumbnail,
             thumb_spec=thumbnail.spec(),
             thumb_photos=thumb_photos,
@@ -7060,14 +7635,13 @@ def _register_routes(app: Flask):
             return _fail("크롭이 이미지 밖으로 나갔어.", 400)
 
         # 픽셀 비율 검증(사진 크기를 알 수 있을 때만 — onedrive 조회 실패 시 관대).
+        # ⛔ 크기 두 개를 알자고 3MB 원본을 받지 않는다 — 메타데이터면 충분하다
+        #    (_crop_vision_dims: 렌디션 메타 → image 패싯, 둘 다 픽셀 0바이트).
         try:
             pi = blocks[idx].get("photo_index")
             photos_ordered = review.photos_ordered
             if isinstance(pi, int) and 0 <= pi < len(photos_ordered):
-                pdata, _c = onedrive.get_photo_content_cached(
-                    photos_ordered[pi].onedrive_item_id
-                )
-                dims = _image_display_size(pdata) if pdata else None
+                dims = _crop_vision_dims(photos_ordered[pi])
             else:
                 dims = None
         except Exception:  # noqa: BLE001 — 크기 조회 실패는 관대(경계 검증은 이미 통과)

@@ -21,25 +21,18 @@
     preloaded[url] = im;
   }
 
-  // Near-viewport prefetch of each ORIGINAL so tapping opens instantly, without
-  // eagerly loading every full image at once.
-  if ("IntersectionObserver" in window) {
-    var io = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (e.isIntersecting) {
-          preload(e.target.getAttribute("data-full"));
-          io.unobserve(e.target);
-        }
-      });
-    }, { rootMargin: "300px" });
-    openers.forEach(function (el) { io.observe(el); });
-  } else {
-    openers.forEach(function (el) { preload(el.getAttribute("data-full")); });
-  }
-  // Belt & suspenders: also prefetch on pointer-down (instant on tap).
+  // ⛔ **화면에 보이는 사진의 원본을 미리 받지 않는다.**
+  // 예전엔 IntersectionObserver 로 뷰포트 근처(300px) 사진의 **원본을 전부** 당겨
+  // 왔다. 한 장이 3MB 이고 그리드에 20장이면 아무것도 안 눌러도 60MB 를 우리 프록시로
+  // 흘린 셈이다 — 0.1 CPU 워커에서 그게 곧 그리드가 버벅이는 이유였다(그리드가 쓰는
+  // 썸네일 요청들과 같은 줄에 선다). 원본은 '열겠다는 신호'가 왔을 때만 받는다:
+  //   * 포인터가 올라오거나(hover/pointerdown) — 탭 전에 미리 시작된다
+  //   * 라이트박스를 열면 그 **양옆** 한 장씩(스와이프 대비)
+  // 그 전까지 화면은 이미 받아 둔 썸네일만 쓴다.
+  function preloadOn(el) { preload(el.getAttribute("data-full")); }
   openers.forEach(function (el) {
-    el.addEventListener("pointerdown", function () {
-      preload(el.getAttribute("data-full"));
+    ["pointerdown", "pointerenter", "focus"].forEach(function (ev) {
+      el.addEventListener(ev, function () { preloadOn(el); }, { once: true });
     });
   });
 
@@ -51,7 +44,31 @@
 
   function openAt(idx) {
     var el = openers[idx];
-    lbImg.src = el.getAttribute("data-full");
+    // 즉시 보이기 — 그리드가 이미 받아 둔 **썸네일을 placeholder 로** 먼저 깔고
+    // (네트워크 0, 브라우저 캐시 히트), 원본이 도착하면 바꿔 끼운다. 최종 픽셀은
+    // 예전과 **완전히 같다** — 달라지는 건 '빈 화면을 보는 시간'뿐이다.
+    var full = el.getAttribute("data-full");
+    var thumb = el.getAttribute("data-thumb");
+    var warm = preloaded[full];
+    if (warm && warm.complete && warm.naturalWidth > 0) {
+      lbImg.classList.remove("lb-placeholder");
+      lbImg.src = full;
+    } else {
+      if (thumb) {
+        lbImg.src = thumb;
+        lbImg.classList.add("lb-placeholder");
+      }
+      var hi = new Image();
+      hi.onload = function () {
+        // 그 사이 다른 사진으로 넘어갔으면 덮어쓰지 않는다.
+        if (lbImg.getAttribute("data-want") !== full) return;
+        lbImg.classList.remove("lb-placeholder");
+        lbImg.src = full;
+      };
+      hi.src = full;
+      preloaded[full] = hi;
+    }
+    lbImg.setAttribute("data-want", full);
     var cap = el.getAttribute("data-caption") || "";
     if (cap) { lbCap.textContent = cap; lbCap.hidden = false; }
     else { lbCap.hidden = true; }

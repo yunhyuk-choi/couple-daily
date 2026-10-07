@@ -44,11 +44,13 @@ def spawned(monkeypatch):
     monkeypatch.setattr(app_module, "_spawn_recommend_if_idle",
                         lambda app, cid: calls["reco"].append(cid))
     app_module._generating_reviews.clear()
+    app_module._refailed_reviews.clear()   # 'failed 자동 1회 재시도' 가드
     app_module._thumbing_reviews.clear()
     app_module._judging.clear()
     app_module._recommending.clear()
     yield calls
     app_module._generating_reviews.clear()
+    app_module._refailed_reviews.clear()   # 'failed 자동 1회 재시도' 가드
     app_module._thumbing_reviews.clear()
     app_module._judging.clear()
     app_module._recommending.clear()
@@ -160,6 +162,79 @@ def test_detail_page_resumes_and_says_what_happened(client, make_review, spawned
     assert "중단된 것 같아" in html
     assert "다시 생성" in html
     assert f"/reviews/{review.id}/regenerate" in html
+
+
+# --------------------------------------------------------------------------- #
+# 'failed' 로 끝난 초안도 한 번은 되살아난다 — 같은 사고가 pending/failed 로
+# 갈리는 **비대칭**을 없앤다.
+#
+# 2026-10-07 에 후기 두 건이 같은 원인(메모리 초과)으로 멈췄는데 결과가 달랐다.
+# 리눅스 OOM 킬러는 cgroup 에서 가장 큰 프로세스를 고르는데, 이 앱에서 그건 보통
+# `claude`(Node, 실측 ~400MB)지 gunicorn 워커(~95MB)가 아니다:
+#   * 워커째 죽으면 → 행이 pending 으로 남고 고아 복구가 되살린다(사용자가 본 쪽).
+#   * claude 자식만 죽으면 → `_run_claude` 가 "exited -9" 로 raise → write_review 가
+#     None → prior 없음 → **failed 로 종결**. 자동 복구 경로가 없었다(남은 쪽).
+# --------------------------------------------------------------------------- #
+def test_a_failed_draft_is_retried_once_when_the_page_is_opened(
+        client, make_review, spawned):
+    review = make_review(status="failed")
+    html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
+    assert spawned["review"] == [review.id], "실패한 초안을 다시 돌리지 않았다"
+    db.session.refresh(review)
+    assert review.status == "pending"
+    assert "다시 시작했어" in html
+
+
+def test_a_failed_draft_is_not_retried_in_a_loop(client, make_review, spawned):
+    """한 프로세스에서 **한 번만** — 영영 안 되는 초안으로 claude 를 돌리지 않는다."""
+    review = make_review(status="failed")
+    client.get(f"/reviews/{review.id}")
+    review.status = "failed"            # 재시도도 실패했다고 치자
+    db.session.commit()
+    html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
+    assert spawned["review"] == [review.id], "같은 행을 두 번 돌렸다"
+    db.session.refresh(review)
+    assert review.status == "failed"
+    assert "다시 생성" in html, "자동 재시도를 멈췄으면 사람 탈출구가 있어야 한다"
+
+
+def test_retrying_a_failed_draft_keeps_everything(client, make_review, spawned):
+    """자동 재시도는 ``resume_review_if_orphaned`` 와 같은 규율 — 아무것도 안 지운다."""
+    review = make_review(status="failed", edited_text="<p>사람이 고친 본문</p>",
+                         research_json='{"status":"ok"}')
+    client.get(f"/reviews/{review.id}")
+    db.session.refresh(review)
+    assert review.edited_text == "<p>사람이 고친 본문</p>"
+    assert review.research_json == '{"status":"ok"}'
+
+
+def test_the_draft_is_committed_before_the_long_crop_pass(
+        client, make_review, monkeypatch, flask_app):
+    """본문이 나오면 **크롭 전에** 커밋한다 — 크롭 중 죽어도 120초가 안 날아간다.
+
+    크롭 단계는 사진마다 claude 비전 콜이라 이 작업에서 가장 긴 구간이다.
+    """
+    import ai
+    review = make_review(status="pending")
+    seen = {}
+
+    monkeypatch.setattr(ai, "write_review",
+                        lambda *a, **k: {"title": "t", "blocks": []})
+    monkeypatch.setattr(app_module.keyword_research, "research",
+                        lambda *a, **k: {"status": "skipped"})
+
+    def _crops(result, photos):
+        # 크롭 단계에 들어온 '그 순간' 행이 어떤 상태인지 본다.
+        row = db.session.get(type(review), review.id)
+        seen["status_during_crops"] = row.status
+        seen["ai_during_crops"] = bool(row.ai_json)
+
+    monkeypatch.setattr(app_module, "_attach_section_crops", _crops)
+    app_module.generate_review(flask_app, review.id)
+    assert seen.get("status_during_crops") == "ready", (
+        "크롭이 도는 동안 본문이 아직 커밋되지 않았다"
+    )
+    assert seen.get("ai_during_crops") is True
 
 
 def test_detail_page_of_a_live_generation_still_just_waits(client, make_review,

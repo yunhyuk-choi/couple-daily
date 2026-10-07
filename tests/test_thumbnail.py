@@ -538,7 +538,10 @@ def test_the_first_attached_photo_is_the_default_background(
     # 셀렉트의 0번(첫 사진)이 선택돼 있고, 앱이 이미 쓰는 서명 URL 을 그대로 쓴다.
     assert 'value="0"' in html and "selected" in html
     assert f"/blog-img/{first.id}?" in html
-    assert "hq=1" in html                  # 1080×1350 에 쓰려면 원본 해상도
+    # 1080×1350 캔버스에 쓰려면 원본 해상도여야 한다. 예전엔 `hq=1`(서버가 원본을
+    # 디코드·재인코딩)이었고, 지금은 `v=orig`(서버가 **열지 않고 중계**)다 —
+    # 해상도는 같고 재인코딩 한 세대가 빠졌다.
+    assert "v=orig" in html
 
 
 def test_a_photoless_review_falls_back_to_a_flat_background(

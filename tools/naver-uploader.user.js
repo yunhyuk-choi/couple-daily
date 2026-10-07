@@ -55,6 +55,53 @@
   var __cdSeenXO = {};
   function diagOnce(key, msg) { if (__cdSeenXO[key]) return; __cdSeenXO[key] = true; diag(msg); }
 
+  // --------- 발행용 크롭 (브라우저가 굽는다) ---------
+  // ⛔ 정본은 앱의 `static/imagecrop.js` 다. 여기 사본이 있는 이유는 **네이버 페이지의
+  //    CSP 가 우리 오리진 스크립트 로드를 막기 때문**이고, 그래서 꼭 필요한 함수
+  //    하나만 옮겼다. 규율(EXIF 방향 적용 · 순차 처리 · 크롭 없으면 원본 그대로 ·
+  //    q0.95)은 그쪽 머리말이 단일 원천이다 — 고칠 일이 생기면 양쪽을 같이 고친다.
+  var CROP_JPEG_QUALITY = 0.95;
+
+  function decodeImage(blob) {
+    if (typeof createImageBitmap === 'function') {
+      try {
+        return createImageBitmap(blob, { imageOrientation: 'from-image' })
+          .catch(function () { return decodeViaImgEl(blob); });
+      } catch (e) {}
+    }
+    return decodeViaImgEl(blob);
+  }
+
+  function decodeViaImgEl(blob) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('decode fail')); };
+      img.src = URL.createObjectURL(blob);
+    });
+  }
+
+  function cropToBlob(blob, crop) {
+    return decodeImage(blob).then(function (src) {
+      var W = src.width || src.naturalWidth, H = src.height || src.naturalHeight;
+      if (!W || !H) throw new Error('size fail');
+      var sx = Math.max(0, Math.min(W - 1, Math.round(+crop[0] * W)));
+      var sy = Math.max(0, Math.min(H - 1, Math.round(+crop[1] * H)));
+      var sw = Math.max(1, Math.min(W - sx, Math.round(+crop[2] * W)));
+      var sh = Math.max(1, Math.min(H - sy, Math.round(+crop[3] * H)));
+      var cv = document.createElement('canvas');
+      cv.width = sw; cv.height = sh;
+      cv.getContext('2d').drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+      if (src.close) { try { src.close(); } catch (e) {} }
+      return new Promise(function (resolve, reject) {
+        cv.toBlob(function (out) {
+          cv.width = cv.height = 0;
+          out ? resolve(out) : reject(new Error('encode fail'));
+        }, 'image/jpeg', CROP_JPEG_QUALITY);
+      });
+    });
+  }
+
   // --------- 캡처 상태 ---------
   function extractSessionKey(text) {
     if (!text) return null;
@@ -1472,28 +1519,40 @@
 
         function proceed(ctx) {
           var win = ctx.win, Sm = ctx.Sm, ed = ctx.ed;
-          // 이미지 바이트는 hq(원본)로 받아 '에디터 렐름' File로 만든다(cross-realm 안전).
+          // 이미지 바이트는 **자르지 않은 원본**(v=orig)으로 받아 **여기서 자른다** —
+          // 앱 서버는 픽셀을 만지지 않는다(원본에서 자르므로 화질도 더 좋다).
+          // 잘린 결과를 '에디터 렐름' File로 만든다(cross-realm 안전).
           var RB = (win && win.Blob) || Blob;
           var RF = (win && win.File) || File;
           if (!images.length) { runCore(u, win, Sm, ed, doc, [], []); return; }
-          setStatus(u, '자동 업로드 중… (이미지 받는 중 0/' + images.length + ')');
-          var got = 0;
-          var jobs = images.map(function (im, i) {
+          // ⚠️ 한 장씩 순차로 — 12MP 캔버스 한 장이 48MB라, 여러 장을 동시에 올리면
+          //    폰 탭이 죽는다. 그래서 Promise.all 이 아니라 체인이다(진행률도 정직해진다).
+          var files = [], fileSrcs = [];
+          function step(i) {
+            if (i >= images.length) return Promise.resolve();
+            var im = images[i];
+            setStatus(u, '자동 업로드 중… (사진 받는 중 ' + (i + 1) + '/' + images.length + ')');
             return fetch(im.url, { cache: 'no-store' })
-              .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.arrayBuffer(); })
-              .then(function (buf) {
-                var blob = new RB([buf], { type: 'image/jpeg' });
-                var f;
-                try { f = new RF([blob], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
-                catch (e) { f = blob; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
-                got++; setStatus(u, '자동 업로드 중… (이미지 받는 중 ' + got + '/' + images.length + ')');
-                return { f: f, src: im.src };
+              .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.blob(); })
+              .then(function (blob) {
+                if (!im.crop) return blob;   // 자를 게 없으면 원본 그대로(재인코딩 0회)
+                setStatus(u, '자동 업로드 중… (자르는 중 ' + (i + 1) + '/' + images.length + ')');
+                return cropToBlob(blob, im.crop);
+              })
+              .then(function (blob) {
+                // 에디터 렐름의 Blob/File 로 다시 감싼다.
+                return blob.arrayBuffer().then(function (buf) {
+                  var rb = new RB([buf], { type: 'image/jpeg' });
+                  var f;
+                  try { f = new RF([rb], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
+                  catch (e) { f = rb; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
+                  files.push(f); fileSrcs.push(im.src);
+                  return step(i + 1);
+                });
               });
-          });
-          Promise.all(jobs).then(function (arr) {
-            var files = [], fileSrcs = [];
-            arr.forEach(function (o) { files.push(o.f); fileSrcs.push(o.src); });
-            diag('자동: 이미지 ' + files.length + '장 준비 → 업로드');
+          }
+          step(0).then(function () {
+            diag('자동: 이미지 ' + files.length + '장 준비(브라우저 크롭) → 업로드');
             runCore(u, win, Sm, ed, doc, files, fileSrcs);
           }).catch(function (e) {
             diag('자동 이미지 준비 실패: ' + (e && e.message ? e.message : e) + ' — 붙여넣기 모드');
