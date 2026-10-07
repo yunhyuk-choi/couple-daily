@@ -50,7 +50,11 @@ def main():
         print("-" * 52)
         for r in out["renditions"]:
             if not r["ok"]:
-                got, size = "(거부/없음)", "-"
+                # 거부인지 **고장**인지 구분해 말한다 — 2026-10-07 운영 500 처럼
+                # Graph 가 200 으로 JSON 아닌 것을 돌려주는 경우가 실제로 있다.
+                got = (f"실패:{r['error'][:40]}" if r.get("error")
+                       else "(거부/없음)")
+                size = "-"
             else:
                 got = f"{r['width']}x{r['height']}"
                 size = (f"{r['bytes'] / 1024:.0f}KB" if r["bytes"] else "-")

@@ -538,38 +538,45 @@ def _blog_std_source(photo, crop, max_edge):
     ``target_size`` 는 **원본에서 만들었다면 나왔을 출력 크기**다(렌디션일 때만).
     크롭 박스의 픽셀 반올림이 소스 해상도에 따라 달라져 결과가 1px 어긋나는 것을
     막는다 — 실측으로 잡은 차이다(1280x960 vs 1280x961).
+
+    ⛔ **렌디션 경로의 어떤 실패도 여기서 끝난다.** 2026-10-07 운영 500 의 교훈:
+    ``onedrive.get_rendition`` 안에서 ``requests`` 의 ``JSONDecodeError`` 가 새어
+    나왔고, 이 자리의 ``except onedrive.OneDriveError`` 가 그걸 못 잡아 **설계돼
+    있던 원본 폴백에 영영 닿지 못한 채** 500 이 됐다. 폴백이 정상 경로라면, 그
+    폴백으로 가는 길은 **예외 종류에 의존하면 안 된다.**
     """
     item_id = photo.onedrive_item_id
-    meta = None
-    if _BLOG_STD_SOURCE == "rendition":
-        try:
-            meta = onedrive.get_item_meta(item_id)
-        except onedrive.OneDriveError:
-            log.debug("blog-img: 아이템 메타 조회 실패 — 원본 경로로 간다",
-                      exc_info=True)
-    if meta and meta.get("width") and meta.get("height"):
-        need = _rendition_long_edge_for(meta["width"], meta["height"], crop,
-                                        max_edge)
-        full = max(meta["width"], meta["height"])
-        if need and need < full:
+    try:
+        meta = None
+        if _BLOG_STD_SOURCE == "rendition":
             try:
+                meta = onedrive.get_item_meta(item_id)
+            except Exception:  # noqa: BLE001 — 메타를 못 얻으면 원본 경로로
+                log.warning("blog-img: 아이템 메타 조회 실패 — 원본 경로로 간다",
+                            exc_info=True)
+        if meta and meta.get("width") and meta.get("height"):
+            need = _rendition_long_edge_for(meta["width"], meta["height"], crop,
+                                            max_edge)
+            full = max(meta["width"], meta["height"])
+            if need and need < full:
                 got = onedrive.get_rendition(item_id, need, min_long_edge=need)
-            except onedrive.OneDriveError:
-                got = None
-            if got:
-                rw, rh = got[2]
-                mw, mh = meta["width"], meta["height"]
-                # ``image`` 패싯은 EXIF 회전 전일 수 있다. 렌디션은 이미 똑바로
-                # 서 있으므로, 둘의 방향이 다르면 원본 표시 크기는 뒤집힌 쪽이다.
-                if (rw > rh) != (mw > mh) and rw != rh and mw != mh:
-                    mw, mh = mh, mw
-                if crop:
-                    left, top, right, bottom = _crop_box_px(mw, mh, crop)
-                    cw, ch = right - left, bottom - top
-                else:
-                    cw, ch = mw, mh
-                target = _thumbnail_size(cw, ch, max_edge)
-                return got[0], f"rendition c{need} ({rw}x{rh})", target
+                if got:
+                    rw, rh = got[2]
+                    mw, mh = meta["width"], meta["height"]
+                    # ``image`` 패싯은 EXIF 회전 전일 수 있다. 렌디션은 이미 똑바로
+                    # 서 있으므로, 둘의 방향이 다르면 원본 표시 크기는 뒤집힌 쪽이다.
+                    if (rw > rh) != (mw > mh) and rw != rh and mw != mh:
+                        mw, mh = mh, mw
+                    if crop:
+                        left, top, right, bottom = _crop_box_px(mw, mh, crop)
+                        cw, ch = right - left, bottom - top
+                    else:
+                        cw, ch = mw, mh
+                    target = _thumbnail_size(cw, ch, max_edge)
+                    return got[0], f"rendition c{need} ({rw}x{rh})", target
+    except Exception:  # noqa: BLE001 — 렌디션은 **최적화**지 전제가 아니다
+        log.warning("blog-img: 렌디션 경로 실패 — 원본으로 폴백 (photo=%s)",
+                    getattr(photo, "id", "?"), exc_info=True)
     data, _ctype = onedrive.get_photo_content_cached(item_id)
     return data, "original", None
 
@@ -3816,7 +3823,10 @@ def blog_std_bytes(photo_id, crop_str):
                 crop = None
     try:
         data, src_label, target = _blog_std_source(photo, crop, _BLOG_IMG_MAX_EDGE)
-    except onedrive.OneDriveError:
+    except Exception:  # noqa: BLE001 — **이미지 서빙은 500 을 내지 않는다**
+        # 예전엔 ``except onedrive.OneDriveError`` 였다. 그 좁은 그물 사이로
+        # ``requests.exceptions.JSONDecodeError`` 가 빠져나가 운영에서 500 이 났다
+        # (본문 이미지 전부 엑박). 조용히 삼키지는 않는다 — 스택을 남긴다.
         log.exception("blog-img: 이미지 바이트 조회 실패 photo=%s", photo.id)
         return None
     if data is None:
@@ -6424,7 +6434,15 @@ def _register_routes(app: Flask):
         # `<img src>`** 가 가리킨다. 그 경로에는 브라우저가 끼어들 자리가 없어서
         # (네이버가 URL 을 그대로 가져간다) 잘린 그림이 URL 끝에 있어야 한다.
         # 대신 **입력을 렌디션으로 바꿔** 12MP 디코드를 없앴다 — 출력 픽셀은 동일.
-        got_std = blog_std_bytes(photo_id, crop_str)
+        # 마지막 그물 — 이 라우트는 **어떤 경우에도 500 을 내지 않는다.**
+        # 못 만들면 404(존재 누설 없는 실패)지, 에러 페이지가 아니다. 원인은
+        # 로그에 스택으로 남는다(조용한 실패 금지).
+        try:
+            got_std = blog_std_bytes(photo_id, crop_str)
+        except Exception:  # noqa: BLE001
+            log.exception("blog-img: std 서빙 실패 photo=%s crop=%s",
+                          photo_id, crop_str)
+            got_std = None
         if got_std is None:
             abort(404)
         data, ctype = got_std
