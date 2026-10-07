@@ -221,9 +221,21 @@ def generate_daily_question(recent_pairs, past_questions=None):
         raise ValueError("empty question field")
     except Exception as e:  # noqa: BLE001 — degrade gracefully
         print(f"[ai] daily question generation failed: {e}", file=sys.stderr)
-        # Deterministic-ish fallback: rotate by history length.
-        idx = len(recent_pairs) % len(FALLBACK_QUESTIONS)
-        return FALLBACK_QUESTIONS[idx], "fallback"
+        return fallback_daily_question(recent_pairs)
+
+
+def fallback_daily_question(recent_pairs):
+    """claude 를 **돌리지 않고** 고르는 '오늘의 질문' — ``(text, 'fallback')``.
+
+    ``generate_daily_question`` 의 실패 폴백과 **같은 선택 규칙**(히스토리 길이로
+    로테이션)을 쓰는 단일 원천. 호출부는 둘이다:
+      * 위 generate_daily_question 의 예외 폴백(claude 가 실패했을 때)
+      * ``app.get_or_create_today_question`` 이 claude 슬롯을 못 잡았을 때 —
+        그 경우 백그라운드가 나중에 개인화 질문으로 올려준다(기능 유지).
+    """
+    # Deterministic-ish fallback: rotate by history length.
+    idx = len(recent_pairs) % len(FALLBACK_QUESTIONS)
+    return FALLBACK_QUESTIONS[idx], "fallback"
 
 
 # ---------------------------------------------------------------------------

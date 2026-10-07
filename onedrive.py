@@ -26,6 +26,7 @@ from datetime import datetime
 
 import requests
 
+import bytecache
 from models import Setting, db
 
 log = logging.getLogger(__name__)
@@ -56,15 +57,24 @@ _reconnect_needed = False
 # the fetched BYTES (not a download URL): personal-OneDrive pre-auth download
 # URLs expire very quickly, so a cached URL would 401 — but cached bytes are
 # always a valid response. Kept brief; the browser also caches via Cache-Control.
+#
+# ⚠️ **이 캐시도 RAM 이 아니라 디스크에 산다**(app 의 가공완료 캐시와 같은 장치 —
+# bytecache.DiskByteCache 머리말이 근거의 단일 원천). 옛 상한은 "memory can't grow
+# unbounded" 라고 적힌 **개수 64개** 였는데 실제로는 아무것도 묶지 못했다 — 실측
+# 아이폰 12MP 원본 한 장이 3.03MB 라 64개면 **197MB 상주**다. 거기에 `claude -p`
+# 한 개가 실측 약 400MB 라, 이 캐시 하나가 512MB 티어를 넘기는 데 충분했다.
+# 담는 양을 줄이는 대신 자리를 옮겼다: 예산 96MB(그런 원본 ~31장, 옛 64개와 같은
+# 급의 용량)를 디스크에 두고 **상주 RAM 은 0** 이다.
 _BYTES_CACHE_TTL = 1800  # seconds
-# ⚠️ 상한은 **개수가 아니라 바이트**다. 옛 상한(64개)은 "memory can't grow unbounded"
-# 라고 적혀 있었지만 실제로는 아무것도 묶지 못했다 — 실측: 아이폰 12MP 원본 한 장이
-# 3.03MB 라 64개면 **197MB** 가 상주한다. 512MB 티어에서 `claude -p` 가 ~265MB,
-# 파이썬 워커가 ~100MB 를 쓰므로 이 캐시 하나로 한도를 넘긴다(2026-10-07 OOM 사고의
-# 지분). 예산 16MB = 그런 원본 약 5장 — "refetch storm 을 흡수한다"는 이 캐시의
-# 목적(짧은 TTL)에는 충분하고, 갤러리 그리드는 아래 썸네일 캐시가 따로 받친다.
-_BYTES_CACHE_BUDGET = 16 * 1024 * 1024
-_bytes_cache: dict[str, tuple[bytes, str, float]] = {}
+_BYTES_CACHE_BUDGET = 96 * 1024 * 1024
+_bytes_cache = bytecache.DiskByteCache(
+    "onedrive-bytes", ttl=_BYTES_CACHE_TTL, budget=_BYTES_CACHE_BUDGET,
+    directory=os.environ.get("ONEDRIVE_BYTES_CACHE_DIR"),
+)
+# 바이트는 디스크에, Content-Type 문자열만 여기에. 항목당 수십 바이트라 메모리
+# 사고와 무관하다(상한은 폭주 방지용이고, 넘치면 통째로 비운다 — 재조회는 값싸다).
+_BYTES_CTYPE_MAX = 4096
+_bytes_ctype: dict[str, str] = {}
 
 # per-(item,size) THUMBNAIL-BYTES cache for the gallery grid. Thumbnails are
 # tiny (a few KB), so we can cache more of them and for longer than full bytes.
@@ -315,31 +325,26 @@ def get_photo_content(item_id: str):
 
 
 def get_photo_content_cached(item_id: str):
-    """``get_photo_content`` with a brief in-process BYTES cache.
+    """``get_photo_content`` with a brief BYTES cache (on **disk**, not in RAM).
 
     Avoids refetch storms (e.g. a reload before the browser cache warms) without
     ever serving an expired URL — the cached value is the decoded bytes, always
-    valid. TTL is short and the cache is size-capped. Returns ``(bytes, ctype)``
-    or ``(None, None)`` if the item is gone.
+    valid. Returns ``(bytes, ctype)`` or ``(None, None)`` if the item is gone.
+
+    바이트는 디스크에, Content-Type 문자열만 **아주 작은** RAM 사이드 테이블에
+    둔다(항목당 수십 바이트). ctype 을 잃어도 호출부가 파일명으로 되돌릴 수 있게
+    설계돼 있지만, 서버가 준 값을 그대로 쓰는 편이 정확하다.
     """
-    now = time.time()
     hit = _bytes_cache.get(item_id)
-    if hit and now < hit[2]:
-        return hit[0], hit[1]
+    if hit is not None:
+        return hit, _bytes_ctype.get(item_id) or None
     data, ctype = get_photo_content(item_id)
     if data:
-        # 만료분을 버리고 **바이트 예산** 안으로 축출한 뒤 넣는다. 한 장이 예산보다
-        # 크면 아예 캐시하지 않는다(그 한 장이 캐시를 비우고 눌러앉지 않게) — 그런
-        # 사진은 매번 다시 받을 뿐 기능은 그대로다.
-        size = len(data)
-        if size <= _BYTES_CACHE_BUDGET:
-            for k in [k for k, v in _bytes_cache.items() if v[2] <= now]:
-                _bytes_cache.pop(k, None)
-            total = sum(len(v[0]) for v in _bytes_cache.values()) + size
-            while _bytes_cache and total > _BYTES_CACHE_BUDGET:
-                oldest = min(_bytes_cache, key=lambda k: _bytes_cache[k][2])
-                total -= len(_bytes_cache.pop(oldest)[0])
-            _bytes_cache[item_id] = (data, ctype or "", now + _BYTES_CACHE_TTL)
+        _bytes_cache.put(item_id, data)
+        if ctype:
+            if len(_bytes_ctype) >= _BYTES_CTYPE_MAX:
+                _bytes_ctype.clear()  # 문자열 테이블이라 통째로 비워도 싸다
+            _bytes_ctype[item_id] = ctype
     return data, ctype
 
 
@@ -398,7 +403,8 @@ def get_thumbnail(item_id: str, size: str = "medium"):
 
 def delete_photo(item_id: str):
     """Delete an item from OneDrive. A 404 (already gone) counts as success."""
-    _bytes_cache.pop(item_id, None)
+    _bytes_cache.delete(item_id)
+    _bytes_ctype.pop(item_id, None)
     for k in [k for k in _thumb_cache if k[0] == item_id]:
         _thumb_cache.pop(k, None)
     try:

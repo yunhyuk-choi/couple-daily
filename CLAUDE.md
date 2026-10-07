@@ -53,29 +53,74 @@
   `_STUCK_REVIEW`=25분, 단발 콜짜리는 `_STUCK_GENERATING`=5분). 회귀 테스트는
   `tests/test_stuck_recovery.py`.
 
-## ⛔ 512MB 안에서의 이미지 메모리 규율 (실측)
+## ⛔ 512MB 규율 — 실측으로 밝힌 것들 (2026-10-07 OOM)
 
-Render 무료티어는 **512MB 한 칸**에 파이썬 워커(~100MB) + `claude -p`(~265MB)가 같이 산다.
-남는 건 ~145MB뿐이라, 이미지 경로의 '무심한' 한 줄이 그대로 OOM이다. 실측치
-(3.03MB · 3024×4032 아이폰 원본, RSS 봉우리):
+Render 무료티어는 **512MB 한 칸**에 파이썬 워커 + `claude -p` 가 같이 산다. 실측:
+
+| 무엇 | 실측 |
+|---|---|
+| 파이썬 워커(부팅 직후, 실서버 프로세스) | **95 MB** |
+| `claude -p` **한 개** | **약 400 MB** (앱과 같은 argv·stdin. 넉넉한 머신 기준 상한 — 컨테이너에선 V8 힙이 작게 잡혀 더 낮지만, **둘이면 512MB 를 넘는다**는 결론은 같다) |
+
+### 1. ⛔ claude 는 **절대 둘이 동시에 뜨지 않는다** (가장 큰 범인)
+
+`_CAPTION_SEM`(기본 1)은 '캡션용'이 아니라 **이 앱의 모든 claude 호출이 지나야 하는 단
+하나의 문**이다. 사고 직전까지 이 문을 **안 지나는 호출이 셋** 있었다 — 월간 회고
+(`/answer` 마다 트리거)·판결(버튼)·오늘의 질문(요청 경로). 신규 기능(키워드 조사→썸네일
+→GIF)이 들어오며 후기 초안이 문을 쥐는 시간이 ~20초 → **170초+** 로 늘자, 그 위에 셋 중
+하나가 겹칠 확률이 같이 뛰었다. **새 claude 호출을 추가할 때는 반드시 이 문을 지나게 할 것.**
+
+요청 경로(`get_or_create_today_question`)만 특별 취급한다: 무한 대기는 gunicorn
+`--timeout 180` 에 걸리므로 `_QUESTION_SLOT_WAIT`(15s)만 기다리고, 못 잡으면 claude 를
+돌리지 않고 폴백 질문으로 즉시 응답한 뒤 **백그라운드가 개인화 질문으로 올려준다**
+(`upgrade_daily_question`, 아무도 답하지 않았을 때만). 기능을 깎지 않으려는 장치다.
+
+### 2. 바이트 캐시는 **RAM 이 아니라 디스크**에 둔다 (`bytecache.DiskByteCache`)
+
+개수 상한은 메모리를 전혀 묶지 못한다 — 엔트리 크기가 5배 넘게 들쭉날쭉하기 때문이다.
+그렇다고 개수를 줄이면 기능이 깎인다. 그래서 **담는 양을 줄이는 대신 자리를 옮겼다**:
+
+| 캐시 | 전(RAM 상주) | 후 | 용량 |
+|---|---|---|---|
+| `app._blog_proc_cache` (가공완료 JPEG) | 최악 **656MB**(200개 × hq 3.28MB) | **0** (디스크 128MB) | std ~217장 / hq ~39장 |
+| `onedrive._bytes_cache` (원본) | **197MB**(64개 × 3.03MB) | **0** (디스크 96MB) | 원본 ~31장 |
+| `onedrive._thumb_cache` (썸네일) | 0.83MB(192개) | 그대로 | 엔트리 균일·작음 — 무죄 |
+
+Render 의 ephemeral 저장소는 tmpfs 가 아니라 **disk** 다(캡션 임시 이미지도 이미 파일로
+쓴다). 히트 비용은 OneDrive 왕복 + 재인코딩(수 초) → 로컬 파일 read(수 ms)로 **더 싸졌다.**
+디스크를 못 쓰는 환경에서는 조용히 '항상 미스'로 동작한다.
+
+### 3. 이미지는 **필요한 만큼만** 디코드한다
 
 | 무엇 | 전 | 후 | 비고 |
 |---|---|---|---|
-| `_blog_img_process` hq(원본·q95) | 143MB | **50MB** | 전체 사본 2개 제거, 출력 바이트 동일 |
+| `_image_display_size` (후기 생성 중 사진마다) | **90.9MB** | **0.0MB** | 크기 두 개 알려고 전체 디코드하던 것 → `size` + EXIF 태그 274. 방향 8종에서 같은 값 확인 |
+| `_blog_img_process` hq(원본·q95) | 143MB | **50MB** | 전체 사본 2개 제거 — 출력 **바이트 동일** |
 | `_blog_img_process` std(1280·q92) | 112MB | **66MB** | 〃 |
-| `onedrive._bytes_cache` 상주 | 197MB(64개) | **≤16MB** | 개수 → **바이트 예산** |
-| `app._blog_proc_cache` 상주 | 최악 656MB(200개) | **≤48MB** | 〃 (hq 엔트리 3.28MB) |
-| `onedrive._thumb_cache` 상주 | 0.83MB(192개) | 그대로 | 엔트리 균일·작음 — 무죄 |
-| `/videos/<id>/stream` 50MB 중계 | +0.02MB | 그대로 | 제너레이터 — 무죄 |
+| `_heic_to_jpeg` | 100MB | **85MB** | 〃 |
 
-- **바이트 캐시의 상한은 개수가 아니라 바이트다.** 엔트리 크기가 수 배~수십 배 들쭉날쭉한
-  캐시(사진 원본·가공본)에 개수 상한을 걸면 아무것도 묶이지 않는다.
-- **Pillow 는 `exif_transpose(img)` 와 `convert("RGB")` 가 각각 전체 사본을 만든다.**
-  12MP 한 장의 RGB 버퍼가 ~36MB다 — 반드시 `_exif_upright()` / `_as_rgb()` 를 쓴다.
-- 아직 안 고친 것: `/memories/upload` 는 사진을 `file.read()` 로 통째로 올린다(상한 50MB).
-  영상처럼 `onedrive.upload_stream` 으로 돌리는 게 맞지만 EXIF·캡션이 바이트를 필요로 해
-  함께 손봐야 한다.
-- 회귀 테스트는 `tests/test_image_memory.py`.
+**Pillow 는 `exif_transpose(img)` 와 `convert("RGB")` 가 각각 전체 사본을 만든다**(12MP 한
+장의 RGB 버퍼가 ~36MB). 반드시 `_exif_upright()` / `_as_rgb()` 를 쓴다.
+
+### 4. 무죄 확인 (실서버 프로세스 RSS 로 지상검증)
+
+| 경로 | 실측 |
+|---|---|
+| `/videos/upload` 50MB (GIF 기능) | Δpeak **+7.0MB** — werkzeug 스풀 → 3.2MiB 청크 PUT |
+| `/videos/<id>/stream` 50MB 중계 | Δpeak **+6.7MB** — 제너레이터, 소켓에 흘릴 뿐 |
+| `keyword_research.research` (claude 제외) | Δpeak **+0.1MB**, 저장 JSON 6.9KB |
+| 신규 기능 전체를 돌린 뒤 서버 RSS | 95MB → **97MB** (상주 증가 없음) |
+
+### 5. 아직 안 고친 것
+
+- `/memories/upload` 는 사진을 `file.read()` 로 통째로 올린다(상한 50MB). 영상처럼
+  `onedrive.upload_stream` 으로 돌리는 게 맞지만 EXIF·캡션이 바이트를 필요로 해 함께 손봐야 한다.
+- hq(원본 해상도) 디코드 **+50MB** 는 더 줄일 수 없다 — 12MP RGB 버퍼가 36MB 다.
+  48MP(8000×6000) 원본이 들어오면 디코드 버퍼만 144MB라 **512MB 에 근본적으로 안 맞는다.**
+- Pillow `draft()`(축소 디코딩)로 std 를 66→23MB 까지 더 줄일 수 있지만 **출력 픽셀이
+  달라지고**(평균차 2.3/255) 크롭과 상호작용해 해상도를 몰래 깎을 수 있어 쓰지 않았다.
+
+회귀 테스트: `tests/test_claude_serialization.py` · `tests/test_image_memory.py`.
 
 ## 아키텍처
 
@@ -88,6 +133,9 @@ Render 무료티어는 **512MB 한 칸**에 파이썬 워커(~100MB) + `claude -
   `write_review`(블로그 후기), `suggest_keyword_candidates`/`select_keywords`(키워드 조사),
   `suggest_thumbnail_copy`(썸네일 카피).
   긴 생성 프롬프트는 `ai.load_prompt(<이름>)`로 **파일에서** 읽는다.
+- **`bytecache.py`** — 디스크에 사는 TTL+바이트예산 캐시(`DiskByteCache`). 사진 원본
+  (`onedrive`)·가공완료 JPEG(`app`) 두 캐시의 **단일 원천**이다. 512MB 안에서 '담는 양'과
+  '죽지 않기'를 떼어 놓으려고 만들었다 — 근거와 실측은 그 모듈 머리말이 정본.
 - **`naver_api.py`** — NAVER API HUB(블로그 검색 · 검색어 트렌드) 얇은 클라이언트. 자격증명은
   **인자로만** 받고 로그·예외에 남기지 않는다. 지표 오독 금지(검색 결과 수 != 검색량,
   상대지수 != 절대 검색 횟수, 빈 트렌드 = 정량 확인 실패)는 모듈 머리말이 정본.

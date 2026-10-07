@@ -49,6 +49,7 @@ from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
+import bytecache
 import events
 import exifutil
 import gifmaker
@@ -142,6 +143,10 @@ def _as_rgb(img):
     return img if img.mode == "RGB" else img.convert("RGB")
 
 
+# EXIF 방향 태그(274). 값 5~8 은 90°/270° 회전이라 표시 기준 가로·세로가 바뀐다.
+_EXIF_ORIENTATION = 0x0112
+
+
 def _heic_to_jpeg(data):
     """HEIC/HEIF 바이트를 JPEG 바이트로 변환. 실패하면 None(호출부는 원본 폴백).
 
@@ -166,50 +171,41 @@ _BLOG_IMG_MAX_EDGE = 1280
 # 블로그 후기 이미지 크롭 목표 가로세로비(가로/세로). 4:3. 3/2·16/9로 자유 교체.
 _BLOG_CROP_ASPECT = 4 / 3
 
-# 가공완료(crop+downscale+JPEG) 블로그 이미지 바이트 캐시. (photo,crop,quality)당
+# 가공완료(crop+downscale+JPEG) 블로그 이미지 바이트 캐시. (photo,crop,mode)당
 # 결과가 불변이라 무효화 불필요. 히트 시 OneDrive 호출·_blog_img_process를 모두
-# 건너뛰어 재방문/재export가 즉시다. onedrive.py 캐시와 같은 만료/축출 패턴.
+# 건너뛰어 재방문/재export가 즉시다.
 #
-# ⚠️ 상한은 **개수가 아니라 바이트**다. 옛 상한(200개)은 메모리를 전혀 묶지 못했다 —
-# 실측: std(1280·q92) 엔트리 0.59MB / hq(원본 해상도·q95) 엔트리 3.28MB. 200개면
-# 최악 **656MB** 로, 512MB 티어를 캐시 하나가 혼자 넘긴다(2026-10-07 OOM 사고의
-# 지분). 엔트리 크기가 5배 넘게 들쭉날쭉한 캐시는 개수로 묶으면 안 된다.
-# 예산 48MB 의 근거(실측 기반 산수): 파이썬 워커 ~100MB + `claude -p` ~265MB +
-# 이미지 디코드 봉우리 ~50MB = 415MB. 512MB 까지 남는 ~97MB 를 이 캐시(48MB)와
-# onedrive 원본 바이트 캐시(16MB)가 나눠 쓰고 ~33MB 를 여유로 둔다.
-# 48MB 는 std 미리보기 ~81장 / hq ~14장이다(후기 한 건의 사진이 보통 5~10장).
+# ⚠️ **이 캐시는 RAM 이 아니라 디스크에 산다.** 예전엔 개수 상한 200개짜리 모듈
+# dict 였는데, 개수 상한은 메모리를 전혀 묶지 못했다 — 실측 엔트리 크기가
+# std(1280·q92) 0.59MB / hq(원본 해상도·q95) **3.28MB** 라 200개면 최악 **656MB**
+# 상주다(512MB 티어를 캐시 하나가 혼자 넘긴다 — 2026-10-07 OOM 의 지분).
+#
+# 그렇다고 개수를 줄이면 '다시 방문하면 즉시' 라는 기능이 깎인다. 그래서 **용량을
+# 줄이는 대신 자리를 옮겼다**: 바이트는 컨테이너의 임시 디스크(Render 는 ephemeral
+# **disk**, tmpfs 가 아니다 — 캡션 임시 이미지도 이미 파일로 쓴다)에 두고, 메모리엔
+# 아무것도 남기지 않는다. 결과:
+#   * 상주 RAM            656MB(최악) → **0**
+#   * 담을 수 있는 장수   200개 → std 기준 ~217장 / hq 기준 ~39장 (128MB 예산)
+#   * 히트 비용           OneDrive 왕복 + Pillow 재인코딩(0.1 CPU 에서 수 초)
+#                         → 로컬 파일 read 수 ms. 기능은 오히려 더 세진다.
+# 디스크가 안 되는 환경(읽기전용·권한 없음)에서는 조용히 '항상 미스'로 동작한다 —
+# 느려질 뿐 절대 실패하지 않는다.
 _BLOG_PROC_CACHE_TTL = 6 * 3600  # seconds (~6h)
-_BLOG_PROC_CACHE_BUDGET = 48 * 1024 * 1024
-_blog_proc_cache = {}  # key: (photo_id, crop_str, mode) -> (jpeg_bytes, expiry)
+_BLOG_PROC_DISK_BUDGET = 128 * 1024 * 1024
+_blog_proc_cache = bytecache.DiskByteCache(
+    "blog-proc", ttl=_BLOG_PROC_CACHE_TTL, budget=_BLOG_PROC_DISK_BUDGET,
+    directory=os.environ.get("BLOG_PROC_CACHE_DIR"),
+)
 
 
 def _blog_proc_cache_get(key):
     """가공완료 캐시 조회 — 유효(미만료) 히트면 바이트, 아니면 None."""
-    hit = _blog_proc_cache.get(key)
-    if hit and time.time() < hit[1]:
-        return hit[0]
-    return None
+    return _blog_proc_cache.get(key)
 
 
 def _blog_proc_cache_put(key, data):
-    """가공완료 캐시 저장 — 만료분을 버리고, **바이트 예산** 안으로 축출한 뒤 넣는다.
-
-    한 엔트리가 예산보다 크면 아예 캐시하지 않는다(그 한 장이 캐시 전체를 비우고
-    눌러앉는 것을 막는다 — 호출부는 매번 다시 가공할 뿐 기능은 그대로다).
-    """
-    if not data:
-        return
-    size = len(data)
-    if size > _BLOG_PROC_CACHE_BUDGET:
-        return
-    now = time.time()
-    for k in [k for k, v in _blog_proc_cache.items() if v[1] <= now]:
-        _blog_proc_cache.pop(k, None)
-    total = sum(len(v[0]) for v in _blog_proc_cache.values()) + size
-    while _blog_proc_cache and total > _BLOG_PROC_CACHE_BUDGET:
-        oldest = min(_blog_proc_cache, key=lambda k: _blog_proc_cache[k][1])
-        total -= len(_blog_proc_cache.pop(oldest)[0])
-    _blog_proc_cache[key] = (data, now + _BLOG_PROC_CACHE_TTL)
+    """가공완료 캐시 저장 — 디스크에 원자적으로 쓰고 예산 안으로 축출."""
+    _blog_proc_cache.put(key, data)
 
 
 # 네이버 자동 export(v2) PENDING 슬롯 — 사용자 export_key → {rid, exp}. 앱에서 📤를
@@ -249,13 +245,27 @@ def _image_display_size(data):
     """이미지 바이트의 '표시 기준'(EXIF 방향 반영) (w, h)를 돌려준다. 실패 시 None.
 
     compute_crop_rect가 쓸 실제 픽셀 크기 — claude가 본 것과 같은 방향으로 맞춘다.
+
+    ⚡ **픽셀을 디코드하지 않는다.** ``Image.open`` 은 지연 로딩이라 헤더만 읽고도
+    ``size`` 를 알고, 방향은 EXIF 태그 274 한 개면 된다. 예전엔 크기 두 개를 알려고
+    ``exif_transpose`` 로 **이미지 전체를 디코드+복사**했다 — 12MP 한 장에 실측
+    **90.9MB** 봉우리다. 이 함수는 후기 초안 생성 중 사진마다 불리므로(그 순간
+    `claude -p` 가 같이 떠 있다) 그 봉우리가 그대로 OOM 거리였다. 실측 **0.0MB**.
+    EXIF 방향 8종 + 태그 없음 + PNG 에서 옛 구현과 **같은 값**임을 확인했다.
     """
     if not _HEIC_OK or not _PILImage or not data:
         return None
     try:
         with _PILImage.open(_BytesIO(data)) as im:
-            img = _exif_upright(im)  # 전체 사본 금지 — 머리말의 메모리 규율
-            return (int(img.width), int(img.height))
+            w, h = im.size  # 지연 로딩 — 아직 픽셀을 읽지 않았다
+            try:
+                orientation = im.getexif().get(_EXIF_ORIENTATION)
+            except Exception:  # noqa: BLE001 - EXIF 없음·깨짐 → 방향 보정 없음
+                orientation = None
+            # 5~8 은 90°/270° 회전(+전치)이라 표시 기준 축이 바뀐다.
+            if orientation in (5, 6, 7, 8):
+                w, h = h, w
+            return (int(w), int(h))
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원
         return None
 
@@ -879,7 +889,29 @@ def get_or_create_today_question(couple: Couple) -> DailyQuestion:
             .all()
         )
     ]
-    text, source = ai.generate_daily_question(recent_pairs, past_questions=past_questions)
+    # ⚠️ 이 앱에서 claude 가 **요청 경로에서** 도는 유일한 자리다(하루 한 번, 그날
+    # 첫 방문). 여기에 세마포어를 무한 대기로 걸면 후기 초안 생성(세마포어를 수 분간
+    # 쥔다) 뒤에 줄을 서다가 gunicorn `--timeout 180` 에 걸려 502 가 난다. 반대로
+    # 세마포어 없이 돌리면 claude 가 둘이 뜬다 — 실측 한 개 ≈ 400MB 라 512MB
+    # 티어는 그 자리에서 죽는다(2026-10-07 OOM 의 유력 경로).
+    # 그래서 **짧게만 기다린다**:
+    #   * 슬롯을 잡으면 → 지금까지와 똑같이 개인화 질문을 생성한다.
+    #   * 못 잡으면 → claude 를 돌리지 않고 폴백 질문으로 **즉시** 행을 만들고,
+    #     슬롯이 비는 대로 백그라운드가 같은 행을 개인화 질문으로 **올려준다**
+    #     (아래 upgrade_daily_question). 기능을 깎지 않으려는 장치다 — 폴백 질문이
+    #     하루 종일 남지 않는다.
+    upgrade_later = False
+    if _CAPTION_SEM.acquire(timeout=_QUESTION_SLOT_WAIT):
+        try:
+            text, source = ai.generate_daily_question(
+                recent_pairs, past_questions=past_questions
+            )
+        finally:
+            _CAPTION_SEM.release()
+    else:
+        log.info("오늘의 질문: claude 슬롯이 바빠 폴백으로 띄우고 나중에 올린다")
+        text, source = ai.fallback_daily_question(recent_pairs)
+        upgrade_later = True
 
     q = DailyQuestion(couple_id=couple.id, q_date=today, text=text, source=source)
     db.session.add(q)
@@ -889,6 +921,9 @@ def get_or_create_today_question(couple: Couple) -> DailyQuestion:
         # Partner generated it concurrently — take theirs.
         db.session.rollback()
         q = DailyQuestion.query.filter_by(couple_id=couple.id, q_date=today).first()
+        upgrade_later = False
+    if upgrade_later and q is not None:
+        _spawn_question_upgrade(current_app._get_current_object(), q.id)
     return q
 
 
@@ -1004,6 +1039,12 @@ def regenerate_monthly_report(app, couple_id, year, month):
                     couple_id, year, month, user_a, user_b
                 )
                 month_label = f"{year}년 {month}월"
+                # 캡션·채점·추천·후기와 '같은' _CAPTION_SEM으로 직렬화한다.
+                # ⚠️ 이게 빠져 있었다 — 월간 회고는 /answer 커밋마다 트리거되므로,
+                # 후기 초안(170초+ 동안 세마포어를 쥔다)이 도는 중에 답변 하나만
+                # 들어와도 claude 가 둘이 됐다. 실측 `claude -p` 한 개 ≈ 400MB →
+                # 둘이면 512MB 티어가 즉사한다(2026-10-07 OOM 의 유력 경로).
+                _CAPTION_SEM.acquire()
                 try:
                     result = ai.generate_monthly_report(
                         month_label,
@@ -1017,6 +1058,8 @@ def regenerate_monthly_report(app, couple_id, year, month):
                         couple_id, year, month,
                     )
                     result = None
+                finally:
+                    _CAPTION_SEM.release()
 
                 report = MonthlyReport.query.filter_by(
                     couple_id=couple_id, year=year, month=month
@@ -1150,11 +1193,117 @@ def _kick_monthly_report(couple_id, year, month):
 _captioning_lock = threading.Lock()
 _captioning: set[int] = set()
 
-# 캡션 동시성 상한 — 기본 1(직렬화). 단일 워커 512MB 무료 티어는 `claude`(Node)
-# 프로세스를 한 번에 하나밖에 못 버틴다: N개의 캡션 스레드가 동시에 claude를 띄우면
-# OOM 나서 캡션이 실패한다(질문 생성은 한 개라 프로덕션에서 정상 동작). 이 세마포어로
-# 여러 스레드가 줄 서서 사진 바이트 로드+vision 호출을 하나씩 순차 처리하게 한다.
+# claude 동시성 상한 — 기본 1(직렬화). 512MB 단일 워커는 `claude`(Node) 프로세스를
+# 한 번에 **하나밖에** 못 버틴다. 실측(2026-10-07): `claude -p` 한 개의 RSS 봉우리가
+# 약 400MB다(앱과 같은 argv·stdin 프롬프트, 넉넉한 머신 기준 상한값 — 컨테이너에선
+# V8 힙이 더 작게 잡혀 그보다 낮지만, **둘이 동시에 뜨면 512MB 를 넘는다**는 결론은
+# 같다). 그래서 이 세마포어는 '캡션용'이 아니라 **이 앱의 모든 claude 호출**이 지나야
+# 하는 단 하나의 문이다.
+#
+# ⚠️ 2026-10-07 OOM 직전까지 이 문을 **안 지나는 claude 호출이 셋** 있었다 —
+# 월간 회고(/answer 마다 트리거)·판결(버튼)·오늘의 질문(요청 경로). 신규 기능(키워드
+# 조사→썸네일→GIF)이 들어오면서 후기 초안이 세마포어를 쥐는 시간이 ~20초에서
+# **170초+** 로 늘자, 그 위에 셋 중 하나가 겹칠 확률이 같이 뛰었다. 이제 전부 이 문을
+# 지난다(아래 _QUESTION_SLOT_WAIT 참고 — 요청 경로만 특별 취급).
 _CAPTION_SEM = threading.Semaphore(int(os.environ.get("CAPTION_MAX_CONCURRENCY", "1")))
+
+# 요청 경로(오늘의 질문)가 claude 슬롯을 기다릴 수 있는 최대 시간(초).
+# gunicorn `--timeout 180` 안에 반드시 들어와야 한다: 대기 15s + claude 최대 120s
+# (ai.CLAUDE_TIMEOUT) = 135s < 180s. 못 잡으면 폴백 질문으로 즉시 응답하고
+# 백그라운드가 개인화 질문으로 올려준다(upgrade_daily_question).
+_QUESTION_SLOT_WAIT = 15
+
+_question_upgrade_lock = threading.Lock()
+_question_upgrades: set[int] = set()
+
+
+def upgrade_daily_question(app, question_id):
+    """폴백으로 즉시 띄운 '오늘의 질문'을 개인화 질문으로 **올려준다**(백그라운드).
+
+    요청 경로가 claude 슬롯을 못 잡았을 때만 돈다. 슬롯이 비기를 기다렸다가 평소와
+    같은 생성을 돌리고, 같은 행의 ``text``/``source`` 를 갈아끼운다. 기능을 깎지
+    않으려는 장치다 — 바쁜 순간에 걸렸다고 폴백 질문이 하루 종일 남지 않는다.
+
+    ⚠️ **아직 아무도 답하지 않았을 때만** 바꾼다. 한 사람이라도 답했으면 그가 본
+    질문이 손에서 바뀌면 안 되므로 폴백 질문을 그대로 둔다.
+    절대 raise 하지 않고 finally 에서 가드를 푼다.
+    """
+    try:
+        with app.app_context():
+            try:
+                q = db.session.get(DailyQuestion, question_id)
+                if q is None or q.source != "fallback" or q.answers.count():
+                    return
+                couple = db.session.get(Couple, q.couple_id)
+                if couple is None:
+                    return
+                recent = (
+                    DailyQuestion.query.filter(
+                        DailyQuestion.couple_id == couple.id,
+                        DailyQuestion.q_date < q.q_date,
+                    )
+                    .order_by(DailyQuestion.q_date.desc())
+                    .limit(8)
+                    .all()
+                )
+                recent_pairs = [
+                    {"question": r.text, "answers": [a.text for a in r.answers.all()]}
+                    for r in recent
+                ]
+                past_questions = [
+                    t for (t,) in (
+                        DailyQuestion.query.with_entities(DailyQuestion.text)
+                        .filter(
+                            DailyQuestion.couple_id == couple.id,
+                            DailyQuestion.q_date < q.q_date,
+                        )
+                        .order_by(DailyQuestion.q_date.desc())
+                        .limit(40)
+                        .all()
+                    )
+                ]
+                _CAPTION_SEM.acquire()
+                try:
+                    text, source = ai.generate_daily_question(
+                        recent_pairs, past_questions=past_questions
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("오늘의 질문 업그레이드 생성 실패 (q=%s)", question_id)
+                    return
+                finally:
+                    _CAPTION_SEM.release()
+                if source != "ai" or not text:
+                    return  # 또 폴백이면 굳이 갈아끼우지 않는다
+                # 기다리는 사이 누가 답했을 수 있다 — 다시 확인하고 그때만 바꾼다.
+                q = db.session.get(DailyQuestion, question_id)
+                if q is None or q.source != "fallback" or q.answers.count():
+                    return
+                q.text = text
+                q.source = source
+                db.session.commit()
+                log.info("오늘의 질문을 개인화 질문으로 올렸다 (q=%s)", question_id)
+            except Exception:  # noqa: BLE001 — 절대 스레드 밖으로 내보내지 않는다
+                db.session.rollback()
+                log.exception("upgrade_daily_question failed (q=%s)", question_id)
+    finally:
+        with _question_upgrade_lock:
+            _question_upgrades.discard(question_id)
+
+
+def _spawn_question_upgrade(app, question_id):
+    """위 업그레이드 스레드를 스폰(이미 돌고 있으면 no-op). 절대 raise 안 한다."""
+    with _question_upgrade_lock:
+        if question_id in _question_upgrades:
+            return
+        _question_upgrades.add(question_id)
+    try:
+        threading.Thread(
+            target=upgrade_daily_question, args=(app, question_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — 업그레이드는 best-effort
+        log.exception("failed to spawn question upgrade thread (q=%s)", question_id)
+        with _question_upgrade_lock:
+            _question_upgrades.discard(question_id)
 
 # Image extensions claude's Read tool recognizes; used to give the temp file the
 # right suffix so vision actually ingests it. Falls back to .jpg.
@@ -1336,6 +1485,11 @@ def judge_case(app, case_id):
                     nm = author.display_name if author else "익명"
                     statements.append({"name": nm, "text": st.text})
 
+                # 캡션·채점·추천·후기와 '같은' _CAPTION_SEM으로 직렬화한다.
+                # ⚠️ 이게 빠져 있었다 — 판결은 사람이 아무 때나 누르는 버튼이라
+                # 후기 초안 생성(170초+ 세마포어 보유) 위에 그대로 겹쳤다.
+                # 실측 `claude -p` 한 개 ≈ 400MB → 둘이면 512MB 티어가 즉사한다.
+                _CAPTION_SEM.acquire()
                 try:
                     result = ai.judge_fight(
                         name_a, name_b, case.situation, statements
@@ -1343,6 +1497,8 @@ def judge_case(app, case_id):
                 except Exception:  # noqa: BLE001 — claude must never crash the thread
                     log.exception("claude fight judgment raised (case=%s)", case_id)
                     result = None
+                finally:
+                    _CAPTION_SEM.release()
 
                 # Re-load in case the row changed while claude ran.
                 case = db.session.get(Case, case_id)
