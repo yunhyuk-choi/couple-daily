@@ -1036,7 +1036,7 @@
   var url = ds.progressUrl, was = ds.status;
   var box = document.getElementById('rv-progress');
   var BASE = 4000, MAX_MS = 60 * 60 * 1000, started = Date.now();
-  var wait = BASE, timer = null, stopped = false;
+  var wait = BASE, timer = null, stopped = false, inflight = false;
 
   function el(name) {
     if (!box) return null;
@@ -1057,15 +1057,18 @@
   function schedule() {
     if (stopped) return;
     if (Date.now() - started > MAX_MS) return;   // 버려진 탭이 영원히 묻지 않게
+    if (timer) clearTimeout(timer);              // 타이머는 언제나 하나뿐
     timer = setTimeout(tick, wait);
   }
 
   function tick() {
-    if (stopped) return;
+    if (stopped || inflight) return;   // 깨우기가 겹쳐도 요청은 한 줄만
     if (document.hidden) { schedule(); return; }  // 안 보이는 탭은 안 묻는다
+    inflight = true;
     fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (d) {
+        inflight = false;
         wait = BASE;
         // 끝났거나(done) 상태가 바뀌었으면(pending → ready/failed) 화면을 새로
         // 그린다 — 그래야 '작성중' 안내가 이미 선 초안 위에 남지 않는다.
@@ -1076,17 +1079,29 @@
         schedule();
       })
       .catch(function () {
+        inflight = false;
         wait = Math.min(wait * 2, 30000);   // 서버가 안 받아 주면 천천히
         schedule();
       });
   }
 
-  // 다시 보이면 기다리지 않고 바로 한 번 묻는다(숨은 동안 끝났을 수 있다).
-  document.addEventListener('visibilitychange', function () {
-    if (document.hidden || stopped) return;
+  // 다시 보이면 기다리지 않고 **바로 한 번** 묻는다(숨은 동안 끝났을 수 있다).
+  // ⚠️ 백오프도 같이 되돌린다. 폰에서 앱을 전환하거나 화면을 끄면 그 사이 요청이
+  //    네트워크 오류로 몇 번 깨지고, wait 가 30초까지 벌어진 채 **성공할 때까지
+  //    줄지 않는다**(실측: 오프라인 2분 → 간격 8·16·30·30·30초). 돌아온 사람에게
+  //    30초짜리 멈춘 화면을 보여 줄 이유가 없다.
+  // pageshow(persisted) 는 bfcache 복귀 — 뒤로가기로 돌아올 때 visibilitychange 가
+  //    안 뜨는 브라우저가 있어 같은 자리에 같이 건다. online 은 비행기모드 해제.
+  function wake() {
+    if (stopped || document.hidden) return;
+    wait = BASE;
     if (timer) { clearTimeout(timer); timer = null; }
     tick();
-  });
+  }
+  document.addEventListener('visibilitychange', wake);
+  window.addEventListener('pageshow', wake);
+  window.addEventListener('focus', wake);
+  window.addEventListener('online', wake);
   schedule();
 })();
 </script>

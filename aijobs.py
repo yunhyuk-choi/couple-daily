@@ -205,7 +205,15 @@ def progress(job_key, step, index=None, total=None):
     걸려 **돌고 있는데 되돌려지는** 일이 없다(진척이 곧 생존 신호다).
 
     절대 raise 하지 않는다 — 진척 보고가 실제 작업을 깨뜨리면 본말전도다.
+
+    ⚠️ **삼키되 지우지는 않는다.** 예전엔 실패가 완전히 무음이었다: 행이 없으면
+    ``False`` 만 돌려주고 아무 로그도 안 남겼고, 예외는 ``log.debug`` 로 갔는데 이
+    앱은 ``basicConfig`` 를 부르는 데가 없어 **DEBUG 는 어디에도 안 찍힌다.** 그러면
+    "일은 돌고 있는데 라벨만 안 바뀌는" 상태를 사람이 **영원히** 구분할 수 없다
+    (실제로 의심받은 증상이다). 그래서 지금은 ``progress_failures`` 카운터가 올라가고
+    첫 실패와 그 뒤 10번째마다 **WARNING** 이 찍힌다 — 본업은 그대로 간다.
     """
+    global progress_failures
     try:
         now = _utcnow()
         values = {"step": (step or "")[:60] or None, "updated_at": now}
@@ -219,11 +227,40 @@ def progress(job_key, step, index=None, total=None):
             .update(values, synchronize_session=False)
         )
         db.session.commit()
-        return bool(updated)
-    except Exception:  # noqa: BLE001
-        db.session.rollback()
-        log.debug("ai job: 진척 기록 실패 (%s)", job_key, exc_info=True)
+        if updated:
+            return True
+        _note_progress_failure(job_key, "그 job_key 의 행이 없다")
         return False
+    except Exception as e:  # noqa: BLE001
+        db.session.rollback()
+        _note_progress_failure(job_key, repr(e))
+        return False
+
+
+# 진척 쓰기가 몇 번 실패했나 — '일은 도는데 라벨만 안 바뀐다'의 **유일한 흔적**이다.
+# 운영 로직은 이 값을 보지 않는다(진단·테스트용).
+progress_failures = 0
+progress_last_failure = None
+progress_last_failure_at = None       # time.monotonic() 기준
+
+
+def progress_failure_age():
+    """마지막 진척 쓰기 실패로부터 흐른 초(한 번도 없었으면 None)."""
+    at = progress_last_failure_at
+    return None if at is None else max(0.0, time.monotonic() - at)
+
+
+def _note_progress_failure(job_key, why):
+    """진척 쓰기 실패를 **보이게** 남긴다 — 카운터 + 첫 실패/10번째마다 WARNING."""
+    global progress_failures, progress_last_failure, progress_last_failure_at
+    progress_failures += 1
+    progress_last_failure = why
+    progress_last_failure_at = time.monotonic()
+    if progress_failures == 1 or progress_failures % 10 == 0:
+        log.warning(
+            "ai job: 진척 기록 실패 %s회째 (%s) — %s. 일은 계속 도는데 화면의 "
+            "단계 표시만 안 바뀔 수 있다.", progress_failures, job_key, why,
+        )
 
 
 def snapshot(job_key):

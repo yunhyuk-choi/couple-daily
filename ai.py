@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -196,6 +197,33 @@ def _popen_kwargs():
 
 def _strip_ansi(text):
     return _ANSI_RE.sub("", text or "")
+
+
+# --- claude 가 **마지막으로 입을 연 시각** ------------------------------------
+# 왜 이게 있나 (2026-10-07, '4/15 본문 쓰는 중' 에서 10분 멈춘 화면):
+# 진척 라벨은 claude 콜 **사이**에만 바뀐다. 그런데 본문 한 콜이 수 분이라, 그 동안
+# 라벨은 당연히 그대로다 — 그게 '죽은 것'과 구분되지 않는다. 우리는 그 동안에도
+# stream-json 이벤트를 **실제로 받고 있으면서** 침묵 감지에만 쓰고 버렸다.
+# 그 사실을 화면까지 보내면 "안 바뀌는 라벨"이 "살아 있는데 긴 단계"가 된다.
+#
+# ⚠️ 시간으로 혼자 올라가는 가짜 진행률이 아니다 — **실제 이벤트를 받은 시각**이고,
+#    claude 가 정말 입을 다물면 이 값도 늙는다.
+# 프로세스 전역이다(잡별이 아니다). 이 앱은 gunicorn 워커 1개 + 큐가 claude 를 한
+# 번에 하나만 띄우는 전제라 "지금 도는 그 콜"과 같다. 전제가 깨지면 그냥 덜 정확한
+# 참고값이 될 뿐 아무것도 고장내지 않는다.
+_last_activity_at = None
+
+
+def _mark_activity():
+    """claude 로부터 이벤트를 한 줄 받았다 — 생존 신호를 찍는다(절대 raise 안 함)."""
+    global _last_activity_at
+    _last_activity_at = time.time()
+
+
+def last_activity_age():
+    """claude 가 마지막으로 이벤트를 준 뒤 흐른 초(한 번도 없으면 None)."""
+    at = _last_activity_at
+    return None if at is None else max(0.0, time.time() - at)
 
 
 class SessionError(RuntimeError):
@@ -403,6 +431,7 @@ class ClaudeSession:
         try:
             for line in self.proc.stdout:
                 self.last_event_at = time.time()
+                _mark_activity()   # 화면이 '살아 있다'를 말할 수 있게
                 event = _parse_stream_event(line)
                 if event is None:
                     continue
@@ -722,6 +751,7 @@ def _run_claude_streamed(prompt: str, allow_web: bool,
         try:
             for line in proc.stdout:
                 state["last"] = time.time()
+                _mark_activity()   # 화면이 '살아 있다'를 말할 수 있게
                 event = _parse_stream_event(line)
                 if event is None:
                     s = _strip_ansi(line).strip()
@@ -1276,6 +1306,163 @@ def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg",
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+# --- 묶음 크롭 — 한 콜에 여러 장 ---------------------------------------------
+# 왜 묶는가: 크롭은 **사진 한 장당 claude 턴 하나**였다. 사진 11장이면 턴 11번이고,
+# 파이프라인에서 가장 긴 구간이 통째로 거기다(본문 1콜 + 조사 2콜 vs 크롭 11콜).
+# 좌표는 0~1 정규화라 사진끼리 섞일 일도 없고, 보여 주는 그림은 장당 수백 KB 렌디션
+# 이라 메모리도 제약이 아니다 — 묶지 못할 기술적 이유가 없었다.
+#
+# 왜 **전부 한 콜**이 아닌가 (실측으로 정한 수): 한 턴에 너무 많이 주면 뒤쪽 사진을
+# 대충 본다(주의 희석). 그래서 작은 묶음으로 끊는다. 기본 4는 "턴 수는 1/4 로 줄되
+# 한 턴이 보는 그림은 네 장"이라는 절충이고, 환경변수로 조정 가능하다 — 1 로 두면
+# 예전과 똑같은 단건 동작이 된다(안전 스위치).
+CROP_BATCH_SIZE = max(1, int(os.environ.get("AI_CROP_BATCH_SIZE", "4")))
+
+# 묶음 안에서 사진을 가리키는 키의 모양. 키는 **파일명이자 식별자**다 — claude 가
+# 여는 경로 자체에 키가 박혀 있어야 '3번 사진 좌표가 7번에 붙는' 사고를 잡아낼 수
+# 있다(돌아온 키 ∉ 요청한 키 → 그 장만 버린다).
+_CROP_KEY_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+
+
+def crop_batches(jobs, size=None):
+    """``jobs`` 를 묶음 크기로 자른 리스트의 리스트 (순수/오프라인 — 테스트용).
+
+    묶음 크기는 ``size`` → ``CROP_BATCH_SIZE`` 순. 1 이하면 단건과 같아진다.
+    """
+    n = max(1, int(size or CROP_BATCH_SIZE))
+    jobs = list(jobs or [])
+    return [jobs[i:i + n] for i in range(0, len(jobs), n)]
+
+
+def parse_crops_batch(data, wanted_keys):
+    """묶음 응답 dict → ``{key: [x,y,w,h]}`` (순수/오프라인 — claude 없이 테스트 가능).
+
+    ⛔ **매핑 사고를 여기서 막는다.** ``wanted_keys`` 에 없는 키는 통째로 버린다 —
+    모델이 키를 지어내거나 남의 묶음 키를 섞어 보내면 그 좌표가 엉뚱한 사진에 붙어
+    **엉뚱한 데를 크롭해서 발행**된다. 같은 키가 두 번 오면 **첫 번째만** 쓴다.
+    박스가 못 쓸 값이면 그 키는 없는 것으로 둔다(호출부가 단건으로 다시 묻는다).
+    """
+    wanted = set(wanted_keys or ())
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    rows = data.get("crops")
+    if not isinstance(rows, list):
+        # 모델이 {"p00": {...}, "p01": {...}} 모양으로 줄 수도 있다 — 그것도 받는다.
+        rows = [
+            dict(v, key=k) for k, v in data.items()
+            if k in wanted and isinstance(v, dict)
+        ]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = row.get("key")
+        if not isinstance(key, str):
+            continue
+        key = key.strip()
+        if key not in wanted or key in out:
+            continue
+        box = _normalize_crop_box(row)
+        if box:
+            out[key] = box
+    return out
+
+
+def suggest_crops_batch(jobs, target_aspect):
+    """여러 장을 **한 번의 claude 비전 콜**로 보고 사진별 크롭 박스를 한꺼번에 받는다.
+
+    ``jobs`` 는 ``{"key", "hint", "image_bytes", "ext", "image_url"}`` 의 리스트.
+    ``key`` 는 이 묶음 안에서 유일한 짧은 식별자이고, 파일 경로에 **그대로 박힌다**
+    (``.../p03.jpg``) — 모델이 사진과 키를 헷갈릴 여지를 구조적으로 줄인다.
+
+    반환은 ``{key: [x,y,w,h]}``. **요청한 키만** 담기고, 빠진 키는 그냥 없다 —
+    호출부가 그 장만 단건으로 다시 묻거나 중앙 크롭으로 떨어뜨린다(전부 아니면
+    전무가 되지 않게). 어떤 실패에도 ``{}`` 를 돌려주고 ``Cancelled`` 만 올린다.
+
+    단건 ``suggest_crop`` 은 그대로 남는다 — 묶음이 깨졌을 때의 폴백이자, 사람이
+    상세 화면에서 한 장만 다시 자를 때의 경로다.
+    """
+    jobs = [j for j in (jobs or []) if j.get("image_bytes") or j.get("image_url")]
+    if not jobs:
+        return {}
+    if len(jobs) == 1:
+        j = jobs[0]
+        box = suggest_crop(
+            j.get("image_bytes"), j.get("hint"), target_aspect,
+            ext=j.get("ext") or ".jpg", image_url=j.get("image_url"),
+        )
+        return {j["key"]: box} if box else {}
+
+    tmp_dir = None
+    try:
+        aspect_txt = f"{float(target_aspect):.3g}"
+    except (TypeError, ValueError):
+        aspect_txt = "1.333"
+    try:
+        lines = []
+        tools_web = False
+        for j in jobs:
+            key = str(j.get("key") or "")
+            if not _CROP_KEY_RE.match(key):
+                raise ValueError(f"bad crop key: {key!r}")
+            hint = (j.get("hint") or "").strip()[:400] or "(설명 없음)"
+            url = j.get("image_url")
+            if url:
+                tools_web = True
+                where = f"- 이미지 URL(WebFetch 로 받아서 실제로 봐라): {url}"
+            else:
+                if tmp_dir is None:
+                    tmp_dir = tempfile.mkdtemp(prefix="cd_crops_")
+                ext = j.get("ext")
+                ext = ext if ext in _CROP_IMAGE_EXTS else ".jpg"
+                path = os.path.join(tmp_dir, f"{key}{ext}")
+                with open(path, "wb") as fh:
+                    fh.write(j["image_bytes"])
+                where = f"- 파일 경로(Read 로 열어서 실제로 봐라): {path}"
+            lines.append(f"[사진 {key}]\n{where}\n- 단락 주제: {hint}")
+        listing = "\n\n".join(lines)
+        keys_txt = ", ".join(str(j["key"]) for j in jobs)
+
+        prompt = (
+            f"아래 사진 {len(jobs)}장을 **각각 한 장씩 실제로 열어 보고** 답해줘.\n\n"
+            "너는 블로그 후기 사진을 가로형(landscape)으로 자를 때 '무엇을 반드시 "
+            "남길지'를 정하는 도우미야. 사진마다 그 사진이 실릴 단락 주제가 따로 "
+            "적혀 있어.\n\n"
+            f"{listing}\n\n"
+            "사진 하나하나에 대해, 그 단락이 말하는 '주인공' 하나(그 음식·메뉴·사물·"
+            "인물 등 바로 그 대상)를 찾아 '빠짐없이 딱 감싸는 가장 타이트한' "
+            "바운딩박스를 줘.\n"
+            "지켜야 할 규칙:\n"
+            "- 주인공 전체가 박스 안에 완전히 들어와야 해(끝·가장자리가 잘리면 안 됨). "
+            "하지만 사진 전체나 넉넉한 여백을 담지는 마 — 주인공에 딱 맞게.\n"
+            "- 주인공이 실제로 있는 위치를 정직하게 반영해. 위쪽에 있으면 y를 작게, "
+            "아래에 있으면 y를 크게, 한쪽으로 치우쳐 있으면 x를 그쪽으로. 무조건 "
+            "가운데(안전한 중앙 박스)로 두지 마 — 사진마다 위치는 다르다.\n"
+            "- 주인공이 여러 개면 그 사진의 단락 주제에 가장 맞는 '하나'만 감싸.\n"
+            "- 좌표는 0~1 상대값: x·w는 '가로폭' 기준, y·h는 '세로높이' 기준. "
+            "x=왼쪽에서 시작, y=위에서 시작, w=폭, h=높이. (x+w, y+h는 1을 넘지 마.)\n"
+            f"- 최종 크롭 비율은 대략 {aspect_txt}:1(가로:세로)로 만들 거야(참고).\n\n"
+            "⚠️ 가장 중요한 것 — **어느 사진의 좌표인지 헷갈리지 마라.** 사진을 하나 "
+            "열 때마다 그 사진의 키를 먼저 적고 그 사진의 좌표를 적어라. 다른 사진의 "
+            "좌표를 옮겨 적으면 엉뚱한 곳이 잘려 발행된다. 뒤쪽 사진이라고 대충 보지 "
+            "말고 앞 사진과 똑같이 열어서 봐라.\n"
+            f"- 키는 정확히 이 {len(jobs)}개다: {keys_txt}. 전부 한 번씩 답해라.\n\n"
+            "출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
+            '{"crops": [{"key": "<위 키 중 하나>", "x": 0.12, "y": 0.05, '
+            '"w": 0.55, "h": 0.42}]}'
+        )
+        raw = _run_claude(prompt, allow_web=tools_web)
+        return parse_crops_batch(_extract_json(raw), [j["key"] for j in jobs])
+    except Cancelled:
+        raise  # 사람이 멈춘 건 '비전 실패'가 아니다
+    except Exception as e:  # noqa: BLE001 — 묶음 실패는 그 묶음만 잃는다
+        print(f"[ai] suggest_crops_batch failed: {e}", file=sys.stderr)
+        return {}
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2169,8 +2356,10 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
         photo_rule = (
             f"- 사진은 0번부터 {len(photos) - 1}번까지 {len(photos)}장이다. 넣고 싶은 "
             "자리에 image 블록을 두고 photo_index에 그 자리에 가장 잘 맞는 사진 번호"
-            "(0-based)를 넣어라. 없는 번호는 절대 쓰지 마라. 모든 사진을 다 넣을 "
-            "필요는 없다."
+            "(0-based)를 넣어라. 없는 번호는 절대 쓰지 마라.\n"
+            f"- **{len(photos)}장 전부 쓰는 것이 기본값이다.** 사용자가 이 글에 쓰려고 "
+            f"직접 고른 사진이다. 다 쓰고 나서 0~{len(photos) - 1}번이 빠짐없이 들어갔는지 "
+            "세어 봐라."
         )
     else:
         photo_block = "(첨부된 사진 없음)"

@@ -2602,11 +2602,16 @@ def _review_eta(n_photos):
     """이 후기 한 건의 (claude 콜 수, '느려도 정상'인 최대 분).
 
     근거는 콜 하나의 **추정 소요**뿐이다 — 조사 2 + 본문 1 = 3 × 120초,
-    사진마다 비전 1 × ``ai.CAPTION_EST_SEC``. **추정이지 약속이 아니고, 이 시간이
-    지나도 아무것도 끊지 않는다**(끊는 건 사람의 중단 버튼과 침묵 감지뿐).
+    사진은 ``ai.CROP_BATCH_SIZE`` 장씩 **묶어** 비전 콜 하나 × ``ai.CAPTION_EST_SEC``.
+    (예전엔 사진 한 장당 한 콜이었다 — 11장이면 11콜. 실측 147초 → 묶으니 3콜 31초.)
+    **추정이지 약속이 아니고, 이 시간이 지나도 아무것도 끊지 않는다**(끊는 건 사람의
+    중단 버튼과 침묵 감지뿐).
     """
-    calls = 3 + max(0, int(n_photos))
-    worst_sec = 3 * ai.CLAUDE_TIMEOUT + max(0, int(n_photos)) * ai.CAPTION_EST_SEC
+    n = max(0, int(n_photos))
+    size = max(1, int(getattr(ai, "CROP_BATCH_SIZE", 4)))
+    crop_calls = -(-n // size)      # 올림 나눗셈
+    calls = 3 + crop_calls
+    worst_sec = 3 * ai.CLAUDE_TIMEOUT + crop_calls * ai.CAPTION_EST_SEC
     return calls, max(1, int(round(worst_sec / 60.0)))
 
 
@@ -2626,6 +2631,49 @@ def _pump_looks_stalled(snap, pump, now):
         return True
     waited = now - (snap["created_at"] or now)
     return waited >= _QUEUE_STALL and not aijobs.anyone_running()
+
+
+def _claude_liveness_hint():
+    """"지금 claude 가 살아 있나"를 사람 문장으로 (할 말 없으면 "").
+
+    근거는 ``ai.last_activity_age()`` — claude 가 **실제로 이벤트를 준** 뒤 흐른
+    초다. 한 단계가 길어서 라벨이 안 바뀌는 것과, 정말 죽어서 안 바뀌는 것을
+    구분해 주는 유일한 신호다(시간으로 혼자 올라가는 가짜 진행률이 아니다).
+    진척 쓰기가 **최근에** 실패했으면 그것도 같이 말한다 — 조용히 삼키면 사람은
+    "일은 도는데 숫자만 안 바뀐다"를 영원히 모른다.
+
+    기존 안내를 **덮지 않고 덧붙인다** — 예상 범위·'안 끊는다' 같은 말은 그대로
+    남아야 한다.
+    """
+    bits = []
+    try:
+        age = ai.last_activity_age()
+    except Exception:  # noqa: BLE001 — 진단이 페이지를 깨뜨리지 않게
+        age = None
+    if age is not None and age < _CLAUDE_LIVE_SEC:
+        bits.append(
+            "claude 는 방금까지 답하고 있었어 — 한 단계가 길어서 숫자가 안 바뀌는 "
+            "것뿐이야." if age < 20
+            else f"claude 가 마지막으로 말한 게 {int(age)}초 전이야 — 아직 도는 중이야."
+        )
+    try:
+        fail_age = aijobs.progress_failure_age()
+    except Exception:  # noqa: BLE001
+        fail_age = None
+    if fail_age is not None and fail_age < _PROGRESS_FAIL_FRESH_SEC:
+        bits.append(
+            f"⚠️ 단계 표시를 {aijobs.progress_failures}번 못 적었어 — 일은 돌고 "
+            "있는데 숫자만 안 바뀌는 걸 수 있어."
+        )
+    return " ".join(bits)
+
+
+# claude 가 이 시간 안에 이벤트를 줬으면 '살아 있다'고 말한다. 길게 잡을 이유가
+# 없다 — 오래된 신호는 '지금 살아 있다'의 근거가 못 된다.
+_CLAUDE_LIVE_SEC = 180
+# 진척 쓰기 실패를 '최근 일'로 칠 시간. 지난 실패가 영원히 경고로 남으면 그건
+# 노이즈다(한 번 삐끗하고 회복되는 게 보통이다).
+_PROGRESS_FAIL_FRESH_SEC = 600
 
 
 def review_progress_view(app_obj, review, resumed=False):
@@ -2768,6 +2816,15 @@ def review_progress_view(app_obj, review, resumed=False):
         else:
             out["state"] = "running"
             out["headline"] = f"✨ 지금 쓰고 있어 — {when} · {where}"
+        # ⭐ **한 단계가 긴 것**과 **죽은 것**을 구분해 준다.
+        # 단계 라벨은 claude 콜 '사이'에만 바뀐다. 본문 한 콜이 수 분이면 그 동안
+        # 라벨은 당연히 그대로인데, 화면만 보면 멈춘 것과 똑같이 보인다 — 실제로
+        # '4/15 본문 쓰는 중' 에서 10분 멈춘 것처럼 보였다는 신고가 있었다.
+        # 그 동안에도 우리는 claude 의 stream 이벤트를 받고 있다. 그 사실을 그대로
+        # 말해 준다(시간으로 혼자 올라가는 가짜 진행률이 아니다 — 실제 이벤트다).
+        live = _claude_liveness_hint()
+        if live:
+            out["hint"] = (out["hint"] + " " + live).strip()
     else:  # queued
         m = _mins(snap["created_at"])
         out["elapsed_min"] = m
@@ -2950,10 +3007,27 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None
     **이미 바깥에서 쥔 채** 부르므로 False 다(같은 스레드가 Semaphore(1) 을 두 번
     잡으면 영원히 멈춘다). 단독 호출(재크롭 등)에서는 True 가 맞다.
 
-    ``on_step(done, total)`` — 선택. 사진 한 장의 비전 콜에 **들어가기 직전** 불린다
-    (1-based ``done``, 실제 image 블록 수 ``total``). 이 구간이 파이프라인에서 가장
-    길다(사진당 ``ai.CAPTION_EST_SEC`` 안팎, **상한은 없다**) — 여기서 아무 소식이
-    없으면 사람은 죽은 줄 안다. 콜백이 터져도 크롭은 그대로 간다.
+    ``on_step(done, total)`` — 선택. 1-based ``done``, 실제 image 블록 수 ``total``.
+    **정확히 블록 수만큼** 불리고 순서대로 올라간다. 이 구간이 파이프라인에서 가장
+    길다(**상한은 없다**) — 여기서 아무 소식이 없으면 사람은 죽은 줄 안다. 콜백이
+    터져도 크롭은 그대로 간다.
+
+    ⚡ **묶음(batch)으로 돈다.** 예전엔 사진 한 장당 claude 턴 하나였다(11장이면 11턴,
+    파이프라인에서 압도적으로 긴 구간). 지금은 ``ai.CROP_BATCH_SIZE`` 장씩 묶어 한 턴에
+    보여 주고 **사진별 좌표를 한꺼번에** 받는다. 묶는 크기를 작게 두는 이유는 주의
+    희석이다 — 한 턴에 너무 많이 주면 뒤쪽 사진을 대충 본다.
+
+    세 가지 위험을 구조로 막는다:
+
+      1. **매핑 사고** — 사진마다 키(``p00``…)를 주고 그 키가 **파일 경로에 그대로**
+         박힌다. 돌아온 키가 요청한 키가 아니면 버린다(``ai.parse_crops_batch``).
+      2. **빠진 사진** — 묶음 응답에 없는 키는 그 장만 **단건으로 다시 묻고**, 그래도
+         없으면 ``focus=None`` 중앙 크롭으로 떨어진다. 그 사진만 손해다.
+      3. **전부 아니면 전무** — 묶음 하나가 통째로 터져도 그 묶음만 잃는다(다음
+         묶음은 그대로 돈다).
+
+    재료 수집(렌디션 크기·바이트)은 **묶음 단위로** 한다 — 11장 치를 미리 다 받아
+    오면 그동안 화면이 조용해진다.
     """
     if not result or not isinstance(result, dict):
         return
@@ -2964,63 +3038,127 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None
         return
     # 실제로 비전 콜이 붙는 블록 수 — '사진 3/5' 의 분모다. 사진 개수가 아니라
     # **본문이 실제로 쓴 image 블록 수**여야 숫자가 정직하다.
-    total_imgs = sum(
-        1 for b in blocks
+    targets = [
+        (i, b, photos_ordered[b["photo_index"]])
+        for i, b in enumerate(blocks)
         if isinstance(b, dict) and b.get("type") == "image"
         and isinstance(b.get("photo_index"), int)
         and 0 <= b["photo_index"] < n
-    )
-    done_imgs = 0
-    for i, blk in enumerate(blocks):
+    ]
+    total_imgs = len(targets)
+    if not total_imgs:
+        return
+
+    def _report(done):
+        if on_step is None:
+            return
         try:
-            if not isinstance(blk, dict) or blk.get("type") != "image":
-                continue
-            pi = blk.get("photo_index")
-            if not isinstance(pi, int) or pi < 0 or pi >= n:
-                continue
-            p = photos_ordered[pi]
-            done_imgs += 1
-            if on_step is not None:
+            on_step(done, total_imgs)
+        except Exception:  # noqa: BLE001 — 진척 보고가 크롭을 깨뜨리지 않게
+            log.debug("crop on_step 실패", exc_info=True)
+
+    done_imgs = 0
+    for chunk in ai.crop_batches(targets):
+        # 긴 콜 **앞에서** 라벨을 움직인다 — 묶음의 첫 사진 번호로. 묶음이 끝나면
+        # 나머지 번호를 마저 올린다(콜백 횟수 = 블록 수, 분자 ≤ 분모).
+        _report(done_imgs + 1)
+        try:
+            jobs, rects = [], {}
+            for pos, (i, blk, p) in enumerate(chunk):
+                key = f"p{done_imgs + pos:02d}"
                 try:
-                    on_step(done_imgs, total_imgs)
-                except Exception:  # noqa: BLE001 — 진척 보고가 크롭을 깨뜨리지 않게
-                    log.debug("crop on_step 실패", exc_info=True)
-            dims = _crop_vision_dims(p)   # 픽셀 0바이트
-            if not dims:
-                continue  # 크기를 못 알아냄 → 크롭 없이(서빙은 다운스케일만)
-            img_w, img_h = dims
-            hint = _crop_hint_for_image(blocks, i)
-            vision_url = _crop_vision_url(p)
-            if vision_url:
-                data, ext = None, ".jpg"   # 바이트를 아예 안 만진다
-            else:
-                data, ext = _crop_vision_image(p)
-                if not data:
-                    continue  # 보여 줄 그림이 없다 → 이 사진만 건너뛴다
-            if acquire_sem:
-                _CAPTION_SEM.acquire()
-            try:
-                focus = ai.suggest_crop(
-                    data, hint, _BLOG_CROP_ASPECT, ext=ext, image_url=vision_url,
-                )
-            except ai.Cancelled:
-                raise  # 사람이 멈췄다 — 중앙 크롭 폴백으로 '성공'처럼 넘기지 않는다
-            except Exception:  # noqa: BLE001 — 비전 실패는 중앙 크롭으로 폴백
-                log.exception("suggest_crop raised (photo=%s)", p.id)
-                focus = None
-            finally:
-                if acquire_sem:
-                    _CAPTION_SEM.release()
-            rect = compute_crop_rect(img_w, img_h, focus, _BLOG_CROP_ASPECT)
-            blk["crop"] = [round(v, 4) for v in rect]
+                    dims = _crop_vision_dims(p)   # 픽셀 0바이트
+                    if not dims:
+                        continue  # 크기를 못 알아냄 → 크롭 없이(서빙은 다운스케일만)
+                    vision_url = _crop_vision_url(p)
+                    if vision_url:
+                        data, ext = None, ".jpg"   # 바이트를 아예 안 만진다
+                    else:
+                        data, ext = _crop_vision_image(p)
+                        if not data:
+                            continue  # 보여 줄 그림이 없다 → 이 사진만 건너뛴다
+                except Exception:  # noqa: BLE001 — 사진당 실패 격리
+                    log.exception("crop 재료 수집 실패 (photo=%s)", p.id)
+                    continue
+                rects[key] = (blk, dims)
+                jobs.append({
+                    "key": key,
+                    "hint": _crop_hint_for_image(blocks, i),
+                    "image_bytes": data,
+                    "ext": ext,
+                    "image_url": vision_url,
+                })
+            if jobs:
+                boxes = _suggest_crops(jobs, acquire_sem)
+                for job in jobs:
+                    key = job["key"]
+                    blk, (img_w, img_h) = rects[key]
+                    rect = compute_crop_rect(
+                        img_w, img_h, boxes.get(key), _BLOG_CROP_ASPECT
+                    )
+                    blk["crop"] = [round(v, 4) for v in rect]
         except ai.Cancelled:
-            raise  # 사람이 멈췄다 — 남은 사진으로 넘어가지 않는다
-        except Exception:  # noqa: BLE001 — 사진당 실패 격리(초안은 계속)
-            log.exception(
-                "image crop 계산 실패 (photo_index=%s)", blk.get("photo_index")
-                if isinstance(blk, dict) else "?"
-            )
+            raise  # 사람이 멈췄다 — 남은 묶음으로 넘어가지 않는다
+        except Exception:  # noqa: BLE001 — 묶음 실패 격리(초안은 계속)
+            log.exception("image crop 묶음 실패 (사진 %s장)", len(chunk))
+        for k in range(1, len(chunk)):
+            _report(done_imgs + 1 + k)
+        done_imgs += len(chunk)
+
+
+def _suggest_crops(jobs, acquire_sem):
+    """묶음 비전 콜 한 번 + **빠진 키만** 단건 재질의 → ``{key: box|None}``.
+
+    묶음이 통째로 실패해도 ``{}`` 가 오고, 그 다음 단건 재질의가 각 사진을 따로
+    구한다 — 어느 단계가 깨지든 **그 사진만** 중앙 크롭(``None``)으로 떨어진다.
+    """
+    def _sem(fn):
+        if acquire_sem:
+            _CAPTION_SEM.acquire()
+        try:
+            return fn()
+        finally:
+            if acquire_sem:
+                _CAPTION_SEM.release()
+
+    def _single(j):
+        return _sem(lambda: ai.suggest_crop(
+            j["image_bytes"], j["hint"], _BLOG_CROP_ASPECT,
+            ext=j["ext"], image_url=j["image_url"],
+        ))
+
+    if len(jobs) == 1:
+        # 한 장짜리 묶음은 묶을 게 없다 — 바로 단건이고, 재질의도 없다(같은 질문을
+        # 두 번 하지 않는다). None 이면 그대로 중앙 크롭이다.
+        try:
+            return {jobs[0]["key"]: _single(jobs[0])}
+        except ai.Cancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("suggest_crop raised (%s)", jobs[0]["key"])
+            return {jobs[0]["key"]: None}
+
+    try:
+        boxes = _sem(lambda: ai.suggest_crops_batch(jobs, _BLOG_CROP_ASPECT))
+    except ai.Cancelled:
+        raise  # 사람이 멈췄다 — 중앙 크롭 폴백으로 '성공'처럼 넘기지 않는다
+    except Exception:  # noqa: BLE001 — 비전 실패는 아래 단건/중앙 크롭으로
+        log.exception("suggest_crops_batch raised (%s장)", len(jobs))
+        boxes = {}
+    boxes = dict(boxes or {})
+    for job in jobs:
+        if boxes.get(job["key"]):
             continue
+        # 묶음이 이 사진을 빠뜨렸거나 키가 안 맞았다 — 그 장만 단건으로 다시 묻는다.
+        log.info("crop: 묶음에서 빠진 사진을 단건으로 다시 묻는다 (%s)", job["key"])
+        try:
+            boxes[job["key"]] = _single(job)
+        except ai.Cancelled:
+            raise
+        except Exception:  # noqa: BLE001 — 중앙 크롭으로 떨어진다
+            log.exception("suggest_crop raised (%s)", job["key"])
+            boxes[job["key"]] = None
+    return boxes
 
 
 def _naver_credentials_for(review):
@@ -3269,6 +3407,11 @@ def generate_review(app, review_id):
                     log.exception(
                         "commit failed for blog review (review=%s)", review_id
                     )
+                # 끝났다는 사실을 **폰까지** 보낸다 — 성공이든 실패든.
+                # 후기는 몇 분이 걸리고 비동기라, 사람은 그 화면을 보고 있지 않다.
+                # (사람이 직접 멈춘 cancelled 는 위 except 로 빠지므로 여기 안 온다.)
+                _notify_review_done(review)
+
                 # 초안이 섰으면 **상세 화면 그림을 미리 굽는다**(프리렌더).
                 # 사람이 열기 전에 끝내 두는 게 요점이라 줄 맨 뒤에 세운다 —
                 # claude 를 안 쓰는 잡이라 다음 claude 잡을 늦추지도 않는다.
@@ -3362,6 +3505,60 @@ def _save_review_result(review_id, result, research, status):
         log.exception("commit failed for blog review (review=%s)", review_id)
 
 
+def _notify_review_done(review):
+    """초안 생성이 **끝났다**는 사실을 커플 두 사람에게 알린다(인앱 + 웹푸시).
+
+    왜 — 후기 한 건은 몇 분이 걸리고 백그라운드로 돈다. 사람은 그 화면을 켜 놓고
+    기다리지 않고 **딴 일을 하러 간다.** 끝난 걸 모르면 끝난 게 아니다.
+
+    규율 넷:
+      * **성공도 실패도** 보낸다 — 기다리다 아무 소식 없는 게 제일 나쁘다.
+        사람이 직접 멈춘 ``cancelled`` 는 안 보낸다(자기가 누른 걸 안다).
+      * **두 사람 모두** — 이 게시판은 커플 공용이다(사용자 지시).
+      * **한 사이클에 한 번** — ``ai_notified_at`` 이 그 표시다. 새 사이클을 세울 때
+        (``_spawn_generate_review``) 지워지고 여기서 한 번 채워진다. 재시도·셀프힐·
+        ↻ 로 완료 전이를 여러 번 밟아도 같은 사이클이면 한 번뿐이고, 프로세스가
+        재시작돼도 DB 에 남아 있어 두 번 울리지 않는다.
+      * **절대 raise 하지 않는다** — 알림이 생성을 깨뜨리면 본말전도다
+        (``_safe_notify`` 가 이미 그 성질이고, 여기도 같은 규율이다).
+
+    발송 자체는 기존 ``_safe_notify`` 하나로 끝난다 — 인앱 행 + 웹푸시가 거기서
+    같이 나간다. 새 발송 경로를 만들지 않는다. 푸시가 꺼져 있으면(VAPID 키 없음)
+    ``send_push`` 가 조용히 no-op 이고 **인앱 알림은 그대로 간다.**
+    """
+    try:
+        if review is None or review.status not in ("ready", "failed"):
+            return False
+        if review.ai_notified_at is not None:
+            return False  # 이번 사이클엔 이미 보냈다
+        topic = (review.topic or "").strip() or "후기"
+        if len(topic) > 60:
+            topic = topic[:59] + "…"
+        if review.status == "ready":
+            msg = f"📝 블로그 초안 다 썼어 — 「{topic}」 보러 올래?"
+        else:
+            msg = f"😵 「{topic}」 블로그 초안을 못 만들었어 — ↻ 로 다시 돌려줄래?"
+        link = f"/reviews/{review.id}"
+        # 먼저 '보냈다'를 **커밋**한다 — 알림 발송 도중 죽어도 두 번 울리지 않는다.
+        review.ai_notified_at = datetime.utcnow()
+        try:
+            db.session.commit()
+        except Exception:  # noqa: BLE001 — 표시를 못 적으면 보내지 않는다(중복 방지 우선)
+            db.session.rollback()
+            log.exception("후기 알림 표시 커밋 실패 (review=%s)", review.id)
+            return False
+        people = User.query.filter_by(couple_id=review.couple_id).all()
+        for u in people:
+            _safe_notify(u, "review_ai", msg, link)
+        log.info("후기 초안 완료 알림 — review=%s status=%s 수신 %s명",
+                 review.id, review.status, len(people))
+        return True
+    except Exception:  # noqa: BLE001 — 알림이 생성을 깨뜨리지 않게
+        log.exception("후기 완료 알림 실패 (review=%s)",
+                      getattr(review, "id", "?"))
+        return False
+
+
 def _spawn_generate_review(app, review_id):
     """이 후기 초안 생성 백그라운드 스레드를 스폰(이미 진행 중이면 no-op).
 
@@ -3378,6 +3575,17 @@ def _spawn_generate_review(app, review_id):
             spawn = True
     if not spawn:
         return
+    # **새 사이클이다** — 지난 완료 알림 표시를 지운다. 이게 "한 사이클에 한 번"의
+    # 리셋 지점이고, 여기 말고 다른 데서 지우지 않는다(스폰 경로가 하나뿐이라
+    # 최초 생성·셀프힐·↻ 가 전부 여기로 모인다).
+    try:
+        row = db.session.get(BlogReview, review_id)
+        if row is not None and row.ai_notified_at is not None:
+            row.ai_notified_at = None
+            db.session.commit()
+    except Exception:  # noqa: BLE001 — 표시 지우기가 생성을 막지 않게
+        db.session.rollback()
+        log.exception("후기 알림 표시 초기화 실패 (review=%s)", review_id)
     if not _enqueue_ai(app, "review", f"review:{review_id}",
                        {"review_id": review_id}):
         with _generating_reviews_lock:
