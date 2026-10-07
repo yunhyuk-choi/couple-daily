@@ -239,6 +239,10 @@ def run_startup_migrations():
                 # 카드에 "영상 올리기"만 보인다. (``videos`` 테이블 자체는 brand-new라
                 # create_all()이 만든다 — ALTER가 필요한 건 이 컬럼 하나뿐이다.)
                 ("gif_json", "TEXT"),
+                # 완료 알림 중복 방지 — 이번 사이클에서 보냈나. 없으면 NULL 이라
+                # 옛 후기는 '아직 안 보냈다'가 되고, 그 후기를 다시 돌릴 때만
+                # 알림이 간다(과거 것이 소급해서 울리지 않는다).
+                ("ai_notified_at", "TIMESTAMP"),
             ):
                 if col in rcols:
                     continue
@@ -1244,6 +1248,12 @@ class BlogReview(db.Model):
     # **픽셀은 여기 안 들어간다** — GIF도 사용자의 브라우저가 만들어 바로 내려받는다
     # (서버엔 ffmpeg가 없다 — gifmaker.py 머리말).
     gif_json = db.Column(db.Text, nullable=True)
+    # 이번 생성 **사이클**에서 완료 알림을 보낸 시각(안 보냈으면 NULL).
+    # 왜 DB 에 적나 — 후기는 재시도·셀프힐·↻ 로 여러 번 완료 전이를 밟고, 프로세스가
+    # 재시작되면 인메모리 표시는 사라진다. 그러면 사람이 같은 후기로 알림을 두 번
+    # 세 번 받는다. 새 사이클을 세울 때(``_spawn_generate_review``) NULL 로 지우고,
+    # 그 사이클이 끝날 때 **한 번만** 채운다.
+    ai_notified_at = db.Column(db.DateTime, nullable=True)
     status = db.Column(db.String(16), default="draft", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(

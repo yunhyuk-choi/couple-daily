@@ -223,6 +223,7 @@ def test_crop_step_counts_the_blocks_that_actually_get_a_vision_call(
     monkeypatch.setattr(app_module, "_crop_vision_dims", lambda p: (100, 80))
     monkeypatch.setattr(app_module, "_crop_vision_url", lambda p: "http://x/i.jpg")
     monkeypatch.setattr(ai, "suggest_crop", lambda *a, **k: None)
+    monkeypatch.setattr(ai, "suggest_crops_batch", lambda *a, **k: {})
     app_module._attach_section_crops(
         result, photos, acquire_sem=False,
         on_step=lambda done, total: seen.append((done, total)),
