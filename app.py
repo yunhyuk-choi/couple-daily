@@ -3450,11 +3450,17 @@ def prerender_review_images(app_obj, review_id):
     (실측: 사진 5장이면 Graph 왕복 10회 · 브라우저 기준 첫 진입 1341ms). 그 일은
     지금 해 두면 된다 — claude 는 이미 끝났고 펌프는 어차피 다음 잡을 집기 전이다.
 
-    굽는 것 셋:
+    굽는 것 둘:
       * grid 티어 미리보기 자산 (사진 목록 썸네일)
-      * view 티어 미리보기 자산 (크롭 UI·라이트박스)
-      * 본문 std 바이트 (블록의 크롭 좌표 그대로 — 캐시 키가 크롭을 포함하므로
-        나중에 크롭을 바꾸면 그 블록만 다시 굽힌다)
+      * view 티어 미리보기 자산 (크롭 UI·라이트박스 **그리고 이제 본문 미리보기**)
+
+    ⛔ **본문 std 바이트는 더 이상 굽지 않는다.** 상세 화면의 본문은 이제 우리
+    미리보기 자산 + CSS 크롭으로 그린다(``_review_screen_html``) — 그 화면에서
+    ``/blog-img`` std 를 한 번도 부르지 않는다. std 는 '유저스크립트 없이 네이버에
+    붙여넣었을 때 네이버가 가져가는 외부 이미지' 전용이 됐고, 그건 몇 분 뒤 밖에서
+    일어나는 일이라 **지금 미리 구울 이유가 없다.** 이 한 줄을 지우면서 사람이
+    기다리는 경로에서 **서버 픽셀 디코드가 0** 이 됐다(이 앱의 유일한 Pillow
+    디코드가 거기였다).
 
     claude 를 전혀 쓰지 않는다. 전부 best-effort — 실패하면 예전처럼 '열 때' 만들어질
     뿐이다. 절대 raise 하지 않는다.
@@ -3464,25 +3470,13 @@ def prerender_review_images(app_obj, review_id):
             review = db.session.get(BlogReview, review_id)
             if review is None:
                 return
-            photos = review.photos_ordered
-            for p in photos:
+            for p in review.photos_ordered:
                 for tier in ("grid", "view"):
                     try:
                         previews.ensure(p, tier)
                     except Exception:  # noqa: BLE001 — 사진·티어당 격리
                         log.exception("prerender: 미리보기 자산 실패 (photo=%s %s)",
                                       p.id, tier)
-            data = review.ai or {}
-            for blk in (data.get("blocks") or []):
-                if not isinstance(blk, dict) or blk.get("type") != "image":
-                    continue
-                pi = blk.get("photo_index")
-                if not (isinstance(pi, int) and 0 <= pi < len(photos)):
-                    continue
-                try:
-                    blog_std_bytes(photos[pi].id, _crop_str(blk.get("crop")))
-                except Exception:  # noqa: BLE001 — 블록당 격리
-                    log.exception("prerender: std 굽기 실패 (photo_index=%s)", pi)
             db.session.remove()
     except Exception:  # noqa: BLE001 — 절대 스레드 밖으로 나가지 않는다
         log.exception("prerender_review_images failed (review=%s)", review_id)
@@ -4193,6 +4187,108 @@ def _first_img_src(html):
     if not m:
         return None
     return m.group(1).replace("&amp;", "&")
+
+
+# --------------------------------------------------------------------------- #
+# 화면 미리보기 ≠ 발행본 — **같은 문자열이던 둘을 가른다**
+# --------------------------------------------------------------------------- #
+# 왜 (2026-10-07, 사용자 지적):
+#   "애초에 본문 미리보기에선 왜 서명 url 을 쓰는 거지? 저것도 미리보긴데?
+#    다른 사진들하고 똑같은 썸네일 쓰면 되는 거 아니야? 발행 버튼 눌렀을 때만
+#    실제 서명 url 로 배선하고?"
+#
+# 맞다. 서명·만료가 필요한 이유는 **앱 밖(네이버)에서 열려야 하기 때문**이지 우리
+# 화면에서 보려고가 아니다. 로그인한 본인이 자기 사진을 보는 데 공개 서명 URL 을
+# 쓸 이유가 없다 — 그리고 그 결정 때문에 ``/blog-img`` 가 터지자 **본문 사진만**
+# 전부 엑박이 됐다(사진 목록·크롭 UI 는 미리보기 자산이라 멀쩡했다).
+#
+# 그래서 표현을 둘로 가른다. 저장되는 정본은 **발행본 하나**다(``edited_text`` 의
+# 형식은 1바이트도 안 바뀐다 — 북마클릿 매칭·발행 조립·토큰 재서명이 그대로 산다):
+#
+#   발행본(저장·복사·발행)  <img src="/blog-img/<id>?e=&t=&c=">   서명·만료 O
+#            │  _review_screen_html (서버, 렌더할 때)
+#            ▼
+#   화면본(미리보기)        우리 미리보기 자산 + **CSS 크롭**        서명·만료 X
+#            │  toPublishHtml() (브라우저, 저장·복사·발행할 때)
+#            ▼
+#   발행본
+#
+# 왕복이 되게 하는 열쇠는 화면본 요소에 박아 두는 ``data-cd-pub``(그 자리의 발행
+# URL)과 ``data-cd-alt`` 다. 브라우저는 그 둘만 보고 발행본을 **정확히** 되돌린다.
+#
+# CSS 크롭이 성립하는 근거: 크롭 좌표는 0~1 정규화라 해상도와 무관하고, 우리
+# 파이프라인의 크롭은 **언제나 ``_BLOG_CROP_ASPECT``(4:3)** 이다(``compute_crop_rect``
+# 가 강제하고 수동 조정 UI 도 같은 비율로 클램프한다). 그래서 컨테이너를 4:3 으로
+# 두고 이미지를 ``width:100/w%`` 로 키워 ``left:-x/w%`` ``top:-y/h%`` 만큼 밀면
+# 서버가 자른 것과 **같은 영역**이 보인다. 서버는 픽셀을 한 번도 안 만진다.
+_SCREEN_IMG_RE = re.compile(
+    r'<img\b(?P<a>[^>]*?)\bsrc="(?P<src>[^"]*?/blog-img/(?P<pid>\d+)[^"]*)"'
+    r'(?P<b>[^>]*?)>',
+    re.I,
+)
+_ALT_ATTR_RE = re.compile(r'\balt="([^"]*)"', re.I)
+_CROP_QUERY_RE = re.compile(r"[?&](?:amp;)?c=([0-9.,]+)")
+
+
+def _parse_crop_query(src):
+    """발행 URL 의 ``c=x,y,w,h`` → ``[x,y,w,h]`` (없거나 못 읽으면 None)."""
+    m = _CROP_QUERY_RE.search(src or "")
+    if not m:
+        return None
+    parts = m.group(1).split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        crop = [float(v) for v in parts]
+    except ValueError:
+        return None
+    x, y, w, h = crop
+    if w <= 0 or h <= 0:
+        return None
+    return crop
+
+
+def _review_screen_html(html):
+    """발행본 HTML → **화면용** HTML (서명 URL 을 우리 미리보기 자산으로 교체).
+
+    바꾸는 것은 ``<img>`` 하나하나뿐이다 — 문단·소제목·스타일은 손대지 않는다.
+    각 자리에 원래 있던 발행 URL 은 ``data-cd-pub`` 로 **그대로 들고 간다.**
+    브라우저가 저장·복사·발행할 때 그 값으로 발행본을 되돌린다.
+
+    ``/blog-img`` 가 아닌 ``<img>`` 나 못 읽는 URL 은 **그대로 둔다**(옛 후기·사람이
+    직접 붙인 그림이 사라지지 않게). 절대 raise 하지 않는다.
+    """
+    if not html:
+        return html
+
+    def _sub(m):
+        try:
+            pid = int(m.group("pid"))
+            pub = m.group("src")          # 이미 속성용으로 이스케이프된 문자열
+            attrs = (m.group("a") or "") + (m.group("b") or "")
+            am = _ALT_ATTR_RE.search(attrs)
+            alt = am.group(1) if am else "후기 사진"
+            preview = _preview_url(pid)
+            data = f'data-cd-pub="{pub}" data-cd-alt="{alt}"'
+            crop = _parse_crop_query(pub)
+            if not crop:
+                return (f'<img src="{preview}" alt="{alt}" {data} '
+                        'style="max-width:100%;height:auto;border-radius:10px;">')
+            x, y, w, h = crop
+            return (
+                f'<span {data} style="display:block;position:relative;'
+                f'width:100%;aspect-ratio:{_BLOG_CROP_ASPECT:.6f};'
+                'overflow:hidden;border-radius:10px;">'
+                f'<img src="{preview}" alt="{alt}" '
+                f'style="position:absolute;left:{-x * 100 / w:.4f}%;'
+                f'top:{-y * 100 / h:.4f}%;width:{100 / w:.4f}%;'
+                'height:auto;max-width:none;"></span>'
+            )
+        except Exception:  # noqa: BLE001 — 한 장 못 바꾼다고 본문을 깨뜨리지 않는다
+            log.exception("미리보기 이미지 변환 실패 — 발행 URL 그대로 둔다")
+            return m.group(0)
+
+    return _SCREEN_IMG_RE.sub(_sub, html)
 
 
 def _gen_export_key():
@@ -8121,6 +8217,13 @@ def _register_routes(app: Flask):
         copy_html = _refresh_blog_img_tokens(
             review.edited_text or _review_copy_html(review)
         )
+        # ⭐ **화면에 그리는 건 발행본이 아니다.** 서명·만료 URL 은 네이버가 밖에서
+        # 열어야 해서 있는 것이지 우리 화면용이 아니다(사용자 지적). 미리보기는
+        # 사진 목록·크롭 UI 와 **같은 경로**(우리 미리보기 자산 + CSS 크롭)로 간다 —
+        # 고정 URL · 서명 없음 · 만료 없음 · immutable · 서버 픽셀 디코드 0.
+        # 발행 URL 은 각 자리의 data-cd-pub 에 그대로 실려 가고, 저장·복사·발행할
+        # 때 브라우저가 그 값으로 발행본을 되돌린다(_review_screen_html 머리말).
+        screen_html = _review_screen_html(copy_html)
         # 수동 크롭 조정 UI 재료 — image 블록마다(블록 인덱스 기준). 옛/새 스키마 모두
         # _ensure_blocks로 통일해 블록 인덱스가 crop-save와 일치하게 한다. 뷰포트에
         # 띄울 '원본 전체'는 크롭 없는 blog_img_url(다운스케일 풀이미지)을 쓴다.
@@ -8200,7 +8303,7 @@ def _register_routes(app: Flask):
             "review_detail.html",
             review=review,
             photos=review.photos_ordered,
-            copy_html=copy_html,
+            copy_html=screen_html,   # 화면본(미리보기 자산) — 발행본이 아니다
             crop_sections=crop_sections,
             doc_data=doc_data,
             export_images=_export_images,
@@ -8225,7 +8328,7 @@ def _register_routes(app: Flask):
             # 그려 두고, 그 뒤 갱신은 /progress JSON 이 **같은 함수**로 만든다.
             progress=review_progress_view(app_obj, review, resumed=review_resumed),
             # 첫 화면 첫 사진 — <head> 에서 프리로드할 URL(없으면 None → 링크 생략).
-            preview_preload=_first_img_src(copy_html),
+            preview_preload=_first_img_src(screen_html),
         )
 
     @app.route("/reviews/<int:rid>/progress")

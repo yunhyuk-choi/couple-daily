@@ -697,27 +697,67 @@
     setTimeout(function () { toast.classList.remove('show'); toast.hidden = true; }, 1800);
   }
   function plainText() { return box.innerText || box.textContent || ''; }
+
+  // ⭐ 화면본 → **발행본**. 화면에 그려진 건 우리 미리보기 자산(서명·만료 없음)이고,
+  // 네이버로 나갈 본문은 공개 서명 URL 이어야 한다. 그 자리의 발행 URL 은 서버가
+  // data-cd-pub 에 실어 보냈으니, 그 값으로 평범한 <img> 를 되세우면 끝이다.
+  // 저장(edited_text)·복사·발행이 **전부 이 함수를 통과**한다 — 저장 형식은 예전과
+  // 1바이트도 다르지 않아서 북마클릿 매칭·토큰 재서명이 그대로 산다.
+  function toPublishHtml() {
+    var clone;
+    try {
+      clone = box.cloneNode(true);
+      var marked = clone.querySelectorAll('[data-cd-pub]');
+      Array.prototype.forEach.call(marked, function (el) {
+        var img = document.createElement('img');
+        img.setAttribute('src', el.getAttribute('data-cd-pub'));
+        img.setAttribute('alt', el.getAttribute('data-cd-alt') || '후기 사진');
+        img.setAttribute('style', 'max-width:100%;height:auto;border-radius:10px;');
+        el.parentNode.replaceChild(img, el);
+      });
+      return clone.innerHTML;
+    } catch (e) {
+      // 변환이 깨지면 화면본을 그대로 내보내지 않는다 — 미리보기 자산 URL 은
+      // 로그인이 필요해서 네이버가 못 연다. 차라리 원본 HTML 을 그대로 둔다.
+      try { console.error('[copy] publish html 변환 실패', e); } catch (_) {}
+      return box.innerHTML;
+    }
+  }
+
   function saveQuiet() {
     try {
       var fd = new FormData();
-      fd.append('text', box.innerHTML);  // 이제 HTML을 저장
+      fd.append('text', toPublishHtml());  // 저장되는 정본은 **발행본**이다
       fetch(saveUrl, {
         method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
     } catch (e) { /* best-effort */ }
   }
-  function legacyCopy() {
-    // contenteditable 전체 선택 → execCommand('copy')는 리치 텍스트째 복사한다.
+  function legacyCopy(html) {
+    // execCommand('copy') 는 **선택된 DOM** 을 리치 텍스트째 복사한다. 그래서
+    // 화면의 #review-copy 를 그대로 선택하면 안 된다 — 거기 박힌 건 로그인이
+    // 필요한 미리보기 자산 URL 이라 네이버가 못 연다. 발행본으로 만든 **임시
+    // 노드**를 화면 밖에 세워 그걸 선택한다(끝나면 즉시 치운다).
+    var tmp = null;
     try {
+      tmp = document.createElement('div');
+      tmp.setAttribute('contenteditable', 'true');
+      tmp.style.cssText =
+        'position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;';
+      tmp.innerHTML = html;
+      document.body.appendChild(tmp);
       var sel = window.getSelection();
       var range = document.createRange();
-      range.selectNodeContents(box);
+      range.selectNodeContents(tmp);
       sel.removeAllRanges();
       sel.addRange(range);
       var ok = document.execCommand('copy');
       sel.removeAllRanges();
       if (ok) return true;
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      if (tmp && tmp.parentNode) tmp.parentNode.removeChild(tmp);
+    }
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(plainText());
@@ -727,7 +767,7 @@
     return false;
   }
   btn.addEventListener('click', function () {
-    var html = box.innerHTML;
+    var html = toPublishHtml();   // 클립보드로는 **발행본**이 나간다(공개 서명 URL)
     var plain = plainText();
     // 복사는 복사만 — 절대 자동 저장하지 않는다(자동 저장이 옛 서식을 edited_text에
     // 얼려버려 이후 복사에서 그 raw HTML이 그대로 나가는 문제 방지). 진짜 편집은
@@ -748,12 +788,12 @@
           })
         ]).then(done, function () {
           // (b) 그래도 안 되면 contenteditable 선택 + execCommand 폴백.
-          if (legacyCopy()) done();
+          if (legacyCopy(html)) done();
         });
       });
     } else {
       // (b) ClipboardItem/clipboard.write 미지원 → 레거시 리치 복사.
-      if (legacyCopy()) done();
+      if (legacyCopy(html)) done();
     }
   });
   if (saveBtn) {
@@ -824,7 +864,7 @@
   //    한 장씩 순차로 처리해 폰 메모리를 지키고, 진행률을 토스트로 보여 준다
   //    (썸네일·GIF 가 쓰는 패턴과 같다). 자세한 규율은 static/imagecrop.js 머리말.
   function buildExportPayload() {
-    var copyHtml = box.innerHTML;
+    var copyHtml = toPublishHtml();   // 북마클릿이 받는 건 **발행본**이다
     // 정식 삽입용 구조화 데이터(있으면) — 북마클릿이 setDocumentData로 조립할 재료.
     var doc = null;
     try {
@@ -839,10 +879,13 @@
       if (exEl) specs = JSON.parse(exEl.textContent || '[]') || [];
     } catch (e) { specs = []; }
     if (!specs.length) {
-      // 폴백: 구조화 데이터가 없는 옛 후기 — 미리보기의 <img> 를 그대로 쓴다
-      // (이미 서버가 잘라 준 std 바이트. 화질은 1280px 미리보기 수준).
+      // 폴백: 구조화 데이터가 없는 옛 후기 — **발행본**의 <img> 를 그대로 쓴다
+      // (화면본이 아니다 — 거기 박힌 미리보기 자산 URL 은 로그인이 필요해서
+      // 네이버·북마클릿이 못 연다). 이미 서버가 잘라 준 std 바이트다.
+      var pubDoc = document.createElement('div');
+      pubDoc.innerHTML = copyHtml;
       var seen = {};
-      Array.prototype.forEach.call(box.querySelectorAll('img'), function (im) {
+      Array.prototype.forEach.call(pubDoc.querySelectorAll('img'), function (im) {
         var src = im.getAttribute('src') || '';
         if (!src || seen[src]) return;
         seen[src] = true;
