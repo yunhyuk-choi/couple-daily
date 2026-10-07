@@ -85,8 +85,11 @@ def drive(monkeypatch, tmp_path):
                  "get_photo_content", "get_photo_content_cached"):
         monkeypatch.setattr(onedrive, name, getattr(d, name))
     # 가공완료 캐시는 테스트마다 빈 디렉토리로 격리(레포 워킹트리는 절대 안 건드린다).
-    monkeypatch.setattr(app_module._blog_proc_cache, "directory",
-                        str(tmp_path / "proc"), raising=False)
+    # ⚠️ 속성 이름은 ``dir`` 이다(``directory`` 는 생성자 인자일 뿐). 예전엔
+    # ``directory`` 를 ``raising=False`` 로 덮어 **격리가 전혀 안 됐고**, 시스템
+    # 임시폴더의 공용 캐시를 그대로 썼다(옛 실행의 히트가 섞인다).
+    monkeypatch.setattr(app_module._blog_proc_cache, "dir",
+                        str(tmp_path / "proc"))
     return d
 
 
