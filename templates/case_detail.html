@@ -84,12 +84,23 @@
   {# 판결 맡기기 / 다시 맡기기 — 종결 시 숨김 #}
   {% if not resolved %}
     <div class="card">
+      {# judging 중엔 버튼을 잠근다 — 단, 생성 스레드가 사라졌거나(judging_resumed)
+         상한을 넘겼으면(overdue) 잠그지 않는다. 안 그러면 재시작으로 죽은 판결이
+         '판결 중…' + disabled 로 영구 고착돼 탈출구가 없다(초안 고착과 같은 구멍). #}
+      {% set judging_stuck = judging_resumed or judging_state == 'overdue' %}
       <form method="post" action="{{ url_for('case_judge', case_id=case.id) }}">
         <button class="btn primary" type="submit" style="width:100%"
-                {% if not has_statement or case.status == 'judging' %}disabled{% endif %}>
-          {% if case.status == 'judging' %}판결 중…{% elif verdict %}다시 판결 맡기기{% else %}판결 맡기기{% endif %}
+                {% if not has_statement or (case.status == 'judging' and not judging_stuck) %}disabled{% endif %}>
+          {% if case.status == 'judging' and not judging_stuck %}판결 중…
+          {% elif judging_stuck %}↻ 판결 다시 맡기기
+          {% elif verdict %}다시 판결 맡기기{% else %}판결 맡기기{% endif %}
         </button>
       </form>
+      {% if judging_resumed %}
+        <p class="muted small center" style="margin:10px 0 0">판결이 중단된 것 같아 방금 다시 시작했어.</p>
+      {% elif judging_state == 'overdue' %}
+        <p class="muted small center" style="margin:10px 0 0">판결이 너무 오래 걸리고 있어 — 중단된 것 같아.</p>
+      {% endif %}
       {% if not has_statement %}
         <p class="muted small center" style="margin:10px 0 0">진술이 하나라도 있어야 판결을 맡길 수 있어.</p>
       {% endif %}
@@ -110,7 +121,13 @@
   {% if case.status == 'judging' %}
     <div class="card center-card verdict-judging">
       <img class="emoji hero" src="{{ url_for('static', filename='emoji/balance_scale.svg') }}" alt="" />
+      {% if judging_resumed %}
+      <p class="muted">판결이 중단된 것 같아 다시 시작했어…<br /><span class="small">조금만 기다려줘.</span></p>
+      {% elif judging_state == 'overdue' %}
+      <p class="muted">판결이 중단된 것 같아.<br /><span class="small">'사건' 탭에서 다시 맡길 수 있어.</span></p>
+      {% else %}
       <p class="muted">판결 내리는 중이에요…<br /><span class="small">잠시만 기다려줘. 다 되면 자동으로 결과가 나와.</span></p>
+      {% endif %}
     </div>
   {% elif has_verdict %}
     <div class="card verdict-card">

@@ -112,16 +112,47 @@ except Exception:  # noqa: BLE001 - Pillow 자체가 없으면 변환 전체 비
     log.info("app: Pillow 미탑재 — HEIC→JPEG 변환 비활성(원본 서빙)")
 
 
+# --------------------------------------------------------------------------- #
+# ⛔ 이미지 디코드 경로의 메모리 규율 (2026-10-07 OOM 사고에서 실측으로 승격)
+# --------------------------------------------------------------------------- #
+# 3024×4032(12.2MP) 한 장의 RGB 픽셀 버퍼는 그 자체로 ~36MB다. Pillow 로 '무심코'
+# 쓰면 그 36MB 짜리 사본이 **여러 개** 동시에 살아 있게 된다:
+#   * ``ImageOps.exif_transpose(img)`` 는 방향 태그가 없어도 **전체 사본**을 만든다.
+#   * ``img.convert("RGB")`` 는 이미 RGB 여도 **또 전체 사본**을 만든다.
+# 실측(3.03MB JPEG · 3024×4032, RSS 봉우리):
+#   원본 해상도 저장(hq)  : 143MB → **50MB**  (-65%)
+#   1280 다운스케일(std) : 112MB → **66MB**  (-41%)
+#   두 경로 모두 출력 픽셀은 **완전히 동일**(채널별 평균차 0.0, 최대차 0).
+# 512MB 티어에서 claude -p 한 개가 ~265MB·파이썬 워커가 ~100MB 를 쓰므로, 이 사본
+# 하나가 그대로 OOM 과 생존의 차이다. 아래 두 헬퍼를 **모든 디코드 경로가** 쓴다.
+def _exif_upright(img):
+    """EXIF 방향을 적용한 이미지 — 가능하면 **제자리에서**(전체 사본 금지).
+
+    ``in_place=True`` 는 Pillow 9.5+ 이고 이 앱은 ``Pillow>=10.2`` 를 쓴다. 혹시
+    더 옛 Pillow 면 옛 경로(사본)로 폴백한다 — 느려지지 않고 메모리만 예전과 같다.
+    """
+    try:
+        return _PILImageOps.exif_transpose(img, in_place=True) or img
+    except TypeError:  # pragma: no cover - Pillow < 9.5
+        return _PILImageOps.exif_transpose(img)
+
+
+def _as_rgb(img):
+    """JPEG 로 저장할 수 있는 RGB 이미지 — 이미 RGB 면 **사본을 만들지 않는다.**"""
+    return img if img.mode == "RGB" else img.convert("RGB")
+
+
 def _heic_to_jpeg(data):
     """HEIC/HEIF 바이트를 JPEG 바이트로 변환. 실패하면 None(호출부는 원본 폴백).
 
     절대 예외를 던지지 않는다 — Pillow/pillow-heif 부재·디코드 실패 모두 None.
+    메모리 규율은 위 머리말 참고(실측 봉우리 ~99MB → 사본 제거분만큼 내려간다).
     """
     if not _HEIC_OK or not data:
         return None
     try:
         with _PILImage.open(_BytesIO(data)) as img:
-            rgb = img.convert("RGB")
+            rgb = _as_rgb(img)
             out = _BytesIO()
             rgb.save(out, format="JPEG", quality=85)
             return out.getvalue()
@@ -138,8 +169,17 @@ _BLOG_CROP_ASPECT = 4 / 3
 # 가공완료(crop+downscale+JPEG) 블로그 이미지 바이트 캐시. (photo,crop,quality)당
 # 결과가 불변이라 무효화 불필요. 히트 시 OneDrive 호출·_blog_img_process를 모두
 # 건너뛰어 재방문/재export가 즉시다. onedrive.py 캐시와 같은 만료/축출 패턴.
+#
+# ⚠️ 상한은 **개수가 아니라 바이트**다. 옛 상한(200개)은 메모리를 전혀 묶지 못했다 —
+# 실측: std(1280·q92) 엔트리 0.59MB / hq(원본 해상도·q95) 엔트리 3.28MB. 200개면
+# 최악 **656MB** 로, 512MB 티어를 캐시 하나가 혼자 넘긴다(2026-10-07 OOM 사고의
+# 지분). 엔트리 크기가 5배 넘게 들쭉날쭉한 캐시는 개수로 묶으면 안 된다.
+# 예산 48MB 의 근거(실측 기반 산수): 파이썬 워커 ~100MB + `claude -p` ~265MB +
+# 이미지 디코드 봉우리 ~50MB = 415MB. 512MB 까지 남는 ~97MB 를 이 캐시(48MB)와
+# onedrive 원본 바이트 캐시(16MB)가 나눠 쓰고 ~33MB 를 여유로 둔다.
+# 48MB 는 std 미리보기 ~81장 / hq ~14장이다(후기 한 건의 사진이 보통 5~10장).
 _BLOG_PROC_CACHE_TTL = 6 * 3600  # seconds (~6h)
-_BLOG_PROC_CACHE_MAX = 200
+_BLOG_PROC_CACHE_BUDGET = 48 * 1024 * 1024
 _blog_proc_cache = {}  # key: (photo_id, crop_str, mode) -> (jpeg_bytes, expiry)
 
 
@@ -152,14 +192,23 @@ def _blog_proc_cache_get(key):
 
 
 def _blog_proc_cache_put(key, data):
-    """가공완료 캐시 저장 — 삽입 전 만료·최고령 항목을 축출해 메모리 상한 유지."""
+    """가공완료 캐시 저장 — 만료분을 버리고, **바이트 예산** 안으로 축출한 뒤 넣는다.
+
+    한 엔트리가 예산보다 크면 아예 캐시하지 않는다(그 한 장이 캐시 전체를 비우고
+    눌러앉는 것을 막는다 — 호출부는 매번 다시 가공할 뿐 기능은 그대로다).
+    """
+    if not data:
+        return
+    size = len(data)
+    if size > _BLOG_PROC_CACHE_BUDGET:
+        return
     now = time.time()
-    if len(_blog_proc_cache) >= _BLOG_PROC_CACHE_MAX:
-        for k in [k for k, v in _blog_proc_cache.items() if v[1] <= now]:
-            _blog_proc_cache.pop(k, None)
-        if len(_blog_proc_cache) >= _BLOG_PROC_CACHE_MAX:
-            oldest = min(_blog_proc_cache, key=lambda k: _blog_proc_cache[k][1])
-            _blog_proc_cache.pop(oldest, None)
+    for k in [k for k, v in _blog_proc_cache.items() if v[1] <= now]:
+        _blog_proc_cache.pop(k, None)
+    total = sum(len(v[0]) for v in _blog_proc_cache.values()) + size
+    while _blog_proc_cache and total > _BLOG_PROC_CACHE_BUDGET:
+        oldest = min(_blog_proc_cache, key=lambda k: _blog_proc_cache[k][1])
+        total -= len(_blog_proc_cache.pop(oldest)[0])
     _blog_proc_cache[key] = (data, now + _BLOG_PROC_CACHE_TTL)
 
 
@@ -205,7 +254,7 @@ def _image_display_size(data):
         return None
     try:
         with _PILImage.open(_BytesIO(data)) as im:
-            img = _PILImageOps.exif_transpose(im)
+            img = _exif_upright(im)  # 전체 사본 금지 — 머리말의 메모리 규율
             return (int(img.width), int(img.height))
     except Exception:  # noqa: BLE001 - 손상·비이미지·미지원
         return None
@@ -284,13 +333,16 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
     면 다운스케일 자체를 건너뛴다 — 네이버 export용 hq(원본 해상도, EXIF·crop만).
     HEIC도 같은 open으로 처리(pillow_heif 등록됨). 어떤 이유로든 실패하면 None
     (호출부가 원본 폴백해 절대 500 안 나게). 저장 원본은 손대지 않는다(메모리 사본만).
+
+    메모리: 전체 사본을 만들지 않는 ``_exif_upright``/``_as_rgb`` 를 쓴다(위 머리말의
+    실측 — hq 봉우리 143MB → 50MB, std 112MB → 66MB, 출력 픽셀은 완전히 동일).
     """
     if not _HEIC_OK or not _PILImage or not data:
         return None
     try:
         resample = getattr(getattr(_PILImage, "Resampling", _PILImage), "LANCZOS")
         with _PILImage.open(_BytesIO(data)) as im:
-            img = _PILImageOps.exif_transpose(im)
+            img = _exif_upright(im)
             if crop:
                 try:
                     x, y, w, h = (float(v) for v in crop)
@@ -305,7 +357,7 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92):
                     img = img.crop((left, top, right, bottom))
             if max_edge:
                 img.thumbnail((max_edge, max_edge), resample)  # 다운스케일만(업스케일 X)
-            rgb = img.convert("RGB")
+            rgb = _as_rgb(img)
             out = _BytesIO()
             rgb.save(out, format="JPEG", quality=quality, optimize=True)
             return out.getvalue()
@@ -885,6 +937,44 @@ _generating: set[tuple[int, int, int]] = set()
 _STUCK_GENERATING = timedelta(minutes=5)
 
 
+# --------------------------------------------------------------------------- #
+# 'pending 행 + 인프로세스 데몬 스레드' 공통 복구 규율 (실측된 사고에서 승격)
+# --------------------------------------------------------------------------- #
+# 이 앱의 모든 AI 생성은 "DB 행을 pending/generating 으로 세우고 데몬 스레드를 띄운다"
+# 는 한 패턴을 쓴다. 그 패턴에는 구멍이 하나 있다: **프로세스가 죽으면 스레드도 같이
+# 죽는데 행은 pending 그대로 영원히 남는다.** 2026-10-07 운영 사고가 정확히 이것이다 —
+# Render 가 메모리 한도 초과로 워커를 자동 재시작했고, 생성 중이던 블로그 초안 행이
+# '작성중'에 영구히 박혔다(사용자는 화면에서 빠져나갈 길조차 없었다).
+#
+# 월간 회고는 이미 이 규율(_STUCK_GENERATING)을 갖고 있었지만 그 한 곳에만 걸려
+# 있었다. 아래 두 함수가 그 규율을 **패턴 전체의 단일 원천**으로 올린다. 판정은 두 겹:
+#   * 인프로세스 가드: 이 워커가 그 작업의 키를 들고 있나. 재시작 뒤엔 이 집합이
+#     비어 있으므로 '죽은 스레드'를 **즉시**(상한을 기다리지 않고) 알아본다.
+#     — 이 앱은 단일 gunicorn 워커가 전제다(Dockerfile `--workers ${WEB_CONCURRENCY:-1}`,
+#       claude 직렬화용 _CAPTION_SEM 도 프로세스 단위다). 그 전제 위에서 이 가드는
+#       '아무도 안 만들고 있다'와 정확히 같은 뜻이다.
+#   * 행 신선도: 가드가 비어 있어도 스폰 직후의 찰나(_BG_SPAWN_GRACE)는 유예한다.
+#     가드가 차 있어도 상한을 넘겼으면(hang·무한 대기) 사람에게 탈출구를 준다.
+_BG_SPAWN_GRACE = timedelta(seconds=60)
+
+
+def _bg_job_verdict(lock, keys, key, updated_at, stuck_after):
+    """백그라운드 생성 한 건의 상태를 판정한다 — 'running' / 'orphaned' / 'overdue'.
+
+    * ``running``  — 정상 생성 중(가드 보유, 상한 이내). 화면은 그냥 기다리면 된다.
+    * ``orphaned`` — 만드는 스레드가 사라졌다(프로세스 재시작). **되살려야 한다.**
+    * ``overdue``  — 스레드는 등록돼 있는데 상한을 넘겼다(hang·세마포어 장기 대기).
+      자동으로 할 수 있는 일은 없으니 화면이 사람에게 탈출구를 줘야 한다.
+    """
+    now = datetime.utcnow()
+    age = now - (updated_at or now)
+    with lock:
+        alive = key in keys
+    if not alive:
+        return "orphaned" if age >= _BG_SPAWN_GRACE else "running"
+    return "overdue" if age >= stuck_after else "running"
+
+
 def regenerate_monthly_report(app, couple_id, year, month):
     """Background worker: (re)build the cached qualitative report for a month.
 
@@ -1282,6 +1372,62 @@ def judge_case(app, case_id):
     finally:
         with _judging_lock:
             _judging.discard(case_id)
+
+
+def _spawn_judge_if_idle(app_obj, case_id):
+    """판결 백그라운드 스레드를 스폰(이미 진행 중이면 no-op). 절대 raise 안 한다.
+
+    다른 생성기들의 ``_spawn_*_if_idle`` 과 같은 패턴 — 빠른 더블탭이 같은 사건에
+    스레드 두 개를 띄우지 못하게 ``_judging`` 가드로 떨군다.
+    """
+    spawn = False
+    with _judging_lock:
+        if case_id not in _judging:
+            _judging.add(case_id)
+            spawn = True
+    if not spawn:
+        return
+    try:
+        threading.Thread(
+            target=judge_case, args=(app_obj, case_id), daemon=True
+        ).start()
+    except Exception:  # noqa: BLE001 — never break the redirect
+        log.exception("failed to spawn judge thread for case %s", case_id)
+        with _judging_lock:
+            _judging.discard(case_id)
+
+
+def case_judging_verdict(case):
+    """'judging' 사건의 상태 — 'running'/'orphaned'/'overdue' 또는 None.
+
+    후기 초안과 **같은 구멍**: 재시작하면 사건 상세가 '판결 중…'에 영구히 박히고,
+    그 화면의 '판결 맡기기' 버튼은 judging 동안 **disabled** 라 탈출구조차 없다.
+    상한은 ``_STUCK_GENERATING``(5분) — 판결은 claude 콜 한 번이다.
+    """
+    if case is None or case.status != "judging":
+        return None
+    return _bg_job_verdict(
+        _judging_lock, _judging, case.id, case.updated_at, _STUCK_GENERATING
+    )
+
+
+def resume_judging_if_orphaned(app_obj, case):
+    """고아가 된 'judging' 사건의 판결을 되살린다(되살렸으면 True).
+
+    ⚠️ ``verdict_json`` 을 건드리지 않는다 — 직전 판결이 있으면 그대로 남는다.
+    """
+    if case_judging_verdict(case) != "orphaned":
+        return False
+    case.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception("판결 재개 커밋 실패 (case=%s)", case.id)
+        return False
+    log.warning("판결 스레드가 사라져 재개한다 (case=%s)", case.id)
+    _spawn_judge_if_idle(app_obj, case.id)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1742,6 +1888,36 @@ def _spawn_recommend_if_idle(app, couple_id):
         log.exception("failed to spawn recommend thread for couple %s", couple_id)
 
 
+def resume_recommendation_if_orphaned(app_obj, couple_id):
+    """고아가 된 'pending' 데이트 추천을 되살린다(되살렸으면 True).
+
+    후기 초안과 **같은 구멍** — 재시작으로 추천 스레드가 죽으면 FAB 패널이
+    '뽑는 중'으로 영원히 폴링한다(사용자가 다시 누르기 전엔 아무 일도 안 일어난다).
+    상한은 월간 회고와 같은 ``_STUCK_GENERATING``(5분): 추천은 claude 콜 한 번이다.
+
+    ⚠️ 직전 ready 추천 내용(message·picks_json)은 건드리지 않는다.
+    """
+    rec = DateRecommendation.query.filter_by(couple_id=couple_id).first()
+    if rec is None or rec.status != "pending":
+        return False
+    verdict = _bg_job_verdict(
+        _recommending_lock, _recommending, couple_id,
+        rec.updated_at, _STUCK_GENERATING,
+    )
+    if verdict != "orphaned":
+        return False
+    rec.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception("데이트 추천 재개 커밋 실패 (couple=%s)", couple_id)
+        return False
+    log.warning("데이트 추천 스레드가 사라져 재개한다 (couple=%s)", couple_id)
+    _spawn_recommend_if_idle(app_obj, couple_id)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 데이트 후기 → 네이버 블로그 초안 백그라운드 생성 (P2)
 # 캡션·채점·추천과 공유하는 _CAPTION_SEM으로 claude를 직렬화하고(512MB: 동시에
@@ -1750,6 +1926,61 @@ def _spawn_recommend_if_idle(app, couple_id):
 # ---------------------------------------------------------------------------
 _generating_reviews_lock = threading.Lock()
 _generating_reviews: set[int] = set()
+
+# 후기 초안 전용 stale 상한 — 월간 회고의 _STUCK_GENERATING(5분)을 **그대로 쓰면 안
+# 된다.** 후기 생성은 claude 를 여러 번 부르고, 그 전부가 캡션·채점·추천과 공유하는
+# _CAPTION_SEM 뒤에 줄을 선다:
+#     키워드 후보 + 선정   = 2 × ai.CLAUDE_TIMEOUT(120s)  = 240s
+#     본문 생성(write_review) = 1 × ai.CLAUDE_TIMEOUT(120s) = 120s
+#     사진 블록마다 비전 크롭  = N × ai.CAPTION_TIMEOUT(180s)
+# 실측 정상치는 ~170초지만(Step 3) 상한은 사진 수에 비례해 늘어난다 — 사진 5장이면
+# 360 + 900 = 1260s(21분)까지 '정상'이다. 5분을 그대로 쓰면 정상 생성을 stale 로
+# 오인한다. 그래서 25분: 사진 5장짜리 최악 생성(21분)보다 넉넉하고, '어제부터 멈춘
+# 행'은 확실히 잡는다. (재시작으로 스레드가 죽은 경우는 이 상한을 **기다리지 않는다** —
+# 인프로세스 가드가 즉시 'orphaned' 로 판정한다. 이 25분은 스레드가 살아 있는데도
+# 안 끝나는 경우(hang)에만 쓰이는 사람 탈출구의 기준이다.)
+_STUCK_REVIEW = timedelta(minutes=25)
+
+
+def review_pending_verdict(review):
+    """'pending' 후기 초안의 생성 상태 — 'running'/'orphaned'/'overdue' 또는 None.
+
+    pending 이 아니면 None. 판정 규율은 ``_bg_job_verdict`` 가 단일 원천이다.
+    """
+    if review is None or review.status != "pending":
+        return None
+    return _bg_job_verdict(
+        _generating_reviews_lock, _generating_reviews, review.id,
+        review.updated_at, _STUCK_REVIEW,
+    )
+
+
+def resume_review_if_orphaned(app_obj, review):
+    """고아가 된 'pending' 후기 초안 생성을 되살린다(되살렸으면 True).
+
+    프로세스가 재시작돼 데몬 스레드가 같이 죽은 행을 다시 스폰한다. ``/memories``
+    가 멈춘 캡션을, ``/dates`` 가 미채점 행사를 되살리는 것과 같은 셀프힐이다.
+
+    ⚠️ ``ai_json``·``edited_text``·``research_json`` 을 **절대 건드리지 않는다** —
+    되돌리는 것은 '생성이 돌고 있다'는 표시(updated_at)뿐이다. 사람이 요청한
+    ``/regenerate`` 와 달리 이건 자동 복구라, 직전 좋은 초안과 사람이 편집한
+    복사본은 그대로 남는다(재생성이 빈손이어도 직전 산출물을 안 지우는 규율).
+    """
+    if review_pending_verdict(review) != "orphaned":
+        return False
+    review.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001 — 복구가 요청을 깨뜨리면 안 된다
+        db.session.rollback()
+        log.exception("후기 초안 재개 커밋 실패 (review=%s)", review.id)
+        return False
+    log.warning(
+        "후기 초안 생성 스레드가 사라져 재개한다 (review=%s) — 프로세스 재시작 추정",
+        review.id,
+    )
+    _spawn_generate_review(app_obj, review.id)
+    return True
 
 
 def _crop_hint_for_image(blocks, idx):
@@ -2104,6 +2335,47 @@ def _spawn_generate_thumbnail(app, review_id):
         log.exception("failed to spawn thumbnail thread for review %s", review_id)
         with _thumbing_reviews_lock:
             _thumbing_reviews.discard(review_id)
+
+
+def thumbnail_pending_verdict(review):
+    """'pending' 썸네일 카피 생성의 상태 — 'running'/'orphaned'/'overdue' 또는 None.
+
+    초안 생성과 **같은 구멍**이 여기에도 있다(인프로세스 스레드 + pending JSON 상태):
+    재시작하면 상세 화면이 '만드는 중'에 영구히 박힌다. 상한은 월간 회고와 같은
+    ``_STUCK_GENERATING``(5분) — 썸네일 카피는 claude 콜이 **한 번**이라
+    ai.CLAUDE_TIMEOUT(120s) 이 상한이고 5분이면 넉넉하다.
+    """
+    if review is None:
+        return None
+    state = review.thumbnail or {}
+    if state.get("status") != "pending":
+        return None
+    return _bg_job_verdict(
+        _thumbing_reviews_lock, _thumbing_reviews, review.id,
+        review.updated_at, _STUCK_GENERATING,
+    )
+
+
+def resume_thumbnail_if_orphaned(app_obj, review):
+    """고아가 된 'pending' 썸네일 카피 생성을 되살린다(되살렸으면 True).
+
+    ⚠️ ``thumbnail_json`` 의 기존 내용(사람이 고른 후보·줄인 문구·사진 선택)을
+    건드리지 않는다 — 상태는 이미 'pending' 이고 되돌리는 건 updated_at 뿐이다.
+    """
+    if thumbnail_pending_verdict(review) != "orphaned":
+        return False
+    review.updated_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception("썸네일 카피 재개 커밋 실패 (review=%s)", review.id)
+        return False
+    log.warning(
+        "썸네일 카피 생성 스레드가 사라져 재개한다 (review=%s)", review.id
+    )
+    _spawn_generate_thumbnail(app_obj, review.id)
+    return True
 
 
 def _star_bar(score):
@@ -5356,6 +5628,10 @@ def _register_routes(app: Flask):
         sides = [{"user": u, "statement": my_st, "is_me": True}]
         if partner is not None:
             sides.append({"user": partner, "statement": partner_st, "is_me": False})
+        # 셀프힐: 'judging'인데 판결 스레드가 사라졌으면(프로세스 재시작) 되살린다.
+        judging_resumed = resume_judging_if_orphaned(
+            current_app._get_current_object(), case
+        )
         return render_template(
             "case_detail.html",
             case=case,
@@ -5364,6 +5640,8 @@ def _register_routes(app: Flask):
             my_statement=my_st,
             has_statement=len(case.statements) >= 1,
             resolved=(case.status == "resolved"),
+            judging_state=case_judging_verdict(case),
+            judging_resumed=judging_resumed,
         )
 
     @app.route("/cases/<int:case_id>/statement", methods=["POST"])
@@ -5428,22 +5706,7 @@ def _register_routes(app: Flask):
         # In-process guard so a rapid double-tap can't spawn two judge threads
         # for the same case (single-worker Render free tier). The thread frees
         # the key in its finally.
-        spawn = False
-        with _judging_lock:
-            if case.id not in _judging:
-                _judging.add(case.id)
-                spawn = True
-        if spawn:
-            try:
-                threading.Thread(
-                    target=judge_case,
-                    args=(current_app._get_current_object(), case.id),
-                    daemon=True,
-                ).start()
-            except Exception:  # noqa: BLE001 — never break the redirect
-                log.exception("failed to spawn judge thread for case %s", case.id)
-                with _judging_lock:
-                    _judging.discard(case.id)
+        _spawn_judge_if_idle(current_app._get_current_object(), case.id)
         return redirect(url_for("case_detail", case_id=case.id))
 
     @app.route("/cases/<int:case_id>/delete", methods=["POST"])
@@ -5706,6 +5969,9 @@ def _register_routes(app: Flask):
         if items and needs_scoring:
             _spawn_scoring_if_idle(current_app._get_current_object(), u.couple_id)
 
+        # 셀프힐: 'pending' 추천인데 스레드가 사라졌으면(재시작) 되살린다 — 안 그러면
+        # FAB 패널이 '뽑는 중'으로 영원히 폴링한다(초안 고착과 같은 구멍).
+        resume_recommendation_if_orphaned(current_app._get_current_object(), u.couple_id)
         # ready 추천은 첫 로드에서 바로 그리고, pending이면 클라가 '뽑는 중' 상태·폴링을 재개한다.
         rec_payload = _date_recommendation_payload(u.couple_id)
         recommendation = rec_payload if rec_payload["status"] in ("ready", "pending") else None
@@ -5757,8 +6023,15 @@ def _register_routes(app: Flask):
         """이 커플 최신 추천 상태 JSON — FAB 패널 폴링용. 순수 DB 읽기(claude 없음).
 
         {status, message, picks:[{event_id, title, why, image_url, category,
-        source}]}. 존재하지 않거나 만료된 픽은 떨군다."""
+        source}]}. 존재하지 않거나 만료된 픽은 떨군다.
+
+        폴링이 닿는 자리라 셀프힐도 여기서 한다 — 'pending'인데 만드는 스레드가
+        사라졌으면(프로세스 재시작) 되살린다. 사용자는 패널을 열어 둔 채 기다리기만
+        해도 복구된다(다시 '추천받기'를 누를 필요가 없다)."""
         u = current_user()
+        resume_recommendation_if_orphaned(
+            current_app._get_current_object(), u.couple_id
+        )
         return jsonify(_date_recommendation_payload(u.couple_id))
 
     @app.route("/dates/more")
@@ -6245,6 +6518,13 @@ def _register_routes(app: Flask):
         review = db.session.get(BlogReview, rid)
         if review is None or review.couple_id != u.couple_id:
             abort(404)
+        # 셀프힐 — 2026-10-07 사고(메모리 한도 초과 → 자동 재시작 → 데몬 스레드 사망 →
+        # 행이 'pending' 영구 고착)의 복구 지점. 'pending'인데 만드는 스레드가 사라졌으면
+        # 여기서 되살린다. /memories 가 멈춘 캡션을, /dates 가 미채점 행사를 되살리는
+        # 것과 같은 자리·같은 패턴이다. 산출물은 건드리지 않는다(함수 docstring).
+        app_obj = current_app._get_current_object()
+        review_resumed = resume_review_if_orphaned(app_obj, review)
+        thumb_resumed = resume_thumbnail_if_orphaned(app_obj, review)
         # 네이버 복사본: 사용자가 편집한 게 있으면 그걸(이제 HTML), 없으면 생성
         # 초안에서 HTML을 조립. edited_text는 이제 HTML을 담는다. 뷰 시점에 이미지
         # 토큰을 신선하게 재발급해, 저장본이 옛(만료) 토큰을 얼렸어도 지금 복사한
@@ -6329,6 +6609,12 @@ def _register_routes(app: Flask):
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
             naver_keys_set=u.has_naver_api_keys,
+            # 'pending' 두 건(초안·썸네일)의 생성이 실제로 살아 있는지 — 화면이
+            # '작성중'만 반복하지 않고 무슨 일이 났는지 말하게 하는 재료.
+            review_state=review_pending_verdict(review),
+            review_resumed=review_resumed,
+            thumb_state=thumbnail_pending_verdict(review),
+            thumb_resumed=thumb_resumed,
         )
 
     # ---- 네이버 자동 export(v2) ----

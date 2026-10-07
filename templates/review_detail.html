@@ -164,12 +164,33 @@
 </div>
 {% endif %}
 
-{# ---- P2: 생성 중 / 초안 준비됨 / 실패 ---- #}
+{# ---- P2: 생성 중 / 초안 준비됨 / 실패 ----
+   'pending' 은 한 가지가 아니다. 2026-10-07 사고(메모리 한도 초과 → 자동 재시작 →
+   초안 스레드 사망 → 행이 영원히 pending)에서 화면은 '작성중'만 말하며 4초마다
+   새로고침을 돌았고, 사용자가 빠져나갈 길이 없었다. 이제 서버가 '정말 만들고 있는지'를
+   판정해(review_state / review_resumed) 화면이 무슨 일이 났는지 말하고, 비정상이면
+   언제나 ↻ 다시 생성 버튼을 준다. #}
 {% if review.status == 'pending' %}
 <div class="review-placeholder">
+  {% if review_resumed %}
+  <span aria-hidden="true">↻</span>
+  <span>생성이 중단된 것 같아 방금 다시 시작했어 — 조금만 기다려줘!</span>
+  {% elif review_state == 'overdue' %}
+  <span aria-hidden="true">⏳</span>
+  <span>생성이 너무 오래 걸리고 있어 — 중단된 것 같아. 다시 시도해줄래?</span>
+  {% else %}
   <span aria-hidden="true">✨</span>
   <span>AI가 블로그 초안을 쓰고 있어요… (잠시만!)</span>
+  {% endif %}
 </div>
+{% if review_resumed or review_state == 'overdue' %}
+{# 탈출구 — 자동 복구가 또 실패해도 사람이 직접 다시 돌릴 수 있어야 한다. #}
+<div class="review-failed">
+  <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
+    <button type="submit" class="btn primary sm">↻ 다시 생성</button>
+  </form>
+</div>
+{% endif %}
 
 {% elif review.status == 'failed' %}
 <div class="review-failed">
@@ -248,7 +269,21 @@
   </p>
 
   {% elif thumb and thumb.status == 'pending' %}
+  {# 초안과 같은 구멍 — 재시작으로 스레드가 죽으면 여기도 '만드는 중'에 영구히 박힌다.
+     서버가 thumb_state/thumb_resumed 로 판정해 주고, 비정상이면 다시 만들 수 있게 한다. #}
+  {% if thumb_resumed %}
+  <p style="margin:8px 0 0;">↻ 문구 생성이 중단된 것 같아 방금 다시 시작했어 — 조금만 기다려줘!</p>
+  {% elif thumb_state == 'overdue' %}
+  <p style="margin:8px 0 0;">⏳ 문구 생성이 너무 오래 걸리고 있어 — 중단된 것 같아.</p>
+  {% else %}
   <p style="margin:8px 0 0;">✨ 썸네일 문구를 만드는 중이야… (잠시만!)</p>
+  {% endif %}
+  {% if thumb_resumed or thumb_state == 'overdue' %}
+  <form method="post" action="{{ url_for('review_thumbnail_generate', rid=review.id) }}"
+        style="margin-top:10px;">
+    <button type="submit" class="btn ghost sm">↻ 문구 다시 만들기</button>
+  </form>
+  {% endif %}
 
   {% elif thumb and thumb.candidates %}
   {% set picked = thumb.picked or 0 %}

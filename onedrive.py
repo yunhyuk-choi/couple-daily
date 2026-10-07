@@ -57,13 +57,22 @@ _reconnect_needed = False
 # URLs expire very quickly, so a cached URL would 401 — but cached bytes are
 # always a valid response. Kept brief; the browser also caches via Cache-Control.
 _BYTES_CACHE_TTL = 1800  # seconds
-_BYTES_CACHE_MAX = 64  # cap entries so memory can't grow unbounded
+# ⚠️ 상한은 **개수가 아니라 바이트**다. 옛 상한(64개)은 "memory can't grow unbounded"
+# 라고 적혀 있었지만 실제로는 아무것도 묶지 못했다 — 실측: 아이폰 12MP 원본 한 장이
+# 3.03MB 라 64개면 **197MB** 가 상주한다. 512MB 티어에서 `claude -p` 가 ~265MB,
+# 파이썬 워커가 ~100MB 를 쓰므로 이 캐시 하나로 한도를 넘긴다(2026-10-07 OOM 사고의
+# 지분). 예산 16MB = 그런 원본 약 5장 — "refetch storm 을 흡수한다"는 이 캐시의
+# 목적(짧은 TTL)에는 충분하고, 갤러리 그리드는 아래 썸네일 캐시가 따로 받친다.
+_BYTES_CACHE_BUDGET = 16 * 1024 * 1024
 _bytes_cache: dict[str, tuple[bytes, str, float]] = {}
 
 # per-(item,size) THUMBNAIL-BYTES cache for the gallery grid. Thumbnails are
 # tiny (a few KB), so we can cache more of them and for longer than full bytes.
 # Same rationale as _bytes_cache: cache the decoded bytes (the Graph thumbnail
 # `url` is a short-lived CDN link that would 401 if reused).
+# 여기는 개수 상한을 그대로 둔다 — 엔트리 크기가 균일하게 작아 개수가 곧 바이트다
+# (실측: Graph 'medium' 썸네일 4.4KB · 192개가 가득 차도 **0.83MB**). 위 캐시와 달리
+# 메모리 사고의 용의자가 아니다.
 _THUMB_CACHE_TTL = 3600  # seconds
 _THUMB_CACHE_MAX = 192
 _thumb_cache: dict[tuple[str, str], tuple[bytes, str, float]] = {}
@@ -318,15 +327,19 @@ def get_photo_content_cached(item_id: str):
     if hit and now < hit[2]:
         return hit[0], hit[1]
     data, ctype = get_photo_content(item_id)
-    if data is not None:
-        # Evict expired / oldest entries before inserting to bound memory.
-        if len(_bytes_cache) >= _BYTES_CACHE_MAX:
+    if data:
+        # 만료분을 버리고 **바이트 예산** 안으로 축출한 뒤 넣는다. 한 장이 예산보다
+        # 크면 아예 캐시하지 않는다(그 한 장이 캐시를 비우고 눌러앉지 않게) — 그런
+        # 사진은 매번 다시 받을 뿐 기능은 그대로다.
+        size = len(data)
+        if size <= _BYTES_CACHE_BUDGET:
             for k in [k for k, v in _bytes_cache.items() if v[2] <= now]:
                 _bytes_cache.pop(k, None)
-            if len(_bytes_cache) >= _BYTES_CACHE_MAX:
+            total = sum(len(v[0]) for v in _bytes_cache.values()) + size
+            while _bytes_cache and total > _BYTES_CACHE_BUDGET:
                 oldest = min(_bytes_cache, key=lambda k: _bytes_cache[k][2])
-                _bytes_cache.pop(oldest, None)
-        _bytes_cache[item_id] = (data, ctype or "", now + _BYTES_CACHE_TTL)
+                total -= len(_bytes_cache.pop(oldest)[0])
+            _bytes_cache[item_id] = (data, ctype or "", now + _BYTES_CACHE_TTL)
     return data, ctype
 
 

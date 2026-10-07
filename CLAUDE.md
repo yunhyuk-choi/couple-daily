@@ -39,6 +39,43 @@
 - 백그라운드 스레드는 **자체 app context + 새 DB 세션**(요청 세션을 스레드 간 공유 금지),
   **예외 catch + 로깅**(스레드 밖으로 예외 전파 금지), **중복 동시 생성 가드**(DB status + in-process
   set)를 반드시 갖춘다.
+- ⛔ **그리고 `pending` 행의 복구 경로를 반드시 갖춘다.** 데몬 스레드는 프로세스가 죽으면
+  같이 죽지만 DB 행은 `pending` 그대로 남는다 — 아무도 되돌리지 않으면 **영원히 '작성중'** 이다
+  (2026-10-07 실사고: 메모리 한도 초과 → Render 자동 재시작 → 블로그 초안이 하루 종일 고착).
+  새 백그라운드 생성기를 만들 때 세 가지를 같이 만든다:
+  1. **판정** — `_bg_job_verdict(lock, keys, key, updated_at, stuck_after)` 가 단일 원천이다
+     (`running`/`orphaned`/`overdue`). 인프로세스 가드가 비어 있으면 스레드가 죽은 것이다.
+  2. **재개** — 그 상태를 보는 화면(또는 폴링 엔드포인트)에서 `resume_*_if_orphaned` 로 재스폰.
+     ⚠️ **직전 산출물을 절대 지우지 않는다** — 되돌리는 건 `updated_at` 뿐이다.
+  3. **탈출구** — 템플릿이 '무슨 일이 났는지' 말하고 사람이 직접 다시 돌릴 버튼을 준다.
+     무한 `meta refresh` 만 도는 상태를 남기지 않는다.
+  상한은 그 작업의 **최악의 정상 소요**로 잡는다(후기 초안은 claude 콜이 여러 번이라
+  `_STUCK_REVIEW`=25분, 단발 콜짜리는 `_STUCK_GENERATING`=5분). 회귀 테스트는
+  `tests/test_stuck_recovery.py`.
+
+## ⛔ 512MB 안에서의 이미지 메모리 규율 (실측)
+
+Render 무료티어는 **512MB 한 칸**에 파이썬 워커(~100MB) + `claude -p`(~265MB)가 같이 산다.
+남는 건 ~145MB뿐이라, 이미지 경로의 '무심한' 한 줄이 그대로 OOM이다. 실측치
+(3.03MB · 3024×4032 아이폰 원본, RSS 봉우리):
+
+| 무엇 | 전 | 후 | 비고 |
+|---|---|---|---|
+| `_blog_img_process` hq(원본·q95) | 143MB | **50MB** | 전체 사본 2개 제거, 출력 바이트 동일 |
+| `_blog_img_process` std(1280·q92) | 112MB | **66MB** | 〃 |
+| `onedrive._bytes_cache` 상주 | 197MB(64개) | **≤16MB** | 개수 → **바이트 예산** |
+| `app._blog_proc_cache` 상주 | 최악 656MB(200개) | **≤48MB** | 〃 (hq 엔트리 3.28MB) |
+| `onedrive._thumb_cache` 상주 | 0.83MB(192개) | 그대로 | 엔트리 균일·작음 — 무죄 |
+| `/videos/<id>/stream` 50MB 중계 | +0.02MB | 그대로 | 제너레이터 — 무죄 |
+
+- **바이트 캐시의 상한은 개수가 아니라 바이트다.** 엔트리 크기가 수 배~수십 배 들쭉날쭉한
+  캐시(사진 원본·가공본)에 개수 상한을 걸면 아무것도 묶이지 않는다.
+- **Pillow 는 `exif_transpose(img)` 와 `convert("RGB")` 가 각각 전체 사본을 만든다.**
+  12MP 한 장의 RGB 버퍼가 ~36MB다 — 반드시 `_exif_upright()` / `_as_rgb()` 를 쓴다.
+- 아직 안 고친 것: `/memories/upload` 는 사진을 `file.read()` 로 통째로 올린다(상한 50MB).
+  영상처럼 `onedrive.upload_stream` 으로 돌리는 게 맞지만 EXIF·캡션이 바이트를 필요로 해
+  함께 손봐야 한다.
+- 회귀 테스트는 `tests/test_image_memory.py`.
 
 ## 아키텍처
 
