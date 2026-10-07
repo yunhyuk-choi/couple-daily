@@ -1,5 +1,12 @@
 <script>
-// 공용 라이트박스 — 썸네일 탭 시 원본 프리로드 + 확대(캡션·태그). 앨범·검색 공유.
+// 공용 라이트박스 — 썸네일 탭 시 **미리보기 자산**(view 티어) 프리로드 + 확대.
+//
+// ⛔ 여기서 띄우는 건 **원본이 아니다**(data-full = /memories/<id>/preview · 긴 변
+//    1280). 폰 전체화면(390×844 CSS · DPR 3 = 1170px)을 덮고도 남는 크기라 보이는
+//    차이가 없는데, 원본(3MB+)을 띄우면 '크게 보기' 한 번에 수 MB를 기다린다.
+//    원본이 필요한 자리는 **'다운로드'** 버튼 하나뿐이고 거기는 그대로 원본이다
+//    (data-download = /memories/<id>/image?download=1 · 원본 바이트·원본 파일명).
+//    되돌리려면 _photo_grid.html 의 data-full 을 memory_image 로 바꾸면 된다.
 (function () {
   var openers = Array.prototype.slice.call(document.querySelectorAll(".photo-open"));
   var lb = document.getElementById("lightbox");

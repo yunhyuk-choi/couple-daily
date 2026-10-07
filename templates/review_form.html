@@ -121,7 +121,7 @@
         <button type="button" class="rev-pick" data-id="{{ p.id }}"
                 aria-pressed="false"
                 aria-label="{{ p.caption or p.original_name or '사진' }} 선택">
-          <img class="rev-pick-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
+          <img class="rev-pick-img" src="{{ thumb_url(p.id) }}"
                loading="lazy" alt=""
                onload="this.classList.add('loaded'); this.closest('.rev-pick').classList.add('is-loaded')"
                onerror="this.closest('.rev-pick').classList.add('is-error')" />
@@ -216,7 +216,10 @@
   if (strip && idsInput) {
     // strip 안의 실제 노드가 '순서의 단일 원천'이다. 재정렬(버튼·드래그)은 노드를
     // 직접 옮기고, sync()가 DOM 순서 → hidden JSON · 번호 · 그리드 선택을 맞춘다.
-    function thumbUrl(id) { return '/memories/' + id + '/thumb'; }
+    // 서버가 내는 고정 URL 과 **같은 모양**이어야 브라우저가 한 장을 공유한다
+    // (?r= 은 미리보기 자산의 캐시 버전 — previews.REV 가 단일 원천).
+    var THUMB_REV = {{ preview_rev | tojson }};
+    function thumbUrl(id) { return '/memories/' + id + '/thumb?r=' + encodeURIComponent(THUMB_REV); }
 
     function makeItem(id) {
       var item = document.createElement('div');

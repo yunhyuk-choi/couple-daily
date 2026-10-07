@@ -32,7 +32,7 @@
           {% if has_photo %}
           <span class="cal-thumb">
             <img class="cal-thumb-img" loading="lazy" alt=""
-                 src="{{ url_for('memory_thumb', photo_id=info.cover) }}"
+                 src="{{ thumb_url(info.cover) }}"
                  onload="this.closest('.cal-thumb').classList.add('is-loaded')"
                  onerror="this.closest('.cal-thumb').classList.add('is-error')" />
           </span>

@@ -223,7 +223,7 @@ def test_the_draft_is_committed_before_the_long_crop_pass(
     monkeypatch.setattr(app_module.keyword_research, "research",
                         lambda *a, **k: {"status": "skipped"})
 
-    def _crops(result, photos):
+    def _crops(result, photos, **kw):   # kw: acquire_sem (파이프라인이 넘긴다)
         # 크롭 단계에 들어온 '그 순간' 행이 어떤 상태인지 본다.
         row = db.session.get(type(review), review.id)
         seen["status_during_crops"] = row.status

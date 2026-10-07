@@ -539,6 +539,81 @@ class Photo(db.Model):
             return []
 
 
+class AiJob(db.Model):
+    """AI 작업 큐 한 줄 — **할 일**이지 역사가 아니다(끝나면 지운다).
+
+    왜 DB 인가: 데몬 스레드는 프로세스가 죽으면 같이 죽지만 '아직 안 끝난 일'은
+    남아야 한다. 이 행이 그 기억이다 — 다음 부팅의 펌프가 **아무도 화면을 열지
+    않아도** 이어서 한다. 규율·구조는 ``aijobs.py`` 머리말이 정본.
+
+    ``job_key`` 는 '무엇에 대한 일인가'의 유일 키다(``"review:12"`` ·
+    ``"monthly:3:2026:10"``). 같은 대상에 대한 중복 요청은 이 유니크 제약에서
+    한 줄로 합쳐진다 — 더블탭·여러 화면 동시 방문이 claude 를 두 번 부르지 않는다.
+
+    ⛔ ``payload_json`` 에는 **참조만** 담는다(사진 id·후기 id 같은 작은 값).
+    이미지 바이트는 절대 넣지 않는다 — 업로드 경로가 이미 스트리밍이라 '메모리에
+    들고 차례를 기다리는' 구간이 없고(실측: 41.5MB 사진 피크 6.5MB), 넣는 순간
+    없던 비용이 생긴다. ``aijobs.MAX_PAYLOAD_BYTES`` 가 코드로 막는다.
+
+    브랜드-뉴 테이블이라 ``db.create_all()`` 이 만든다 — ALTER 마이그레이션 없음.
+    """
+    __tablename__ = "ai_jobs"
+
+    id = db.Column(db.Integer, primary_key=True)  # 오름차순 = 도착순 = 처리 순서
+    kind = db.Column(db.String(32), nullable=False, index=True)
+    job_key = db.Column(db.String(128), nullable=False, unique=True, index=True)
+    payload_json = db.Column(db.Text, nullable=True)
+    couple_id = db.Column(db.Integer, nullable=True, index=True)
+    # 'queued' | 'running'. 'done' 은 없다 — 끝난 행은 지운다.
+    status = db.Column(db.String(16), nullable=False, default="queued", index=True)
+    # 지금 이 행을 쥔 프로세스 토큰. 다른 토큰이면 그 프로세스는 죽은 것이다.
+    owner = db.Column(db.String(64), nullable=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    started_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class PhotoPreview(db.Model):
+    """**우리가 소유하는** 미리보기 자산 한 칸 — 사진 × 티어.
+
+    갤러리 그리드·크롭 UI·라이트박스가 쓰는 작은 그림이다. Graph 가 한 번 만들어
+    준 바이트를 **여기에 영구 보관**해서, 두 번째부터는 화면이 **DB 읽기 + 리페인트**
+    말고 아무것도 하지 않게 한다. 자세한 근거(왜 캐시가 아니라 자산인지, 왜 남의
+    URL 수명에 걸지 않는지)는 ``previews.py`` 머리말이 정본이다.
+
+    ⚠️ 이건 **캐시가 아니다.** Render 의 임시 디스크는 재배포마다 비고, 프로세스
+    메모리는 재시작마다 빈다 — 둘 중 어디에 둬도 '배포할 때마다 전부 다시 받기'가
+    돌아온다. 그래서 DB 행이다(재시작·재배포에 안전).
+
+    브랜드-뉴 테이블이라 ``db.create_all()`` 이 만든다 — ALTER 마이그레이션 없음.
+    """
+    __tablename__ = "photo_previews"
+    __table_args__ = (
+        db.UniqueConstraint("photo_id", "tier", name="uq_photo_preview_tier"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    photo_id = db.Column(
+        db.Integer, db.ForeignKey("photos.id"), nullable=False, index=True
+    )
+    # 'grid'(목록용 작은 것) / 'view'(크롭 UI·라이트박스용). previews.TIERS 가 정본.
+    tier = db.Column(db.String(16), nullable=False)
+    # 자산 바이트 그대로. Postgres 에서는 BYTEA.
+    data = db.Column(db.LargeBinary, nullable=False)
+    content_type = db.Column(db.String(64), nullable=True)
+    # 알 때만 채운다(렌디션은 가로세로를 알려 주고, 이름 있는 썸네일은 안 알려 준다).
+    # 목록이 <img width height> 를 박아 레이아웃 흔들림을 없애는 데 쓴다.
+    width = db.Column(db.Integer, nullable=True)
+    height = db.Column(db.Integer, nullable=True)
+    byte_len = db.Column(db.Integer, nullable=True)
+    # 무엇으로 만들었는지(진단용): 'rendition:c384' / 'thumbnail:medium' 등.
+    source = db.Column(db.String(32), nullable=True)
+    # 조건부 요청(304)용. 내용 해시라 같은 바이트면 항상 같다.
+    etag = db.Column(db.String(64), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Video(db.Model):
     """커플이 올린 동영상 한 건 — 바이트는 OneDrive(``couple-daily`` 폴더)에 있다.
 

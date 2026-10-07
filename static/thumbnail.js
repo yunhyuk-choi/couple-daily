@@ -165,7 +165,13 @@
   function selectedPhoto() {
     if (!el.photoSel) return null;
     var opt = el.photoSel.options[el.photoSel.selectedIndex];
-    return opt ? { index: parseInt(opt.value, 10), url: opt.getAttribute("data-url") } : null;
+    // url     = 1080×1350 캔버스 래스터용 **원본**('내려받기'를 누를 때만 로드)
+    // preview = 화면 DOM 미리보기용 우리 자산(고정 URL·만료 없음·재방문 네트워크 0)
+    return opt ? {
+      index: parseInt(opt.value, 10),
+      url: opt.getAttribute("data-url"),
+      preview: opt.getAttribute("data-preview") || opt.getAttribute("data-url"),
+    } : null;
   }
   // 사진이 없는 후기의 폴백 배경 — 그라데이션의 끝 색(어두운 쪽)을 그대로 쓴다.
   // **AI 로 그림을 지어내지 않는다** — 단색 위에 타이포만 올린다.
@@ -430,7 +436,8 @@
   if (el.photoSel) {
     el.photoSel.addEventListener("change", function () {
       var p = selectedPhoto();
-      if (p && el.photo) el.photo.src = p.url;
+      // 화면 미리보기는 **미리보기 자산**이다 — 원본(수 MB)을 띄우지 않는다.
+      if (p && el.photo) el.photo.src = p.preview;
       save();
     });
   }
@@ -439,7 +446,9 @@
 
   var first = selectedPhoto();
   if (first && el.photo) {
-    el.photo.src = first.url;                      // 기본 = 후기의 첫 사진
+    // ⛔ 여기에 원본을 걸면 **상세 화면을 열 때마다** 수 MB를 받는다(아무도
+    //    '내려받기'를 누르지 않아도). 화면엔 미리보기 자산, 캔버스엔 원본.
+    el.photo.src = first.preview;                  // 기본 = 후기의 첫 사진
   } else if (el.cover) {
     if (el.photo) el.photo.remove();               // 사진 없는 후기 — 단색 폴백
     el.cover.style.backgroundColor = fallbackBg();
