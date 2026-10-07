@@ -5,16 +5,20 @@
   {% for p in photos %}
     <button type="button" class="photo-open"
             data-id="{{ p.id }}"
-            data-full="{{ url_for('memory_image', photo_id=p.id) }}"
-            data-thumb="{{ url_for('memory_thumb', photo_id=p.id) }}"
+            data-full="{{ preview_url(p.id) }}"
+            data-thumb="{{ thumb_url(p.id) }}"
             data-download="{{ url_for('memory_image', photo_id=p.id) }}?download=1"
             data-delete="{{ url_for('memories_delete', photo_id=p.id) }}"
             data-caption="{{ (p.caption or '') if p.caption_status == 'ready' else '' }}"
             data-tags="{{ (p.tags | join(',')) if (p.caption_status == 'ready' and p.tags) else '' }}"
             data-status="{{ p.caption_status }}"
             aria-label="{{ p.caption or p.original_name or '추억 사진' }} 크게 보기">
-      <img class="photo-img" src="{{ url_for('memory_thumb', photo_id=p.id) }}"
-           loading="lazy" alt="{{ p.caption or p.original_name or '추억 사진' }}"
+      {# 첫 줄(3칸)은 **첫 화면에 보이는 것**이라 지연시키지 않는다 — lazy 는 레이아웃이
+         잡힌 뒤에야 요청을 내므로 첫 페인트가 한 박자 늦는다. 나머지는 lazy. #}
+      <img class="photo-img" src="{{ thumb_url(p.id) }}"
+           loading="{{ 'eager' if loop.index0 < 3 else 'lazy' }}"
+           {% if loop.index0 < 3 %}fetchpriority="high"{% endif %}
+           decoding="async" alt="{{ p.caption or p.original_name or '추억 사진' }}"
            onload="this.classList.add('loaded'); this.closest('.photo-open').classList.add('is-loaded')"
            onerror="this.closest('.photo-open').classList.add('is-error')" />
       {% if p.caption_status == 'pending' %}

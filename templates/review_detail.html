@@ -8,8 +8,28 @@
   {# 썸네일 타이포 — design/thumbnail-template.css 가 지정한 Pretendard. 다른 폰트로
      그리면 검증된 디자인이 아니게 되므로, 로딩에 실패하면 JS가 렌더를 아예 막는다. #}
   {% if thumb and thumb.candidates and thumb_spec and thumb_photos %}
-  <link rel="stylesheet" crossorigin="anonymous"
+  {# ⛔ **렌더를 막지 않게** 받는다. 이 폰트는 썸네일 카드(화면 아래쪽, 캔버스로
+     그리는 것)에만 쓰이는데, 보통의 <link rel=stylesheet> 는 **첫 페인트를 통째로
+     막는다** — 외부 CDN 한 번의 왕복이 페이지 전체의 '화면 딜레이'가 된다.
+     media=print 로 받아 onload 에서 적용하면 파싱과 페인트가 기다리지 않는다.
+     thumbnail.js 는 어차피 document.fonts 로 로드를 기다리므로(loadFonts) 검증된
+     디자인으로만 그린다는 규율은 그대로다. #}
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="stylesheet" crossorigin="anonymous" media="print"
+        onload="this.media='all'"
         href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard-dynamic-subset.css" />
+  <noscript>
+    <link rel="stylesheet" crossorigin="anonymous"
+          href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard-dynamic-subset.css" />
+  </noscript>
+  {% endif %}
+  {# 첫 화면에 보이는 **첫 사진 한 장**만 미리 받기 시작한다(프리로드). <img> 는
+     본문 한참 아래에서 파싱되는데, 이 한 줄이 <head> 에서 요청을 먼저 띄워 첫
+     사진이 도착하는 시점을 앞당긴다. 두 번째부터는 하지 않는다 — 대역폭을 첫
+     화면에서 뺏으면 오히려 늦어진다. #}
+  {% if preview_preload %}
+  <link rel="preload" as="image" fetchpriority="high"
+        href="{{ preview_preload }}" />
   {% endif %}
 {% endblock %}
 {% block content %}
@@ -52,7 +72,7 @@
     {% for p in photos %}
     <div class="rp-cell">
       <span class="rp-num" aria-hidden="true">{{ loop.index }}</span>
-      <img src="{{ url_for('memory_thumb', photo_id=p.id) }}" loading="lazy"
+      <img src="{{ thumb_url(p.id) }}" loading="lazy" decoding="async"
            alt="{{ p.caption or p.original_name or '후기 사진' }}" />
     </div>
     {% endfor %}
@@ -338,7 +358,10 @@
       <span class="muted small">배경 사진 <span style="opacity:.7;">· 기본은 첫 사진</span></span>
       <select class="rv-thumb-photo-select">
         {% for p in thumb_photos %}
+        {# data-url = 캔버스 래스터용 **원본**(내려받기를 누를 때만 로드)
+           data-preview = 화면 미리보기용 우리 자산(고정 URL · 만료 없음) #}
         <option value="{{ p.index }}" data-url="{{ p.url }}"
+                data-preview="{{ p.preview_url }}"
                 {% if p.index == (thumb.photo_index or 0) %}selected{% endif %}>
           {{ loop.index }}. {{ p.name }}
         </option>
@@ -846,8 +869,13 @@
     <div class="rv-crop-item" data-section="{{ cs.index }}" data-crop="{{ cs.crop | tojson }}">
       {% if cs.heading %}<div class="rv-crop-title">{{ cs.heading }}</div>{% endif %}
       <div class="rv-crop-view">
-        <img class="rv-crop-img" src="{{ cs.img_url }}"
-             alt="{{ cs.heading or '후기 사진' }}" draggable="false" />
+        {# 이 패널은 기본으로 접혀 있다(<details>) — 펼치기 전에는 보이지도 않는
+           그림을 첫 화면에서 받을 이유가 없다. loading="lazy" 면 브라우저가
+           '보이게 될 때'까지 요청을 미룬다. 예전엔 속성이 없어(=eager) 상세 화면을
+           열 때마다 접힌 패널의 1280px 사진 N장을 **전부** 받았다. #}
+        <img class="rv-crop-img" src="{{ cs.img_url }}" loading="lazy"
+             decoding="async" alt="{{ cs.heading or '후기 사진' }}"
+             draggable="false" />
       </div>
       <div class="rv-crop-status muted" aria-live="polite"></div>
     </div>

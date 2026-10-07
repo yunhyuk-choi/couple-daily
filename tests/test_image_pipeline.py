@@ -207,7 +207,7 @@ def test_v_orig_streams_the_original_without_decoding(drive, photo, flask_app,
     monkeypatch.setattr(app_module._PILImage, "open", _spy)
 
     with flask_app.test_request_context("/"):
-        url = app_module.blog_img_url(photo, external=False) + "&v=orig"
+        url = app_module.publish_source_url(photo, external=False)
     r = client.get(url)
     assert r.status_code == 200
     body = r.get_data()
@@ -220,7 +220,7 @@ def test_v_orig_streams_the_original_without_decoding(drive, photo, flask_app,
 
 def test_v_rendition_is_relayed_as_is(drive, photo, flask_app, client):
     with flask_app.test_request_context("/"):
-        url = app_module.blog_img_url(photo, external=False) + "&v=r1280"
+        url = app_module.blog_img_url(photo, external=False, variant="r1280")
     r = client.get(url)
     assert r.status_code == 200
     with Image.open(io.BytesIO(r.get_data())) as im:
@@ -232,6 +232,36 @@ def test_v_rendition_is_relayed_as_is(drive, photo, flask_app, client):
 # --------------------------------------------------------------------------- #
 # 4. 크롭 판단 — 치수도 비전도 원본을 안 쓴다
 # --------------------------------------------------------------------------- #
+def test_a_published_std_token_cannot_be_upgraded_to_the_original(
+        drive, photo, flask_app, client):
+    """⛔ 네이버 글에 박힌 std URL 에 ``&v=orig`` 를 붙여 **원본**을 꺼낼 수 없다.
+
+    예전엔 ``v`` 가 서명 대상이 아니어서 가능했다. std 는 1280px 로 **잘린** 그림인데
+    원본은 자르지 않은 풀 해상도다 — 크롭으로 가린 바깥까지 나간다. '같은 사진 한
+    장이라 노출 범위가 같다'는 옛 전제가 거기서 깨진다.
+    """
+    with flask_app.test_request_context("/"):
+        std = app_module.blog_img_url(photo, external=False)
+    assert client.get(std).status_code == 200
+    assert client.get(std + "&v=orig").status_code == 404, (
+        "std 토큰으로 원본을 꺼낼 수 있다"
+    )
+    assert client.get(std + "&v=r1280").status_code == 404
+
+
+def test_the_publish_source_url_expires_quickly(photo, flask_app):
+    """발행 소스는 '보내기'를 누른 순간 한 번 받고 끝난다 — 24시간 살 이유가 없다."""
+    import time as _t
+    with flask_app.test_request_context("/"):
+        url = app_module.publish_source_url(photo, external=False)
+    exp = int(url.split("e=")[1].split("&")[0])
+    life = exp - int(_t.time())
+    assert life <= app_module._BLOG_PUBLISH_TTL + 2
+    assert life < app_module._BLOG_IMG_TTL, (
+        "발행 소스 URL 이 본문 이미지만큼 오래 산다"
+    )
+
+
 def test_crop_dims_come_from_metadata_not_pixels(drive, photo):
     dims = app_module._crop_vision_dims(photo)
     assert dims is not None

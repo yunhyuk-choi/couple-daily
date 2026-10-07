@@ -1899,9 +1899,17 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   margin: 18px 0 8px; padding-left: 10px; border-left: 3px solid var(--pink);
 }
 .rv-editable p { margin: 0 0 8px; }
+/* 미리보기 사진 — **자리를 미리 잡아 둔다.**
+   본문 이미지는 서버가 4:3(_BLOG_CROP_ASPECT)으로 잘라 내보내므로 높이를 미리 알 수
+   있다. 비워 두면 사진이 하나씩 도착할 때마다 본문이 아래로 밀려(레이아웃 시프트)
+   '화면이 늦게 잡히는' 체감이 생긴다. aspect-ratio 를 박아 두면 첫 페인트에 레이아웃이
+   확정되고, 사진 도착은 **리페인트**로만 끝난다. 혹시 다른 비율이 섞여 와도 `width`/
+   `height` 속성이 있으면 그쪽이 이긴다(기본값일 뿐 강제가 아니다). */
 .rv-editable img {
   display: block; max-width: 100%; height: auto; border-radius: 12px; margin: 6px 0;
+  aspect-ratio: 4 / 3; object-fit: cover; background: var(--pink-soft);
 }
+.rv-editable img[width][height] { aspect-ratio: auto; }
 .rv-editable table {
   border-collapse: collapse; width: 100%; margin: 6px 0 12px; font-size: 0.92rem;
 }

@@ -12,12 +12,18 @@ Security: the prompt is fed to `claude -p` via STDIN (never as a shell arg and
 never with shell=True), so user answer text is treated purely as data. The CLI
 is invoked as a plain argv list.
 """
+import contextlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+
+log = logging.getLogger(__name__)
 
 CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
 # Vision (reading an image off disk) is markedly slower than a text prompt on
@@ -94,18 +100,351 @@ def _claude_argv(allow_web: bool = False) -> list:
     return ["claude", "-p", "--allowedTools", *tools]
 
 
-def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
-                allow_web: bool = False) -> str:
-    """Run `claude -p`, feeding the prompt via stdin. Returns raw stdout text.
+# --------------------------------------------------------------------------- #
+# 지속 세션 — **프로세스 부팅을 파이프라인당 1회로** (2026-10-07, 4차)
+# --------------------------------------------------------------------------- #
+# 후기 한 건(사진 5장)은 claude 를 8번 부른다: 키워드 후보·선정·본문 + 사진마다 크롭
+# 판단 ×5. 지금까지는 그 8번이 **프로세스 8개**였다 — 매번 Node 를 새로 부팅하고
+# (0.1 CPU 에서 특히 비싸다) 매번 같은 재료를 처음부터 다시 읽혔다.
+#
+# `claude -p --input-format stream-json` 은 **살아 있는 세션**을 연다. stdin 에
+# user 메시지를 줄 단위로 밀어 넣으면 같은 프로세스가 턴을 이어 받는다. 그래서
+# 부팅이 8번 → **1번**이 되고, 앞 턴의 맥락이 남아 뒤 프롬프트가 짧아진다.
+#
+# ### 실측 (이 머신, 후기 1건 모사 = 긴 텍스트 3콜 + 비전 5콜)
+#
+# | | one-shot 8개 | 지속 세션 1개 |
+# |---|---|---|
+# | 총 소요 | **91.9s** | **71.5s** (−22%) |
+# | 프로세스 트리 RSS 봉우리 | 496~578MB (콜마다) | **580MB** |
+# | 콜 사이 상주 | **0** (프로세스가 죽는다) | 490~600MB (세션 수명 내내) |
+#
+# 읽는 법: **봉우리는 사실상 같다**(578 vs 580MB). 512MB 한 칸이 터지느냐는 '동시에
+# 얼마나 떠 있나'의 문제이고 그 최댓값은 바뀌지 않는다. 달라지는 건 **상주 시간**이다 —
+# one-shot 은 콜 사이에 0으로 내려가고, 세션은 파이프라인 내내 들고 있다. 그 구간에
+# 다른 claude 가 끼어들면 둘이 겹쳐 죽는데, 그건 `_CAPTION_SEM` 이 이미 막는다(그래서
+# 세션은 **반드시 그 세마포어 안에서** 열고 닫는다). 파이썬 쪽 이미지 봉우리는 3차
+# 작업으로 10MB 대까지 내려와 있어(CLAUDE.md §5) 겹쳐도 여유가 있다.
+#
+# 끄는 법: ``CLAUDE_SESSION=0``. 그러면 모든 호출이 예전처럼 one-shot 이다.
+# 세션이 어떤 이유로든 깨지면 **그 호출부터 자동으로 one-shot 으로 되돌아간다** —
+# 글이 안 나오는 일은 없다(이 레포의 'degrade 하되 raise 하지 않는다' 규율).
+SESSION_ENABLED = (os.environ.get("CLAUDE_SESSION") or "1").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+# 세션 수명 백스톱 — 행·누수 안전망(jira-auto-dispatcher 의 agent_runner 와 같은 사상).
+SESSION_MAX_SEC = int(os.environ.get("CLAUDE_SESSION_MAX_SEC", "1800"))
+SESSION_IDLE_SEC = int(os.environ.get("CLAUDE_SESSION_IDLE_SEC", "600"))
+TERMINATE_GRACE_SEC = 5
 
-    읽기 계열 도구(Read/Glob/Grep)는 매 호출에 미리 허용된다(``_claude_argv`` 참고) —
-    비전 프롬프트가 임시 이미지를 Read할 때 비대화형 모드에서 거부되지 않게 한다.
-    ``allow_web=True``면 WebSearch/WebFetch까지 허용해 라이브 웹 검색을 쓴다(팝업
-    페처 전용). 요청 경로의 데일리 질문 콜에도 안전하다(도구를 안 쓰면 그만 —
-    여기에 세마포어·블로킹을 추가하지 않는다).
+# 세션에서 읽어 낼 session_id 후보 키(CLI 버전차 방어).
+_SESSION_ID_KEYS = ("session_id", "sessionId", "sessionID")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-    Raises RuntimeError on non-zero exit / timeout / missing binary.
+
+def _popen_kwargs():
+    """콘솔 창 없이 · 좀비 없이 띄우기 위한 플랫폼별 Popen 인자.
+
+    * Windows — ``CREATE_NO_WINDOW``. 콘솔 없는 부모(서비스·pythonw)에서 띄우면
+      콘솔 창이 튀어나오는데, 사용자 머신에서 실제로 겪은 문제다.
+    * POSIX(실제 운영) — ``start_new_session=True`` 로 **새 프로세스 그룹의 리더**로
+      띄운다. 종료할 때 그룹 전체를 죽일 수 있어 손자 프로세스가 고아로 남지 않는다.
     """
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    elif hasattr(os, "setsid"):
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+class SessionError(RuntimeError):
+    """지속 세션이 쓸 수 없는 상태 — 호출부는 one-shot 으로 되돌아간다."""
+
+
+class ClaudeSession:
+    """``claude -p`` 프로세스 **하나**에 여러 턴을 밀어 넣는 살아 있는 세션.
+
+    쓰는 쪽은 :func:`claude_session` 컨텍스트 매니저만 보면 된다 — 그 안에서는
+    ``_run_claude`` 가 자동으로 이 세션을 탄다(호출부 13곳을 고치지 않는다).
+    """
+
+    def __init__(self, allow_web=False, max_sec=None, idle_sec=None):
+        self.allow_web = bool(allow_web)
+        self.max_sec = max_sec if max_sec is not None else SESSION_MAX_SEC
+        self.idle_sec = idle_sec if idle_sec is not None else SESSION_IDLE_SEC
+        self.proc = None
+        self.session_id = None
+        self.turns = 0
+        self.dead = False
+        self.started_at = None
+        self.last_event_at = None
+        self._results = []
+        self._cv = threading.Condition()
+        self._reader = None
+        self._eof = False
+
+    # -- 수명 ---------------------------------------------------------------
+    def argv(self):
+        """지속 세션 argv. ``--allowedTools`` 는 one-shot 과 **같은 것**을 쓴다.
+
+        ⛔ ``--dangerously-skip-permissions`` 는 못 쓴다 — Render 는 root 로 도는데
+        Claude Code 가 root 에서 그 플래그를 거부해 **모든 claude 콜이 깨진다**.
+        ``--allowedTools`` 가 지속 세션에서도 동작하는 것은 **실호출로 확인했다**
+        (stream-json 세션에서 Read 로 이미지를 열어 크롭 좌표를 받아 냈다).
+        """
+        return _claude_argv(self.allow_web) + [
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+
+    def start(self):
+        """세션을 연다. 못 열면 ``SessionError`` (호출부가 one-shot 으로 간다)."""
+        try:
+            self.proc = subprocess.Popen(
+                self.argv(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **_popen_kwargs(),
+            )
+        except FileNotFoundError as e:
+            raise SessionError("claude CLI not found on PATH") from e
+        except Exception as e:  # noqa: BLE001
+            raise SessionError(f"claude session spawn failed: {e}") from e
+        self.started_at = self.last_event_at = time.time()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        return self
+
+    def _read_loop(self):
+        """stdout 의 stream-json 이벤트를 읽어 ``result`` 만 큐에 쌓는다."""
+        try:
+            for line in self.proc.stdout:
+                self.last_event_at = time.time()
+                event = _parse_stream_event(line)
+                if event is None:
+                    continue
+                sid = _extract_session_id(event)
+                if sid and not self.session_id:
+                    self.session_id = sid
+                if event.get("type") == "result":
+                    with self._cv:
+                        self._results.append(event)
+                        self._cv.notify_all()
+        except Exception:  # noqa: BLE001 — 읽기 실패 = 세션 사망, 폴백으로 간다
+            log.debug("claude session reader ended", exc_info=True)
+        finally:
+            self._eof = True
+            with self._cv:
+                self._cv.notify_all()
+
+    def healthy(self):
+        if self.dead or self.proc is None or self.proc.poll() is not None:
+            return False
+        now = time.time()
+        if self.started_at and (now - self.started_at) > self.max_sec:
+            return False
+        if self.last_event_at and (now - self.last_event_at) > self.idle_sec:
+            return False
+        return True
+
+    # -- 한 턴 ---------------------------------------------------------------
+    def ask(self, prompt, timeout=CLAUDE_TIMEOUT):
+        """프롬프트 한 턴을 밀어 넣고 결과 텍스트를 받는다.
+
+        실패(쓰기 불가·EOF·타임아웃)면 세션을 죽이고 ``SessionError`` — 호출부가
+        같은 프롬프트로 one-shot 을 돌린다(글은 반드시 나온다).
+        """
+        if not self.healthy():
+            self.close()
+            raise SessionError("claude session is not healthy")
+        with self._cv:
+            self._results.clear()
+        try:
+            self.proc.stdin.write(_encode_user_message(prompt))
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            self.close()
+            raise SessionError(f"claude session stdin write failed: {e}") from e
+
+        deadline = time.time() + max(1, int(timeout))
+        with self._cv:
+            while not self._results and not self._eof:
+                if not self._cv.wait(min(1.0, max(0.05, deadline - time.time()))):
+                    pass
+                if time.time() >= deadline:
+                    break
+            event = self._results.pop(0) if self._results else None
+        if event is None:
+            self.close()
+            raise SessionError("claude session turn produced no result")
+        self.turns += 1
+        if event.get("is_error"):
+            # 모델이 에러를 냈다 — 세션 자체는 멀쩡하지만 이 턴은 실패다.
+            raise SessionError(
+                f"claude session turn errored: {str(event.get('result') or '')[:200]}"
+            )
+        return _strip_ansi(str(event.get("result") or "")).strip()
+
+    # -- 종료 ---------------------------------------------------------------
+    def close(self):
+        """stdin 을 닫아 정상 종료시키고, 안 죽으면 **프로세스 그룹째** 거둔다."""
+        self.dead = True
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        pgid = None
+        if hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:  # noqa: BLE001
+                pgid = None
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=TERMINATE_GRACE_SEC)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        for killer in (_kill_group, _kill_one):
+            try:
+                killer(proc, pgid)
+                proc.wait(timeout=TERMINATE_GRACE_SEC)
+                return
+            except Exception:  # noqa: BLE001
+                continue
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _kill_group(proc, pgid):
+    import signal
+    if pgid is None or not hasattr(os, "killpg"):
+        raise OSError("no process group")
+    os.killpg(pgid, signal.SIGTERM)
+
+
+def _kill_one(proc, pgid):
+    proc.terminate()
+
+
+def _parse_stream_event(line):
+    """stream-json 한 줄 → dict(아니면 None). 부수 출력이 섞여도 관대하게."""
+    if not line:
+        return None
+    s = _strip_ansi(line).strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _extract_session_id(event):
+    """이벤트에서 session_id 를 방어적으로 추출(키 이름이 버전마다 다를 수 있다)."""
+    if not isinstance(event, dict):
+        return None
+    scopes = [event]
+    for k in ("result", "message", "data", "session"):
+        v = event.get(k)
+        if isinstance(v, dict):
+            scopes.append(v)
+    for scope in scopes:
+        for key in _SESSION_ID_KEYS:
+            val = scope.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _encode_user_message(text):
+    """stdin 에 밀어 넣을 stream-json user 메시지 한 줄(JSON + 개행)."""
+    return json.dumps(
+        {"type": "user",
+         "message": {"role": "user", "content": [{"type": "text", "text": text}]}},
+        ensure_ascii=False,
+    ) + "\n"
+
+
+# 지금 이 **스레드**가 쓰고 있는 세션. 스레드 로컬인 이유: 파이프라인 하나는 한
+# 스레드에서 처음부터 끝까지 돈다(작업 큐의 펌프 스레드). 다른 스레드의 호출이
+# 남의 세션에 끼어들 길을 아예 만들지 않는다.
+_session_tls = threading.local()
+
+
+def current_session():
+    """이 스레드가 열어 둔 건강한 세션(없으면 None)."""
+    sess = getattr(_session_tls, "session", None)
+    if sess is None:
+        return None
+    if not sess.healthy():
+        return None
+    return sess
+
+
+@contextlib.contextmanager
+def claude_session(allow_web=False, enabled=None):
+    """이 블록 동안 ``_run_claude`` 호출들이 **한 프로세스**를 공유한다.
+
+    쓰는 쪽은 블록으로 감싸기만 하면 된다 — 호출부(13곳)는 한 줄도 바뀌지 않는다::
+
+        with ai.claude_session():
+            research = keyword_research.research(...)   # claude ×2
+            result = ai.write_review(...)               # claude ×1
+            _attach_section_crops(result, photos)       # claude ×N
+
+    ⚠️ **반드시 ``_CAPTION_SEM`` 안에서 열고 닫는다.** 세션이 사는 동안 400MB 대가
+    상주하므로, 그 구간에 다른 claude 가 뜨면 512MB 한 칸이 터진다(2026-10-07 사고의
+    1번 범인). 세마포어가 그 문이다.
+
+    세션을 못 열거나 중간에 깨지면 **조용히 one-shot 으로 되돌아간다** — 블록 안의
+    나머지 호출도 전부 one-shot 이다. 예외를 올리지 않는다.
+    """
+    use = SESSION_ENABLED if enabled is None else bool(enabled)
+    sess = None
+    if use:
+        try:
+            sess = ClaudeSession(allow_web=allow_web).start()
+        except SessionError:
+            log.warning("claude 지속 세션을 열지 못했다 — one-shot 으로 간다",
+                        exc_info=True)
+            sess = None
+    prev = getattr(_session_tls, "session", None)
+    _session_tls.session = sess
+    try:
+        yield sess
+    finally:
+        _session_tls.session = prev
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001
+                log.debug("claude session close failed", exc_info=True)
+
+
+def _run_claude_oneshot(prompt: str, timeout: int = CLAUDE_TIMEOUT,
+                        allow_web: bool = False) -> str:
+    """예전 경로 그대로 — 프로세스를 새로 띄워 한 번 묻고 죽인다."""
     argv = _claude_argv(allow_web)
     try:
         proc = subprocess.run(
@@ -116,6 +455,7 @@ def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            **_popen_kwargs(),
         )
     except FileNotFoundError as e:
         raise RuntimeError("claude CLI not found on PATH") from e
@@ -127,6 +467,35 @@ def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
             f"claude CLI exited {proc.returncode}: {(proc.stderr or '').strip()[:300]}"
         )
     return (proc.stdout or "").strip()
+
+
+def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
+                allow_web: bool = False) -> str:
+    """Run `claude -p`, feeding the prompt via stdin. Returns raw stdout text.
+
+    읽기 계열 도구(Read/Glob/Grep)는 매 호출에 미리 허용된다(``_claude_argv`` 참고) —
+    비전 프롬프트가 임시 이미지를 Read할 때 비대화형 모드에서 거부되지 않게 한다.
+    ``allow_web=True``면 WebSearch/WebFetch까지 허용해 라이브 웹 검색을 쓴다(팝업
+    페처 전용). 요청 경로의 데일리 질문 콜에도 안전하다(도구를 안 쓰면 그만 —
+    여기에 세마포어·블로킹을 추가하지 않는다).
+
+    Raises RuntimeError on non-zero exit / timeout / missing binary.
+
+    **지속 세션**: 이 스레드가 ``claude_session()`` 블록 안에 있으면 프로세스를 새로
+    띄우지 않고 그 세션에 턴을 이어 붙인다(부팅 1회). 세션이 없거나·웹 권한이 다르거나·
+    중간에 깨지면 **그 자리에서 one-shot 으로 되돌아간다** — 호출부는 차이를 모른다.
+    """
+    sess = current_session()
+    if sess is not None and sess.allow_web == bool(allow_web):
+        try:
+            out = sess.ask(prompt, timeout=timeout)
+            if out:
+                return out
+            # 빈 응답은 세션 탓일 수 있다 — 조용히 one-shot 으로 한 번 더 묻는다.
+            log.warning("claude 세션 턴이 빈 응답 — one-shot 으로 재시도")
+        except SessionError:
+            log.warning("claude 세션 턴 실패 — one-shot 으로 폴백", exc_info=True)
+    return _run_claude_oneshot(prompt, timeout=timeout, allow_web=allow_web)
 
 
 def _extract_json(raw: str):

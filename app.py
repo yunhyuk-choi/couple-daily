@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import string
+import sys
 import tempfile
 import threading
 import time
@@ -51,6 +52,7 @@ from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import ai
+import aijobs
 import bytecache
 import events
 import exifutil
@@ -60,6 +62,7 @@ import insights
 import keyword_research
 import naver_api
 import onedrive
+import previews
 import thumbnail
 from models import (
     Answer,
@@ -446,6 +449,33 @@ def _blog_img_process(data, crop=None, max_edge=_BLOG_IMG_MAX_EDGE, quality=92,
 _RENDITION_PREVIEW_EDGE = 1280   # 상세 화면·크롭 UI 미리보기
 _RENDITION_VISION_EDGE = 1600    # claude 비전의 크롭 '판단'용 (판단은 정규화 좌표라
                                  # 해상도 독립 — 12MP 를 보여 줄 이유가 없다)
+
+# --------------------------------------------------------------------------- #
+# 미리보기 자산 — **우리가 소유한다.** (previews.py 머리말이 근거의 단일 원천)
+# --------------------------------------------------------------------------- #
+# 사람이 보는 작은 그림(그리드 썸네일·크롭 UI·라이트박스)은 사진당 한 번 만들어
+# DB 에 영구 보관하고, **사진당 고정 URL**로 내준다. 그래서:
+#
+#   * Graph 왕복 = 사진·티어당 **평생 1회** (예전엔 화면을 열 때마다 2회)
+#   * 서명·만료 **없음** — 로그인한 본인에게 자기 사진을 주는 데 만료는 무의미하고,
+#     토큰이 매 렌더 달라지면 **브라우저 캐시 키가 매번 깨진다**(= 캐시가 안 먹는다).
+#     서명·만료는 네이버 발행용 **외부 노출** 이미지(/blog-img)에만 남는다.
+#   * 재방문 = 네트워크 **0** (불변 자산 캐시 + ETag/304)
+#
+# `immutable` 이 정직한 이유: 사진은 업로드 후 바뀌지 않고, 자산은 (사진, 티어)의
+# 결정론적 산물이다. 티어 크기를 바꿔 **이미 캐시된 브라우저**까지 새로 받게 하려면
+# `PREVIEW_REV` 를 올린다 — URL 이 바뀌므로 캐시가 비껴간다.
+_PREVIEW_CACHE_CONTROL = "private, max-age=31536000, immutable"
+
+
+def _thumb_url(photo_id):
+    """갤러리 그리드용 작은 미리보기의 고정 URL(캐시 버전 포함)."""
+    return url_for("memory_thumb", photo_id=photo_id, r=previews.REV)
+
+
+def _preview_url(photo_id):
+    """크게 보는 미리보기(크롭 UI·라이트박스)의 고정 URL(캐시 버전 포함)."""
+    return url_for("memory_preview", photo_id=photo_id, r=previews.REV)
 
 # --------------------------------------------------------------------------- #
 # std(미리보기·클립보드) 가공의 **입력**을 무엇으로 할 것인가 — 측정해서 고를 일
@@ -1302,18 +1332,49 @@ _STUCK_GENERATING = timedelta(minutes=5)
 _BG_SPAWN_GRACE = timedelta(seconds=60)
 
 
-def _bg_job_verdict(lock, keys, key, updated_at, stuck_after):
+def _enqueue_ai(app_obj, kind, key, payload, couple_id=None):
+    """느린 claude 작업 하나를 **DB 큐**에 세우고 펌프가 돌고 있는지 확인한다.
+
+    예전엔 여기서 데몬 스레드를 띄웠다. 스레드는 프로세스가 죽으면 같이 죽고,
+    DB 행은 ``pending`` 으로 남아 **아무도 그 화면을 열지 않으면 영원히 '작성중'**
+    이었다(2026-10-07 실사고). 줄을 DB 에 적으면 다음 부팅의 펌프가 **아무도 안 보고
+    있어도** 이어서 한다. 같은 대상에 대한 중복 요청은 큐의 유니크 키가 흡수한다.
+
+    True = 줄에 있다(새로 넣었거나 이미 있었다). False = 못 넣었다 — 호출부가
+    인프로세스 가드를 되돌려, 다음 방문의 ``resume_*`` 가 다시 시도하게 한다.
+    """
+    try:
+        ok = aijobs.enqueue(kind, key, payload, couple_id=couple_id)
+    except Exception:  # noqa: BLE001 — 큐가 삐끗해도 요청을 깨뜨리지 않는다
+        log.exception("ai job enqueue 실패 (kind=%s key=%s)", kind, key)
+        return False
+    if ok:
+        aijobs.start_pump(app_obj)
+    return ok
+
+
+def _bg_job_verdict(lock, keys, key, updated_at, stuck_after, job_key=None):
     """백그라운드 생성 한 건의 상태를 판정한다 — 'running' / 'orphaned' / 'overdue'.
 
-    * ``running``  — 정상 생성 중(가드 보유, 상한 이내). 화면은 그냥 기다리면 된다.
-    * ``orphaned`` — 만드는 스레드가 사라졌다(프로세스 재시작). **되살려야 한다.**
-    * ``overdue``  — 스레드는 등록돼 있는데 상한을 넘겼다(hang·세마포어 장기 대기).
+    * ``running``  — 정상 생성 중(줄에 있거나 가드 보유, 상한 이내). 기다리면 된다.
+    * ``orphaned`` — 만드는 쪽이 사라졌다(프로세스 재시작). **되살려야 한다.**
+    * ``overdue``  — 등록은 돼 있는데 상한을 넘겼다(hang·세마포어 장기 대기).
       자동으로 할 수 있는 일은 없으니 화면이 사람에게 탈출구를 줘야 한다.
+
+    ``job_key`` 를 주면 **DB 작업 큐**를 먼저 본다. 인프로세스 가드는 재시작에
+    비워지지만 큐 행은 남으므로, 큐에 있으면 그 일은 '사라진' 게 아니라 '아직
+    차례'다 — 그걸 orphaned 로 읽으면 멀쩡히 줄 선 일을 다시 되살린다고 떠든다.
     """
     now = datetime.utcnow()
     age = now - (updated_at or now)
     with lock:
         alive = key in keys
+    if not alive and job_key:
+        # 큐에 적혀 있으면 살아 있는 것이다(펌프가 순서대로 집는다).
+        try:
+            alive = aijobs.pending(job_key)
+        except Exception:  # noqa: BLE001 — 판정이 페이지를 깨뜨리지 않게
+            log.debug("ai job pending 조회 실패 (%s)", job_key, exc_info=True)
     if not alive:
         return "orphaned" if age >= _BG_SPAWN_GRACE else "running"
     return "overdue" if age >= stuck_after else "running"
@@ -1473,12 +1534,12 @@ def _kick_monthly_report(couple_id, year, month):
             report.updated_at = now
             db.session.commit()
 
-        threading.Thread(
-            target=regenerate_monthly_report,
-            args=(current_app._get_current_object(), couple_id, year, month),
-            daemon=True,
-        ).start()
-        spawned = True
+        spawned = _enqueue_ai(
+            current_app._get_current_object(), "monthly",
+            f"monthly:{couple_id}:{year}:{month}",
+            {"couple_id": couple_id, "year": year, "month": month},
+            couple_id=couple_id,
+        )
     except Exception:  # noqa: BLE001
         db.session.rollback()
         log.exception(
@@ -1605,12 +1666,8 @@ def _spawn_question_upgrade(app, question_id):
         if question_id in _question_upgrades:
             return
         _question_upgrades.add(question_id)
-    try:
-        threading.Thread(
-            target=upgrade_daily_question, args=(app, question_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — 업그레이드는 best-effort
-        log.exception("failed to spawn question upgrade thread (q=%s)", question_id)
+    if not _enqueue_ai(app, "question_upgrade", f"question:{question_id}",
+                       {"question_id": question_id}):
         with _question_upgrade_lock:
             _question_upgrades.discard(question_id)
 
@@ -1740,12 +1797,41 @@ def _spawn_caption_if_idle(app, photo_id):
     with _captioning_lock:
         if photo_id in _captioning:
             return
+    _enqueue_ai(app, "caption", f"caption:{photo_id}", {"photo_id": photo_id})
+
+
+def _warm_previews(app, photo_ids):
+    """업로드 직후 미리보기 자산(grid)을 만들어 둔다 — 배경, best-effort.
+
+    claude 와 **무관한** 값싼 HTTP 한 번이라 ``_CAPTION_SEM`` 뒤에 줄 서지 않는다
+    (거기 세우면 캡션 뒤에서 몇 분을 기다린다). 실패해도 아무 일도 일어나지 않는다 —
+    갤러리가 그 사진을 처음 열 때 그때 만든다.
+    """
+    try:
+        with app.app_context():
+            for pid in photo_ids or []:
+                try:
+                    photo = db.session.get(Photo, pid)
+                    if photo is not None:
+                        previews.ensure(photo, "grid")
+                except Exception:  # noqa: BLE001 — 사진당 실패 격리
+                    log.exception("preview warm 실패 (photo=%s)", pid)
+            db.session.remove()
+    except Exception:  # noqa: BLE001 — 절대 스레드 밖으로 나가지 않는다
+        log.exception("preview warm 스레드가 예외로 끝났다")
+
+
+def _spawn_warm_previews(app, photo_ids):
+    """``_warm_previews`` 를 배경 스레드로. 절대 raise 하지 않는다."""
+    ids = [int(i) for i in (photo_ids or [])]
+    if not ids:
+        return
     try:
         threading.Thread(
-            target=caption_photo, args=(app, photo_id), daemon=True
+            target=_warm_previews, args=(app, ids), daemon=True
         ).start()
-    except Exception:  # noqa: BLE001 — captioning is best-effort
-        log.exception("failed to spawn caption thread for photo %s", photo_id)
+    except Exception:  # noqa: BLE001 — 미리보기 예열은 best-effort
+        log.exception("failed to spawn preview warm thread")
 
 
 # --------------------------------------------------------------------------- #
@@ -1852,12 +1938,7 @@ def _spawn_judge_if_idle(app_obj, case_id):
             spawn = True
     if not spawn:
         return
-    try:
-        threading.Thread(
-            target=judge_case, args=(app_obj, case_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — never break the redirect
-        log.exception("failed to spawn judge thread for case %s", case_id)
+    if not _enqueue_ai(app_obj, "judge", f"judge:{case_id}", {"case_id": case_id}):
         with _judging_lock:
             _judging.discard(case_id)
 
@@ -1872,7 +1953,8 @@ def case_judging_verdict(case):
     if case is None or case.status != "judging":
         return None
     return _bg_job_verdict(
-        _judging_lock, _judging, case.id, case.updated_at, _STUCK_GENERATING
+        _judging_lock, _judging, case.id, case.updated_at, _STUCK_GENERATING,
+        job_key=f"judge:{case.id}",
     )
 
 
@@ -2154,12 +2236,8 @@ def _spawn_scoring_if_idle(app, couple_id):
     with _scoring_lock:
         if couple_id in _scoring:
             return
-    try:
-        threading.Thread(
-            target=score_events_for_couple, args=(app, couple_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — 채점은 best-effort
-        log.exception("failed to spawn scoring thread for couple %s", couple_id)
+    _enqueue_ai(app, "score", f"score:{couple_id}", {"couple_id": couple_id},
+                couple_id=couple_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -2345,12 +2423,8 @@ def _spawn_recommend_if_idle(app, couple_id):
     with _recommending_lock:
         if couple_id in _recommending:
             return
-    try:
-        threading.Thread(
-            target=recommend_dates_for_couple, args=(app, couple_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — 추천은 best-effort
-        log.exception("failed to spawn recommend thread for couple %s", couple_id)
+    _enqueue_ai(app, "recommend", f"recommend:{couple_id}", {"couple_id": couple_id},
+                couple_id=couple_id)
 
 
 def resume_recommendation_if_orphaned(app_obj, couple_id):
@@ -2416,7 +2490,7 @@ def review_pending_verdict(review):
         return None
     return _bg_job_verdict(
         _generating_reviews_lock, _generating_reviews, review.id,
-        review.updated_at, _STUCK_REVIEW,
+        review.updated_at, _STUCK_REVIEW, job_key=f"review:{review.id}",
     )
 
 
@@ -2611,12 +2685,12 @@ def _crop_vision_url(photo):
     if not base:
         return None  # 외부에서 못 닿는 환경(로컬 개발 등) → 파일 경로로 간다
     exp = int(time.time()) + _CROP_VISION_URL_TTL
-    sig = _blog_img_sig(photo.id, exp, None)
-    return (f"{base}/blog-img/{photo.id}?e={exp}&t={sig}"
-            f"&v=r{_RENDITION_VISION_EDGE}")
+    variant = f"r{_RENDITION_VISION_EDGE}"
+    sig = _blog_img_sig(photo.id, exp, None, variant)
+    return f"{base}/blog-img/{photo.id}?e={exp}&t={sig}&v={variant}"
 
 
-def _attach_section_crops(result, photos_ordered):
+def _attach_section_crops(result, photos_ordered, acquire_sem=True):
     """result['blocks']의 각 image 블록에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
 
     ⛔ **원본 바이트를 받지 않는다.** 크롭 박스는 0~1 정규화 좌표라 **해상도와
@@ -2631,8 +2705,11 @@ def _attach_section_crops(result, photos_ordered):
     렌디션을 못 받으면 그때만 원본으로 폴백한다(동작은 예전과 동일).
     suggest_crop이 None이어도 focus=None(중앙 크롭)으로 크롭을 저장해 서빙이 항상
     랜드스케이프가 되게 한다. 사진당 실패는 그 사진만 크롭 없이 넘어간다(전체 실패로
-    번지지 않게). 각 비전 콜은 캡션과 '같은' _CAPTION_SEM으로 직렬화한다.
-    저장 원본은 안 건드린다.
+    번지지 않게). 저장 원본은 안 건드린다.
+
+    ``acquire_sem`` — 비전 콜마다 ``_CAPTION_SEM`` 을 쥘 것인가. 후기 파이프라인은
+    **이미 바깥에서 쥔 채** 부르므로 False 다(같은 스레드가 Semaphore(1) 을 두 번
+    잡으면 영원히 멈춘다). 단독 호출(재크롭 등)에서는 True 가 맞다.
     """
     if not result or not isinstance(result, dict):
         return
@@ -2661,7 +2738,8 @@ def _attach_section_crops(result, photos_ordered):
                 data, ext = _crop_vision_image(p)
                 if not data:
                     continue  # 보여 줄 그림이 없다 → 이 사진만 건너뛴다
-            _CAPTION_SEM.acquire()
+            if acquire_sem:
+                _CAPTION_SEM.acquire()
             try:
                 focus = ai.suggest_crop(
                     data, hint, _BLOG_CROP_ASPECT, ext=ext, image_url=vision_url,
@@ -2670,7 +2748,8 @@ def _attach_section_crops(result, photos_ordered):
                 log.exception("suggest_crop raised (photo=%s)", p.id)
                 focus = None
             finally:
-                _CAPTION_SEM.release()
+                if acquire_sem:
+                    _CAPTION_SEM.release()
             rect = compute_crop_rect(img_w, img_h, focus, _BLOG_CROP_ASPECT)
             blk["crop"] = [round(v, 4) for v in rect]
         except Exception:  # noqa: BLE001 — 사진당 실패 격리(초안은 계속)
@@ -2746,57 +2825,75 @@ def generate_review(app, review_id):
                 # 메모에 남는다). 아무도 안 넣었으면 조사는 그냥 꺼진다.
                 creds, key_owner = _naver_credentials_for(review)
 
-                # 캡션·채점·추천과 '같은' 세마포어로 claude 콜을 직렬화. claude가
-                # 터져도 실패로만 취급(스레드를 죽이지 못하게).
+                # ⛔ **세마포어 하나 · claude 프로세스 하나로 파이프라인 전체를 덮는다.**
+                #
+                # 세마포어: 캡션·채점·추천과 '같은' 문이다(512MB 한 칸에 claude 가
+                # 둘 뜨면 죽는다). 예전엔 (1)(2) 와 크롭 N 개가 **각자** 이 문을
+                # 여닫았는데, 이제는 파이프라인이 통째로 한 번만 쥔다 — 그 안에서
+                # claude 프로세스가 **계속 살아 있기** 때문이다.
+                #
+                # 세션: ``ai.claude_session()`` 블록 안의 모든 ``_run_claude`` 호출이
+                # **한 프로세스**를 공유한다(부팅 8번 → 1번). 실측 71.5s vs 91.9s,
+                # 봉우리 RSS 는 사실상 동일(580 vs 578MB) — 근거는 ai.py 머리말.
+                # 세션을 못 열거나 중간에 깨지면 호출마다 조용히 one-shot 으로
+                # 되돌아간다(초안은 반드시 나온다).
+                #
+                # ⚠️ 블록 안에서는 ``_CAPTION_SEM`` 을 **다시 잡지 않는다** — 같은
+                # 스레드가 Semaphore(1) 을 두 번 잡으면 영원히 멈춘다. 그래서
+                # ``_attach_section_crops(acquire_sem=False)`` 다.
                 _CAPTION_SEM.acquire()
                 try:
-                    # (1) 키워드 조사 → (2) 본문 생성. 조사는 **절대 생성을 막지
-                    # 않는다** — 키가 없으면 skipped, 실패하면 failed를 메모로 남기고
-                    # 지금까지와 똑같이 쓴다.
-                    try:
-                        research = keyword_research.research(
-                            topic, location, prose, overall, details,
-                            client_id=creds[0], client_secret=creds[1],
-                            key_owner=key_owner,
-                        )
-                    except Exception:  # noqa: BLE001 — 조사는 best-effort
-                        log.exception(
-                            "keyword research raised (review=%s)", review_id
-                        )
-                        research = {"status": "failed", "reason": "exception"}
-                    try:
-                        result = ai.write_review(
-                            topic, location, prose, overall, photos_arg,
-                            details=details, research=research,
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "claude write_review raised (review=%s)", review_id
-                        )
-                        result = None
+                    with ai.claude_session():
+                        # (1) 키워드 조사 → (2) 본문 생성. 조사는 **절대 생성을 막지
+                        # 않는다** — 키가 없으면 skipped, 실패하면 failed를 메모로
+                        # 남기고 지금까지와 똑같이 쓴다.
+                        try:
+                            research = keyword_research.research(
+                                topic, location, prose, overall, details,
+                                client_id=creds[0], client_secret=creds[1],
+                                key_owner=key_owner,
+                            )
+                        except Exception:  # noqa: BLE001 — 조사는 best-effort
+                            log.exception(
+                                "keyword research raised (review=%s)", review_id
+                            )
+                            research = {"status": "failed", "reason": "exception"}
+                        try:
+                            result = ai.write_review(
+                                topic, location, prose, overall, photos_arg,
+                                details=details, research=research,
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.exception(
+                                "claude write_review raised (review=%s)", review_id
+                            )
+                            result = None
+
+                        # ⛔ **본문을 먼저 확정해 둔다 — 크롭 전에.**
+                        # 크롭 단계는 사진마다 claude 비전 콜이라 가장 긴 구간이고,
+                        # 2026-10-07 처럼 그 사이에 프로세스가 죽으면 **이미 끝난
+                        # 본문 생성이 통째로 버려졌다**(행은 pending 으로 남아 처음부터
+                        # 다시 돌았다). 먼저 커밋해 두면 거기서 죽어도 사람은 쓸 수
+                        # 있는 초안을 보고, 크롭만 다시 붙이면 된다.
+                        if result:
+                            _save_review_result(
+                                review_id, result, research, status="ready"
+                            )
+
+                        # 각 섹션 사진에 '내용 인지' 크롭을 계산해 result에 심는다
+                        # (서빙 시 적용). 크롭 실패는 초안 저장을 막지 않는다.
+                        if result:
+                            try:
+                                _attach_section_crops(
+                                    result, photos_ordered_list, acquire_sem=False
+                                )
+                            except Exception:  # noqa: BLE001 — belt & suspenders
+                                log.exception(
+                                    "attach section crops failed (review=%s)",
+                                    review_id,
+                                )
                 finally:
                     _CAPTION_SEM.release()
-
-                # ⛔ **본문을 먼저 확정해 둔다 — 크롭 전에.**
-                # 크롭 단계는 사진마다 claude 비전 콜이라 이 작업에서 가장 긴 구간이고
-                # (사진 5장이면 최악 15분), 2026-10-07 처럼 그 사이에 프로세스가 죽으면
-                # **이미 끝난 120초짜리 본문 생성이 통째로 버려졌다**(행은 pending 으로
-                # 남아 처음부터 다시 돌았다). 본문을 먼저 커밋해 두면 그 구간에서 죽어도
-                # 사람은 쓸 수 있는 초안을 보고, 크롭만 다시 붙이면 된다.
-                if result:
-                    _save_review_result(review_id, result, research, status="ready")
-
-                # 각 섹션 사진에 '내용 인지' 크롭을 계산해 result에 심는다(서빙 시
-                # 적용). 크롭 실패는 초안 저장을 막지 않는다(사진당 격리 + 여기서도
-                # 감싼다). suggest_crop은 위 write_review와 같은 _CAPTION_SEM으로
-                # 사진마다 직렬화된다.
-                if result:
-                    try:
-                        _attach_section_crops(result, photos_ordered_list)
-                    except Exception:  # noqa: BLE001 — belt & suspenders
-                        log.exception(
-                            "attach section crops failed (review=%s)", review_id
-                        )
 
                 # 행이 바뀌었을 수 있어 재조회.
                 review = db.session.get(BlogReview, review_id)
@@ -2825,12 +2922,64 @@ def generate_review(app, review_id):
                     log.exception(
                         "commit failed for blog review (review=%s)", review_id
                     )
+                # 초안이 섰으면 **상세 화면 그림을 미리 굽는다**(프리렌더).
+                # 사람이 열기 전에 끝내 두는 게 요점이라 줄 맨 뒤에 세운다 —
+                # claude 를 안 쓰는 잡이라 다음 claude 잡을 늦추지도 않는다.
+                if result or prior_ok:
+                    _enqueue_ai(app, "prerender", f"prerender:{review_id}",
+                                {"review_id": review_id})
             except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
                 db.session.rollback()
                 log.exception("generate_review failed (review=%s)", review_id)
     finally:
         with _generating_reviews_lock:
             _generating_reviews.discard(review_id)
+
+
+def prerender_review_images(app_obj, review_id):
+    """후기 상세 화면이 **열리기 전에** 그 화면의 그림을 전부 구워 둔다 (프리렌더).
+
+    왜: 초안이 끝나면 곧 사람이 상세 화면을 연다. 그때 서버가 비로소 Graph 렌디션을
+    왕복하고 Pillow 로 자르기 시작하면 그 전부가 **사람이 기다리는 시간**이 된다
+    (실측: 사진 5장이면 Graph 왕복 10회 · 브라우저 기준 첫 진입 1341ms). 그 일은
+    지금 해 두면 된다 — claude 는 이미 끝났고 펌프는 어차피 다음 잡을 집기 전이다.
+
+    굽는 것 셋:
+      * grid 티어 미리보기 자산 (사진 목록 썸네일)
+      * view 티어 미리보기 자산 (크롭 UI·라이트박스)
+      * 본문 std 바이트 (블록의 크롭 좌표 그대로 — 캐시 키가 크롭을 포함하므로
+        나중에 크롭을 바꾸면 그 블록만 다시 굽힌다)
+
+    claude 를 전혀 쓰지 않는다. 전부 best-effort — 실패하면 예전처럼 '열 때' 만들어질
+    뿐이다. 절대 raise 하지 않는다.
+    """
+    try:
+        with app_obj.app_context():
+            review = db.session.get(BlogReview, review_id)
+            if review is None:
+                return
+            photos = review.photos_ordered
+            for p in photos:
+                for tier in ("grid", "view"):
+                    try:
+                        previews.ensure(p, tier)
+                    except Exception:  # noqa: BLE001 — 사진·티어당 격리
+                        log.exception("prerender: 미리보기 자산 실패 (photo=%s %s)",
+                                      p.id, tier)
+            data = review.ai or {}
+            for blk in (data.get("blocks") or []):
+                if not isinstance(blk, dict) or blk.get("type") != "image":
+                    continue
+                pi = blk.get("photo_index")
+                if not (isinstance(pi, int) and 0 <= pi < len(photos)):
+                    continue
+                try:
+                    blog_std_bytes(photos[pi].id, _crop_str(blk.get("crop")))
+                except Exception:  # noqa: BLE001 — 블록당 격리
+                    log.exception("prerender: std 굽기 실패 (photo_index=%s)", pi)
+            db.session.remove()
+    except Exception:  # noqa: BLE001 — 절대 스레드 밖으로 나가지 않는다
+        log.exception("prerender_review_images failed (review=%s)", review_id)
 
 
 def _save_review_result(review_id, result, research, status):
@@ -2869,12 +3018,8 @@ def _spawn_generate_review(app, review_id):
             spawn = True
     if not spawn:
         return
-    try:
-        threading.Thread(
-            target=generate_review, args=(app, review_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — 초안 생성은 best-effort, redirect를 막지 않게
-        log.exception("failed to spawn review thread for review %s", review_id)
+    if not _enqueue_ai(app, "review", f"review:{review_id}",
+                       {"review_id": review_id}):
         with _generating_reviews_lock:
             _generating_reviews.discard(review_id)
 
@@ -2975,12 +3120,8 @@ def _spawn_generate_thumbnail(app, review_id):
             spawn = True
     if not spawn:
         return
-    try:
-        threading.Thread(
-            target=generate_thumbnail_copy, args=(app, review_id), daemon=True
-        ).start()
-    except Exception:  # noqa: BLE001 — 썸네일은 best-effort
-        log.exception("failed to spawn thumbnail thread for review %s", review_id)
+    if not _enqueue_ai(app, "thumbnail", f"thumbnail:{review_id}",
+                       {"review_id": review_id}):
         with _thumbing_reviews_lock:
             _thumbing_reviews.discard(review_id)
 
@@ -3001,6 +3142,7 @@ def thumbnail_pending_verdict(review):
     return _bg_job_verdict(
         _thumbing_reviews_lock, _thumbing_reviews, review.id,
         review.updated_at, _STUCK_GENERATING,
+        job_key=f"thumbnail:{review.id}",
     )
 
 
@@ -3238,6 +3380,17 @@ def _review_copy_text(review):
 # 서버로 재호스팅하므로 짧은 창이면 충분하다 — 영원히 공개로 두지 않는다.
 _BLOG_IMG_TTL = int(os.environ.get("BLOG_IMG_TTL_HOURS", "24")) * 3600
 
+# **발행 소스(v=orig) 전용** 수명. 이 URL 은 '네이버로 보내기'를 누른 **그 순간**
+# 브라우저가 한 번 받아 Canvas 로 자르는 데만 쓰인다 — 본문 std URL(네이버가 가져가
+# 재호스팅하는 것)과 달리 24시간 살아 있을 이유가 없다. 버킷에 올리지도 않는다:
+# 캐시 이득이 없고(한 번 받고 끝) 짧고 매번 다른 편이 맞다.
+#
+# 1시간인 이유(더 짧게 안 하는 이유): 이 URL 은 **페이지를 렌더할 때** 만들어져
+# `cd-export-images` 에 실린다. 사람이 상세 화면을 열어 초안을 읽고·고치고 📤 를
+# 누르기까지의 간격이 그만큼 벌어질 수 있다. 만료되면 조용히 깨지지 않고
+# '사진 담기 실패' 토스트가 뜨며, **새로고침**하면 새 URL 로 다시 된다.
+_BLOG_PUBLISH_TTL = int(os.environ.get("BLOG_PUBLISH_TTL_SEC", "3600"))
+
 
 def _crop_str(crop):
     """정규화 크롭 [x,y,w,h]를 URL·서명용 컴팩트 'x,y,w,h' 문자열로(3자리 반올림).
@@ -3259,7 +3412,68 @@ def _crop_str(crop):
     return f"{_f(x)},{_f(y)},{_f(w)},{_f(h)}"
 
 
-def _blog_img_sig(photo_id, exp, crop_str=None):
+# 확장자 → Content-Type. 라우트 클로저 밖(std 바이트 생성·예열기)에서도 쓰므로
+# 모듈 레벨이다(클로저 안에 두면 예열기가 못 본다 — 실제로 깨졌다).
+_EXT_CONTENT_TYPES_BY_EXT = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".heic": "image/heic", ".heif": "image/heif",
+}
+
+
+def content_type_for(name):
+    ext = os.path.splitext(name or "")[1].lower()
+    return _EXT_CONTENT_TYPES_BY_EXT.get(ext, "image/jpeg")
+
+
+def blog_std_bytes(photo_id, crop_str):
+    """발행·미리보기 본문용 std 바이트 ``(data, ctype)`` 또는 None.
+
+    이 앱에서 **서버가 픽셀을 만지는 유일한 자리**다. 왜 남았나: 이 바이트는 네이버
+    스마트에디터에 붙여넣는 HTML 의 ``<img src>`` 가 가리키는데, 그 경로에는 브라우저가
+    끼어들 자리가 없다(네이버가 URL 을 그대로 가져간다). 대신 **입력을 원본이 아니라
+    렌디션으로** 바꿔 12MP 디코드를 없앴다 — 출력 픽셀은 같다.
+
+    라우트와 **예열기**가 같은 함수를 쓴다. 예열이 요점이다: 초안이 완성되는 순간
+    (사람이 화면을 열기 전에) 미리 구워 두면, 상세 화면 첫 진입에서 Graph 왕복도
+    Pillow 재인코딩도 **이미 끝나 있다** — 첫 진입이 '리페인트 시간'에 가까워진다.
+    """
+    proc_key = (photo_id, crop_str or "", "std")
+    cached = _blog_proc_cache_get(proc_key)
+    if cached is not None:
+        return cached, "image/jpeg"
+    photo = db.session.get(Photo, photo_id)
+    if photo is None:
+        return None
+    # 크롭 파싱 — 4개 float, 아니면 크롭 없음.
+    crop = None
+    if crop_str:
+        parts = crop_str.split(",")
+        if len(parts) == 4:
+            try:
+                crop = [float(v) for v in parts]
+            except ValueError:
+                crop = None
+    try:
+        data, src_label, target = _blog_std_source(photo, crop, _BLOG_IMG_MAX_EDGE)
+    except onedrive.OneDriveError:
+        log.exception("blog-img: 이미지 바이트 조회 실패 photo=%s", photo.id)
+        return None
+    if data is None:
+        return None  # OneDrive 에서 사라짐
+    ctype = content_type_for(photo.filename or photo.original_name)
+    processed = _blog_img_process(
+        data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE, quality=92,
+        target_size=target,
+    )
+    if processed is not None:
+        log.debug("blog-img std photo=%s source=%s", photo.id, src_label)
+        data, ctype = processed, "image/jpeg"
+        _blog_proc_cache_put(proc_key, processed)  # 가공 성공분만 캐시
+    return data, ctype
+
+
+def _blog_img_sig(photo_id, exp, crop_str=None, variant=None):
     """공개 서명 이미지 URL용 HMAC 토큰(앱 SECRET_KEY 서명, 무상태·DB 컬럼 없음).
 
     id와 만료시각(exp, unix초)을 함께 서명해 토큰이 특정 시점 이후 무효가 되게
@@ -3267,32 +3481,78 @@ def _blog_img_sig(photo_id, exp, crop_str=None):
     하위호환: 크롭이 없으면 '옛' 문자열 ``blogimg:{id}:{exp}`` 를 그대로 서명하므로
     이미 발급된 (크롭 없는) URL도 계속 검증된다. 토큰이 곧 인가다 — 유효한 서명 +
     미만료면 그 사진 하나를 공개로 노출한다.
+
+    ⛔ **등급(``variant``)도 서명한다.** 예전엔 ``v`` 가 서명 대상이 아니어서, 네이버
+    글에 박힌 std URL(1280px·크롭된 그림)에 ``&v=orig`` 만 붙이면 **자르지 않은 풀
+    해상도 원본**이 나왔다 — 크롭으로 가린 바깥 영역까지. '같은 사진 한 장'이라는
+    옛 주석의 전제가 거기서 깨진다. 이제 등급이 다르면 토큰도 다르다. ``v`` 가 없는
+    (std) URL 의 서명 문자열은 **그대로**라 이미 발행된 글의 이미지는 계속 열린다.
     """
     secret = current_app.config["SECRET_KEY"]
     if isinstance(secret, str):
         secret = secret.encode("utf-8")
     if crop_str:
-        msg = f"blogimg:{photo_id}:{exp}:{crop_str}".encode("utf-8")
+        raw = f"blogimg:{photo_id}:{exp}:{crop_str}"
     else:
-        msg = f"blogimg:{photo_id}:{exp}".encode("utf-8")
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+        raw = f"blogimg:{photo_id}:{exp}"
+    if variant:
+        raw += f"|v={variant}"
+    return hmac.new(secret, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
 
-def blog_img_url(photo, crop=None, external=True):
+def _blog_img_exp(now=None):
+    """서명 URL 의 만료 시각 — **TTL 버킷에 고정**한다(렌더마다 달라지지 않게).
+
+    왜: 예전엔 ``now + TTL`` 이라 **같은 사진의 URL 이 렌더할 때마다 달랐다.**
+    브라우저 캐시 키는 쿼리를 포함한 URL 전체라, 상세 화면을 다시 열 때마다 이미
+    받아 둔 바이트를 **버리고 전부 다시 받았다**(그리고 서버는 그만큼 Graph 렌디션을
+    다시 왕복했다). 토큰이 '지금'에 매달릴 이유는 없다 — 필요한 건 '언젠가 만료된다'
+    뿐이다. 그래서 만료를 TTL 경계에 올려 **같은 버킷 안에서는 URL 이 바이트까지
+    동일**하게 만든다.
+
+    유효 기간은 버킷 위치에 따라 TTL ~ 2×TTL 이다 — **옛 동작(정확히 TTL)보다 짧아지는
+    일은 없다.** 네이버에 붙여넣은 임시 외부 이미지의 수명도 줄지 않는다.
+    """
+    now = int(now if now is not None else time.time())
+    return ((now // _BLOG_IMG_TTL) + 2) * _BLOG_IMG_TTL
+
+
+def blog_img_url(photo, crop=None, external=True, variant=None, ttl=None):
     """공개(인증 불필요) 서명 이미지의 절대 https URL — 네이버/독자가 로그인 없이
     가져간다. ``_external=True``라 렌더 호스트 기준 절대 URL이 나온다.
 
     ``crop``(정규화 [x,y,w,h])이 주어지면 ``&c=x,y,w,h``를 붙이고 그 값까지 서명한다
-    (서버가 서빙 시 그 영역으로 크롭). 렌더 시점 기준 ``_BLOG_IMG_TTL`` 초 뒤 만료.
+    (서버가 서빙 시 그 영역으로 크롭).
+
+    ``variant`` 는 등급(``orig`` / ``r<N>``)이고 **서명에 포함된다** — std URL 에
+    ``&v=orig`` 를 붙여 원본으로 승급시키는 길을 막는다(``_blog_img_sig`` 머리말).
+
+    만료: 기본은 ``_blog_img_exp`` 의 **TTL 버킷**(같은 버킷 안에서 URL 이 안 바뀌어
+    브라우저 캐시가 산다). ``ttl`` 을 주면 그 대신 '지금 + ttl' 로 **짧고 매번 다른**
+    만료를 쓴다 — 발행 소스(``v=orig``)처럼 한 번 받고 끝나는 URL 용이다.
     """
-    exp = int(time.time()) + _BLOG_IMG_TTL
+    exp = (int(time.time()) + int(ttl)) if ttl else _blog_img_exp()
     crop_str = _crop_str(crop)
-    sig = _blog_img_sig(photo.id, exp, crop_str)
+    sig = _blog_img_sig(photo.id, exp, crop_str, variant)
     url = url_for("blog_img", photo_id=photo.id, e=exp, t=sig, _external=external)
     if crop_str:
         # url_for로 넘기지 않고 직접 붙인다(쉼표 인코딩 방지 → 서명 문자열과 일치).
         url += f"&c={crop_str}"
+    if variant:
+        url += f"&v={variant}"
     return url
+
+
+def publish_source_url(photo, external=True):
+    """'네이버로 보내기'가 쓰는 **자르지 않은 원본** URL — 짧은 만료 · 등급 서명.
+
+    발행의 계약(사용자 요구 5번)은 이것이다: 브라우저가 **원본**을 이 URL 로 받아,
+    블록에 저장된 **정규화 크롭 좌표**로 Canvas 에서 자른 뒤 네이버에 올린다. 서버는
+    픽셀을 만지지 않고, 결과 화질은 원본 픽셀 그대로다(다운스케일본에서 자르는 것보다
+    낫다 — static/imagecrop.js 머리말).
+    """
+    return blog_img_url(photo, external=external, variant="orig",
+                        ttl=_BLOG_PUBLISH_TTL)
 
 
 # /blog-img/<id> 를 (기존 ?e=..&t=.. 유무와 무관하게) 잡아내는 패턴 — 스킴/호스트
@@ -3300,8 +3560,10 @@ def blog_img_url(photo, crop=None, external=True):
 # 안에서는 ``&``가 ``&amp;``로 이스케이프되므로 두 형태 모두 매칭한다(안 그러면
 # 이미 토큰이 박힌 src를 못 잡고 뒤에 두 번째 쿼리를 붙여 URL을 망가뜨린다).
 # 그룹2 = 선택적 크롭 문자열(x,y,w,h) — refresh가 보존·재서명한다.
+# 그룹3 = 선택적 등급(v=orig / v=r1280) — 이제 서명 대상이라 재서명에 함께 넣는다.
 _BLOG_IMG_RE = re.compile(
-    r"/blog-img/(\d+)(?:\?e=\d+&(?:amp;)?t=[0-9a-f]+(?:&(?:amp;)?c=([0-9.,]+))?)?"
+    r"/blog-img/(\d+)(?:\?e=\d+&(?:amp;)?t=[0-9a-f]+"
+    r"(?:&(?:amp;)?c=([0-9.,]+))?(?:&(?:amp;)?v=([0-9a-z]+))?)?"
 )
 
 
@@ -3322,15 +3584,37 @@ def _refresh_blog_img_tokens(html):
 
     def _sub(m):
         pid = int(m.group(1))
-        crop_str = m.group(2)  # 없으면 None
-        exp = int(time.time()) + _BLOG_IMG_TTL
-        sig = _blog_img_sig(pid, exp, crop_str)
+        crop_str = m.group(2)   # 없으면 None
+        variant = m.group(3)    # 없으면 None (저장된 본문 HTML 은 std 라 보통 없다)
+        exp = _blog_img_exp()   # TTL 버킷 — 같은 버킷 안에서 URL 이 안 바뀐다
+        sig = _blog_img_sig(pid, exp, crop_str, variant)
         out = f"/blog-img/{pid}?e={exp}&amp;t={sig}"
         if crop_str:
             out += f"&amp;c={crop_str}"
+        if variant:
+            out += f"&amp;v={variant}"
         return out
 
     return _BLOG_IMG_RE.sub(_sub, html)
+
+
+_FIRST_IMG_SRC_RE = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"']", re.I)
+
+
+def _first_img_src(html):
+    """HTML 안 **첫 번째** ``<img src>`` 문자열(없으면 None).
+
+    상세 화면이 ``<link rel=preload as=image>`` 로 **첫 사진 한 장만** 먼저 받기
+    시작하는 데 쓴다. 미리 받을 URL 은 실제 ``src`` 와 **바이트까지 같아야** 한다 —
+    한 글자라도 다르면 브라우저가 같은 그림을 두 번 받는다. 그래서 추정하지 않고
+    렌더될 HTML 에서 그대로 꺼낸다(``&amp;`` 는 브라우저가 같은 URL 로 해석한다).
+    """
+    if not html:
+        return None
+    m = _FIRST_IMG_SRC_RE.search(html)
+    if not m:
+        return None
+    return m.group(1).replace("&amp;", "&")
 
 
 def _gen_export_key():
@@ -3354,16 +3638,6 @@ def _ensure_export_key(u):
             if getattr(u, "export_key", None):
                 return u.export_key
     return getattr(u, "export_key", None)
-
-
-def _variant(url, v):
-    """서명 blog-img URL 에 등급(``&v=``)을 붙인다 — ``orig`` 또는 ``r<N>``.
-
-    ``v`` 는 서명 대상이 아니다(어느 등급이든 같은 사진 한 장이다 — blog_img 머리말).
-    """
-    if not url:
-        return url
-    return url + ("&" if "?" in url else "?") + f"v={v}"
 
 
 def _build_export_payload(review):
@@ -3394,7 +3668,7 @@ def _build_export_payload(review):
         blk["__src"] = key_src
         images.append({
             "src": key_src,
-            "url": _variant(blog_img_url(p), "orig"),  # 자르지 않은 원본
+            "url": publish_source_url(p),  # 자르지 않은 원본(짧은 만료·등급 서명)
             "crop": [round(float(v), 6) for v in crop] if crop else None,
         })
     created = review.created_at
@@ -4055,6 +4329,12 @@ def _register_routes(app: Flask):
             "push_enabled": push_enabled(),
             "onedrive_enabled": onedrive.onedrive_enabled(),
             "notif_unread": notif_unread,
+            # 미리보기 자산 URL — **사진당 고정**이고 서명·만료가 없다. 템플릿이
+            # url_for 를 직접 부르지 않고 이걸 쓰는 이유는 캐시 버전(PREVIEW_REV)을
+            # 한 곳에서만 붙이기 위해서다(티어 크기를 바꿨을 때의 유일한 손잡이).
+            "thumb_url": _thumb_url,
+            "preview_url": _preview_url,
+            "preview_rev": previews.REV,
         }
 
     @app.template_filter("timeago")
@@ -5514,15 +5794,8 @@ def _register_routes(app: Flask):
     # 256KB 면 넉넉하고(실패해도 Graph 메타가 받친다) 메모리는 사진 크기와 무관하다.
     _EXIF_HEAD_BYTES = 256 * 1024
     _MAX_UPLOAD_BATCH = 20               # 요청당 사진 수 안전 상한 (JS는 이제 1장씩 보냄)
-    _EXT_CONTENT_TYPES = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-        ".gif": "image/gif", ".webp": "image/webp",
-        ".heic": "image/heic", ".heif": "image/heif",
-    }
-
-    def _content_type_for(name):
-        ext = os.path.splitext(name or "")[1].lower()
-        return _EXT_CONTENT_TYPES.get(ext, "image/jpeg")
+    _EXT_CONTENT_TYPES = _EXT_CONTENT_TYPES_BY_EXT
+    _content_type_for = content_type_for
 
     def _attachment_disposition(name):
         """Build a Content-Disposition: attachment header that survives non-ASCII
@@ -5749,13 +6022,14 @@ def _register_routes(app: Flask):
             abort(404)
         # 선택적 크롭 — 서명에 포함된다. URL에 붙인 원문 그대로 되읽어 서명 대조.
         crop_str = request.args.get("c") or None
+        variant = (request.args.get("v") or "").strip().lower()
+        # 등급까지 서명 대조한다 — std 토큰으로 원본을 꺼내지 못하게.
         if not got or not hmac.compare_digest(
-            got, _blog_img_sig(photo_id, exp, crop_str)
+            got, _blog_img_sig(photo_id, exp, crop_str, variant or None)
         ):
             abort(404)
         if exp <= int(time.time()):  # 만료 → 404(존재 누설 방지로 410 대신)
             abort(404)
-        variant = (request.args.get("v") or "").strip().lower()
 
         def _public(resp):
             # PUBLIC 캐시 — 공개로 가져가라고 만든 URL이므로 private가 아니라 public.
@@ -5790,70 +6064,70 @@ def _register_routes(app: Flask):
         # `<img src>`** 가 가리킨다. 그 경로에는 브라우저가 끼어들 자리가 없어서
         # (네이버가 URL 을 그대로 가져간다) 잘린 그림이 URL 끝에 있어야 한다.
         # 대신 **입력을 렌디션으로 바꿔** 12MP 디코드를 없앴다 — 출력 픽셀은 동일.
-        proc_key = (photo_id, crop_str or "", "std")
-        cached = _blog_proc_cache_get(proc_key)
-        if cached is not None:
-            return _public(app.response_class(cached, mimetype="image/jpeg"))
-        photo = db.session.get(Photo, photo_id)  # 토큰이 인가 — 커플 불문
-        if photo is None:
+        got_std = blog_std_bytes(photo_id, crop_str)
+        if got_std is None:
             abort(404)
-        # 크롭 파싱(서명이 이미 검증된 값) — 4개 float, 아니면 크롭 없음.
-        crop = None
-        if crop_str:
-            parts = crop_str.split(",")
-            if len(parts) == 4:
-                try:
-                    crop = [float(v) for v in parts]
-                except ValueError:
-                    crop = None
-        try:
-            data, src_label, target = _blog_std_source(
-                photo, crop, _BLOG_IMG_MAX_EDGE
-            )
-        except onedrive.OneDriveError:
-            log.exception("blog-img: 이미지 바이트 조회 실패 photo=%s", photo.id)
-            abort(404)
-        if data is None:
-            abort(404)  # OneDrive에서 사라짐
-        ctype = _content_type_for(photo.filename or photo.original_name)
-        processed = _blog_img_process(
-            data, crop=crop, max_edge=_BLOG_IMG_MAX_EDGE, quality=92,
-            target_size=target,
-        )
-        if processed is not None:
-            log.debug("blog-img std photo=%s source=%s", photo.id, src_label)
-            data, ctype = processed, "image/jpeg"
-            _blog_proc_cache_put(proc_key, processed)  # 가공 성공분만 캐시
+        data, ctype = got_std
         return _public(app.response_class(data, mimetype=ctype))
 
-    @app.route("/memories/<int:photo_id>/thumb")
-    @active_couple_required
-    def memory_thumb(photo_id):
-        """Fast gallery thumbnail: stream a SMALL OneDrive-rendered thumbnail.
+    def _serve_preview(photo_id, tier):
+        """**우리가 소유한** 미리보기 자산을 내준다 — 사진당 고정 URL.
 
-        Serves ``get_thumbnail`` (a few-KB image) instead of proxying the full
-        original, so the grid loads quickly on the free tier. Falls back to the
-        full-res ``memory_image`` proxy when a thumbnail isn't available for the
-        item yet. Cached for a day in the browser. 404 unless the photo belongs
-        to the requester's couple.
+        ⛔ 여기엔 서명도 만료도 없다. 로그인한 커플 구성원만 닿고(``@active_couple_
+        required``), 그 사람은 어차피 그 사진의 주인이다. 예전 경로는 화면을 열
+        때마다 Graph 를 두 번 왕복해 썸네일을 '다시 만들었다' — 그게 미리보기 딜레이의
+        정체였다. 지금은 **DB 읽기 한 번**이다(자산 생성은 사진당 평생 한 번).
+
+        캐시: 자산은 사진이 사라지기 전까지 **절대 바뀌지 않으므로** 불변 자산처럼
+        다룬다(``immutable`` + 1년). 그래서 재방문은 네트워크 요청이 **아예 안 나간다.**
+        혹시 나가더라도 ``ETag`` 가 있어 **304** 로 끝난다. 티어 크기를 바꿔 이미
+        캐시된 브라우저까지 새 자산을 줘야 하면 ``PREVIEW_REV`` 를 올린다(URL 이 바뀐다).
+
+        자산을 못 만들면(OneDrive 미연결·Graph 실패) 404 로 죽지 않고 **원본 중계로
+        폴백**한다 — 화면이 비는 것보다 느린 게 낫다.
         """
         u = current_user()
         photo = db.session.get(Photo, photo_id)
         if photo is None or photo.couple_id != u.couple_id:
             abort(404)
-        try:
-            data, ctype = onedrive.get_thumbnail(photo.onedrive_item_id, size="medium")
-        except onedrive.OneDriveError:
-            log.exception("could not fetch thumbnail for photo %s", photo.id)
-            data, ctype = None, None
-        if data is None:
-            # No thumbnail (yet) → fall back to the full-res proxy.
+        got = previews.ensure(photo, tier)
+        if got is None:
             return redirect(url_for("memory_image", photo_id=photo.id))
+        data, ctype, etag, _w, _h = got
         if not ctype or not ctype.startswith("image/"):
             ctype = "image/jpeg"
-        resp = app.response_class(data, mimetype=ctype)
-        resp.headers["Cache-Control"] = "private, max-age=86400"
+        if etag and request.headers.get("If-None-Match") == etag:
+            resp = app.response_class(status=304)
+        else:
+            resp = app.response_class(data, mimetype=ctype)
+        resp.headers["Cache-Control"] = _PREVIEW_CACHE_CONTROL
+        if etag:
+            resp.headers["ETag"] = etag
         return resp
+
+    @app.route("/memories/<int:photo_id>/thumb")
+    @active_couple_required
+    def memory_thumb(photo_id):
+        """갤러리 그리드 썸네일 — 우리가 소유한 'grid' 티어 자산(DB 읽기 한 번).
+
+        예전엔 요청마다 ``onedrive.get_thumbnail`` 로 Graph 를 두 번 왕복했다(메타 +
+        CDN). 그 결과는 프로세스 메모리 캐시에만 살아서 재시작·재배포마다 전부
+        다시 받았다. 지금은 사진당 **한 번** 만들어 DB 에 보관한 것을 내준다.
+        """
+        return _serve_preview(photo_id, "grid")
+
+    @app.route("/memories/<int:photo_id>/preview")
+    @active_couple_required
+    def memory_preview(photo_id):
+        """크게 보는 미리보기 — 우리가 소유한 'view' 티어 자산(긴 변 1280).
+
+        크롭 UI·썸네일 배경 미리보기·라이트박스가 쓴다. 예전엔 같은 그림을 **만료
+        5분~24시간짜리 서명 URL**(``/blog-img?e=&t=&v=r1280``)로 내줬다 — 렌더마다
+        토큰이 달라져 브라우저 캐시 키가 매번 깨졌고(= 캐시가 아예 안 먹었다), 매
+        요청이 Graph 렌디션 왕복이었다. 로그인한 본인에게 자기 사진을 보여 주는 데
+        만료는 필요 없다. 서명·만료는 **네이버 발행용 외부 노출 이미지**에만 남는다.
+        """
+        return _serve_preview(photo_id, "view")
 
     def _wants_json():
         """AJAX 업로더 여부 판정: JS는 사진 1장씩 fetch로 보내며 아래 신호 중
@@ -6078,6 +6352,7 @@ def _register_routes(app: Flask):
 
         saved_ids = []          # rows that need background captioning
         saved_takens = []       # saved_ids와 짝: 각 사진의 taken_at(EXIF, 없으면 None)
+        warm_ids = []           # 미리보기 자산을 미리 만들어 둘 사진(캡션 유무 무관)
         saved = 0
         skipped = 0             # invalid / empty / too-big files
         failed = 0              # OneDrive upload errors
@@ -6163,22 +6438,23 @@ def _register_routes(app: Flask):
             # Commit per photo so one later failure can't lose earlier successes.
             db.session.commit()
             saved += 1
+            # 미리보기 자산을 **지금** 만들어 둔다 — 갤러리를 처음 열 때 Graph 를
+            # 기다리지 않게. 업로드 응답은 이걸 기다리지 않는다(배경 스레드).
+            warm_ids.append(photo.id)
             if caption is None:
                 saved_ids.append(photo.id)
                 saved_takens.append(taken)
+
+        # 미리보기 자산을 **업로드 직후** 만들어 둔다(배경). 갤러리를 처음 열 때
+        # Graph 를 기다리는 일이 아예 없어진다 — claude 와 무관한 값싼 HTTP 한 번이라
+        # _CAPTION_SEM 뒤에 줄 서지 않는다.
+        _spawn_warm_previews(current_app._get_current_object(), warm_ids)
 
         # Fire-and-forget auto-captioning for each new photo. The HTTP response
         # returns after the OneDrive PUTs + DB inserts — it NEVER waits on the
         # slow vision pass (CLAUDE.md: no synchronous AI on the request path).
         for pid in saved_ids:
-            try:
-                threading.Thread(
-                    target=caption_photo,
-                    args=(current_app._get_current_object(), pid),
-                    daemon=True,
-                ).start()
-            except Exception:  # noqa: BLE001 — captioning is best-effort
-                log.exception("failed to spawn caption thread for photo %s", pid)
+            _spawn_caption_if_idle(current_app._get_current_object(), pid)
 
         # AJAX 업로더(사진 1장씩)에는 JSON으로 결과만 돌려준다 — redirect 없음.
         # 클라이언트가 진행률/실패 파일명을 직접 표시하고, 전부 끝난 뒤 페이지를
@@ -6258,6 +6534,8 @@ def _register_routes(app: Flask):
             log.exception("OneDrive delete failed for photo %s", photo.id)
             flash("사진 삭제에 실패했어. 잠시 후 다시 시도해줘.", "error")
             return redirect(url_for("memories"))
+        # 원본이 사라지면 그 사진의 미리보기 자산도 같이 거둔다(FK 가 막기 전에).
+        previews.forget(photo.id)
         db.session.delete(photo)
         db.session.commit()
         flash("사진을 삭제했어.", "ok")
@@ -7282,24 +7560,35 @@ def _register_routes(app: Flask):
                         "index": i,  # 블록 인덱스(crop-save가 target)
                         "heading": _crop_hint_for_image(blocks, i)[:40],
                         # 크롭 조정 UI 는 **화면에서 드래그**하는 미리보기다 —
-                        # 원본(수 MB)을 부를 이유가 없다. Graph 렌디션(수백 KB)을
-                        # 중계로 받아 CSS 로 자른 모습을 보여 준다.
-                        "img_url": _variant(blog_img_url(p),
-                                            f"r{_RENDITION_PREVIEW_EDGE}"),
+                        # 원본(수 MB)을 부를 이유가 없다. 우리가 소유한 'view'
+                        # 티어 자산(긴 변 1280)을 **고정 URL**로 받아 CSS 로 자른
+                        # 모습을 보여 준다. 예전엔 같은 그림을 만료 24시간짜리
+                        # 서명 URL(`/blog-img?e=&t=&v=r1280`)로 줬는데, 렌더마다
+                        # 토큰이 달라져 **브라우저 캐시가 매번 미스**였고 매 요청이
+                        # Graph 렌디션 왕복이었다. 픽셀은 같고 딜레이만 사라진다.
+                        "img_url": _preview_url(p.id),
                         "crop": crop,
                     }
                 )
         # 썸네일(Step 4) 재료. 서버는 스펙(template.css에서 읽은 수치)과 사진 URL만
-        # 넘기고, 그림은 브라우저가 그린다. 사진은 **원본 중계**(v=orig)로 받는다 —
-        # 1080×1350 캔버스에 1280px 다운스케일본을 늘려 쓰면 흐려진다. 예전엔
-        # &hq=1 이 서버에서 원본을 디코드·재인코딩해 줬는데, 그냥 흘려보내면 된다
-        # (화질은 오히려 재인코딩 한 세대가 빠져 더 좋다).
+        # 넘기고, 그림은 브라우저가 그린다.
+        #
+        # ⛔ **URL 이 두 개인 이유 — 화면과 결과물은 다른 그림을 필요로 한다.**
+        #   preview_url : 화면의 DOM 미리보기(가로 300~400px 로 줄여 보여 준다).
+        #                 우리가 소유한 'view' 자산 — 고정 URL · 만료 없음 · 재방문
+        #                 네트워크 0. 예전엔 여기에도 **원본(수 MB)** 을 걸어 둬서,
+        #                 썸네일 카드가 있는 후기는 상세 화면을 열 때마다 원본 한
+        #                 장을 통째로 받았다(아무도 '내려받기'를 누르지 않아도).
+        #   url         : 1080×1350 캔버스 래스터용 **원본 중계**(v=orig). 여기선
+        #                 원본이 맞다 — 다운스케일본을 늘려 쓰면 흐려진다. 이 URL 은
+        #                 '내려받기'를 누를 때 **그때 비로소** 로드된다.
         thumb_photos = []
         for i, p in enumerate(review.photos_ordered):
             thumb_photos.append(
                 {
                     "index": i,
-                    "url": _variant(blog_img_url(p), "orig"),
+                    "url": publish_source_url(p),
+                    "preview_url": _preview_url(p.id),
                     "name": (p.caption or p.original_name or f"사진 {i + 1}")[:40],
                 }
             )
@@ -7346,6 +7635,8 @@ def _register_routes(app: Flask):
             review_resumed=review_resumed,
             thumb_state=thumbnail_pending_verdict(review),
             thumb_resumed=thumb_resumed,
+            # 첫 화면 첫 사진 — <head> 에서 프리로드할 URL(없으면 None → 링크 생략).
+            preview_preload=_first_img_src(copy_html),
         )
 
     # ---- 네이버 자동 export(v2) ----
@@ -7662,6 +7953,10 @@ def _register_routes(app: Flask):
         blocks[idx]["crop"] = [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
         review.ai_json = json.dumps(data, ensure_ascii=False)
         db.session.commit()
+        # 크롭이 바뀌면 그 블록의 std 캐시 키도 바뀐다(키에 크롭이 들어간다) —
+        # 다음 방문이 기다리지 않게 **지금** 다시 구워 둔다(프리렌더, claude 無).
+        _enqueue_ai(current_app._get_current_object(), "prerender",
+                    f"prerender:{review.id}", {"review_id": review.id})
         if is_ajax:
             return jsonify(ok=True, crop=blocks[idx]["crop"])
         flash("사진 위치를 저장했어.", "success")
@@ -8136,7 +8431,65 @@ def _register_routes(app: Flask):
             return html, 500, {"Content-Type": "text/html; charset=utf-8"}
 
 
+# --------------------------------------------------------------------------- #
+# AI 작업 큐 배선 — 느린 claude 작업은 **DB 큐**를 거쳐 한 줄로 돈다
+# --------------------------------------------------------------------------- #
+# 규율의 정본은 ``aijobs.py`` 머리말. 여기서 하는 일은 셋뿐이다:
+#   (1) kind → 기존 워커 함수를 잇는다 (워커 본문은 한 줄도 안 바뀐다),
+#   (2) 스폰 지점이 ``_enqueue_ai`` 로 '스레드 띄우기' 대신 '줄 세우기'를 한다,
+#   (3) 펌프를 띄운다 (프로세스당 하나 · gunicorn 워커 1개가 이 앱의 전제).
+def _register_ai_handlers():
+    aijobs.register(
+        "monthly",
+        lambda a, p: regenerate_monthly_report(
+            a, p["couple_id"], p["year"], p["month"]
+        ),
+    )
+    aijobs.register(
+        "question_upgrade",
+        lambda a, p: upgrade_daily_question(a, p["question_id"]),
+    )
+    aijobs.register("caption", lambda a, p: caption_photo(a, p["photo_id"]))
+    aijobs.register("judge", lambda a, p: judge_case(a, p["case_id"]))
+    aijobs.register(
+        "score", lambda a, p: score_events_for_couple(a, p["couple_id"])
+    )
+    aijobs.register(
+        "recommend", lambda a, p: recommend_dates_for_couple(a, p["couple_id"])
+    )
+    aijobs.register("review", lambda a, p: generate_review(a, p["review_id"]))
+    aijobs.register(
+        "thumbnail", lambda a, p: generate_thumbnail_copy(a, p["review_id"])
+    )
+    # claude 를 안 쓰는 유일한 잡 — 상세 화면 그림을 미리 구워 둔다(프리렌더).
+    aijobs.register(
+        "prerender", lambda a, p: prerender_review_images(a, p["review_id"])
+    )
+
+
+_register_ai_handlers()
+
+
+def _pump_should_start():
+    """펌프를 띄울 환경인가.
+
+    ``AI_JOB_PUMP`` 로 강제할 수 있고, 기본(auto)은 **pytest 안에서는 안 띄운다** —
+    테스트는 큐를 직접(``aijobs.run_one``) 돌려 결정적으로 검증한다.
+    """
+    flag = (os.environ.get("AI_JOB_PUMP") or "auto").strip().lower()
+    if flag in ("0", "false", "off", "no"):
+        return False
+    if flag in ("1", "true", "on", "yes"):
+        return True
+    return "pytest" not in sys.modules
+
+
 app = create_app()
+
+if _pump_should_start():
+    # 부팅 즉시 띄운다 — 지난 프로세스가 남긴 'running' 행을 되돌려 **아무도 화면을
+    # 열지 않아도** 이어서 한다. 2026-10-07 사고('작성중' 영구 고착)의 구조적 해소점.
+    aijobs.start_pump(app)
 
 if __name__ == "__main__":
     # Local dev only. Production uses gunicorn (see Dockerfile / fly.toml).
