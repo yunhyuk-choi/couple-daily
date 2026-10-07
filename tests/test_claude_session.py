@@ -222,7 +222,7 @@ def test_the_pipeline_holds_the_claude_slot_exactly_once(
     monkeypatch.setattr(app_module.keyword_research, "research",
                         lambda *a, **k: {"status": "skipped"})
 
-    def _crops(result, photos, acquire_sem=True):
+    def _crops(result, photos, acquire_sem=True, on_step=None):
         held.append(acquire_sem)
         # 문이 잡혀 있어야 한다(= 바깥에서 쥐고 들어왔다).
         got = app_module._CAPTION_SEM.acquire(blocking=False)

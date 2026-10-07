@@ -187,8 +187,15 @@ def _public_evidence(candidates, evidence):
     return out
 
 
+#: 이 조사가 밟는 단계 이름 — 화면이 "2/8단계 (검색으로 후보 확인하는 중)" 처럼
+#: 보여 준다. 순서가 곧 진행 순서이고, 길이가 곧 '조사가 차지하는 단계 수'다.
+#: 키가 없어 조사가 꺼지면 이 셋은 **계획에서 통째로 빠진다**(총 단계 수가 줄어든다).
+STEPS = ("키워드 후보 뽑는 중", "검색으로 후보 확인하는 중", "키워드 고르는 중")
+
+
 def research(topic, location, prose, overall_score, details=None,
-             client_id=None, client_secret=None, key_owner="", today=None):
+             client_id=None, client_secret=None, key_owner="", today=None,
+             on_step=None):
     """키워드 조사 한 번. **절대 raise 하지 않고** 항상 dict를 돌려준다.
 
     반환 ``status``:
@@ -197,17 +204,32 @@ def research(topic, location, prose, overall_score, details=None,
       * ``"ok"``      — ``selection``(메인·보조·이유)과 ``candidates`` 증거가 있다.
 
     자격증명은 인자로만 쓰이고 **반환 dict에 절대 들어가지 않는다.**
+
+    ``on_step(label)`` — 선택. 느린 구간에 **들어가기 직전** 그 구간 이름으로 불린다
+    (``STEPS`` 순서). 조사 한 번은 claude 콜 2 번 + 네이버 API 왕복이라 수 분이 될 수
+    있는데, 그동안 화면이 아무 변화도 못 보면 사람은 죽은 줄 안다. 콜백이 터져도
+    조사는 그대로 간다 — 진척 보고가 본업을 깨뜨리지 않는다.
     """
+    def _step(label):
+        if on_step is None:
+            return
+        try:
+            on_step(label)
+        except Exception:  # noqa: BLE001 — 진척 보고가 조사를 깨뜨리지 않게
+            log.debug("keyword research: on_step 실패 (%s)", label, exc_info=True)
+
     if not (client_id or "").strip() or not (client_secret or "").strip():
         return {"status": "skipped", "reason": "no_credentials"}
 
     input_block = ai.build_review_input_block(
         topic, location, prose, overall_score, details
     )
+    _step(STEPS[0])
     candidates = ai.suggest_keyword_candidates(input_block)
     if not candidates:
         return {"status": "failed", "reason": "no_candidates"}
 
+    _step(STEPS[1])
     try:
         evidence, errors = collect_evidence(
             candidates, client_id, client_secret, today=today
@@ -216,6 +238,7 @@ def research(topic, location, prose, overall_score, details=None,
         log.exception("keyword research: evidence collection blew up")
         evidence, errors = {}, ["조사 호출이 예외로 중단됐다"]
 
+    _step(STEPS[2])
     selection = ai.select_keywords(
         input_block, format_evidence_block(candidates, evidence, errors), candidates
     )

@@ -2,9 +2,12 @@
 {% from "_stars.html" import stars %}
 {% block title %}{{ review.topic }} · 후기 · {{ app_name }}{% endblock %}
 {% block head %}
-  {# 생성 중일 때만 4초마다 새로고침 — 백그라운드 초안이 끝나면 자동으로 결과가
-     뜬다. (의존성 없는 순수 meta refresh. 'ready'/'failed'가 되면 자연히 멈춘다.) #}
-  {% if review.status == 'pending' or (thumb and thumb.status == 'pending') %}<meta http-equiv="refresh" content="4" />{% endif %}
+  {# ⛔ 기다리는 동안의 갱신은 **작은 JSON 폴링**이 한다(본문 아래 rv-progress 스크립트).
+     예전엔 여기서 4초마다 이 페이지를 **통째로** 다시 그렸다 — 사진·썸네일·GIF·복사본
+     HTML 까지 세우는 가장 무거운 화면을, 가장 자주. 지금은 같은 4초에 수백 바이트짜리
+     JSON 하나만 오간다. 끝나면 그때 한 번 새로고침한다.
+     JS 가 없는 브라우저에는 예전 동작을 그대로 남긴다(noscript). #}
+  {% if progress and not progress.done %}<noscript><meta http-equiv="refresh" content="4" /></noscript>{% endif %}
   {# 썸네일 타이포 — design/thumbnail-template.css 가 지정한 Pretendard. 다른 폰트로
      그리면 검증된 디자인이 아니게 되므로, 로딩에 실패하면 JS가 렌더를 아예 막는다. #}
   {% if thumb and thumb.candidates and thumb_spec and thumb_photos %}
@@ -187,30 +190,35 @@
 {# ---- P2: 생성 중 / 초안 준비됨 / 실패 ----
    'pending' 은 한 가지가 아니다. 2026-10-07 사고(메모리 한도 초과 → 자동 재시작 →
    초안 스레드 사망 → 행이 영원히 pending)에서 화면은 '작성중'만 말하며 4초마다
-   새로고침을 돌았고, 사용자가 빠져나갈 길이 없었다. 이제 서버가 '정말 만들고 있는지'를
-   판정해(review_state / review_resumed) 화면이 무슨 일이 났는지 말하고, 비정상이면
-   언제나 ↻ 다시 생성 버튼을 준다. #}
-{% if review.status == 'pending' %}
-<div class="review-placeholder">
-  {% if review_resumed %}
-  <span aria-hidden="true">↻</span>
-  <span>생성이 중단된 것 같아 방금 다시 시작했어 — 조금만 기다려줘!</span>
-  {% elif review_state == 'overdue' %}
-  <span aria-hidden="true">⏳</span>
-  <span>생성이 너무 오래 걸리고 있어 — 중단된 것 같아. 다시 시도해줄래?</span>
-  {% else %}
-  <span aria-hidden="true">✨</span>
-  <span>AI가 블로그 초안을 쓰고 있어요… (잠시만!)</span>
-  {% endif %}
-</div>
-{% if review_resumed or review_state == 'overdue' %}
-{# 탈출구 — 자동 복구가 또 실패해도 사람이 직접 다시 돌릴 수 있어야 한다. #}
-<div class="review-failed">
-  <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
-    <button type="submit" class="btn primary sm">↻ 다시 생성</button>
-  </form>
-</div>
+   새로고침을 돌았고, 사용자가 빠져나갈 길이 없었다.
+
+   그 다음 질문이 이것이었다 — **"오래 걸리는 건지 죽은 건지를 모르겠어."** 큐 행은
+   필요한 걸 이미 다 알고 있었는데(차례·시작 시각·시도 횟수·지금 몇 단계) 화면에
+   꺼내는 길이 없었다. 이제 서버가 그걸 다섯 상태의 **한 문장**으로 만들어
+   (``review_progress_view``) 여기에 적고, 폴링이 같은 문장을 갱신한다. #}
+{% if review.status != 'pending' and progress and progress.headline %}
+{# 초안은 떴지만 **사진 크롭이 아직 돈다** — 파이프라인이 본문을 크롭 전에 먼저
+   커밋하기 때문이다(거기서 죽어도 쓸 수 있는 초안이 남게). 가장 긴 구간이 여기라,
+   조용히 한 줄로 알려 주고 끝나면 폴링이 화면을 한 번 더 그린다. #}
+<p id="rv-progress" class="muted small rv-progress-hint"
+   data-url="{{ url_for('review_progress', rid=review.id) }}"
+   data-rv="headline">{{ progress.headline }}</p>
 {% endif %}
+{% if review.status == 'pending' %}
+<div id="rv-progress" data-url="{{ url_for('review_progress', rid=review.id) }}">
+  <div class="review-placeholder">
+    <span data-rv="headline">{{ progress.headline }}</span>
+  </div>
+  {% if progress.hint %}
+  <p class="muted small rv-progress-hint" data-rv="hint">{{ progress.hint }}</p>
+  {% endif %}
+  {# 탈출구 — 자동 복구가 또 실패해도 사람이 직접 다시 돌릴 수 있어야 한다. #}
+  <div class="review-failed" data-rv="retry"{% if not progress.retry %} hidden{% endif %}>
+    <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
+      <button type="submit" class="btn primary sm">↻ 다시 생성</button>
+    </form>
+  </div>
+</div>
 
 {% elif review.status == 'failed' %}
 <div class="review-failed">
@@ -984,6 +992,74 @@
 })();
 </script>
 {% endif %}
+{% endif %}
+
+{% if progress and not progress.done %}
+{# ---- 기다리는 동안의 갱신 — 페이지가 아니라 **문장 한 줄**만 다시 받는다 ----
+   예전: 4초마다 meta refresh → 이 무거운 상세 페이지를 통째로 다시 그렸다.
+   지금: 4초마다 작은 JSON(수백 바이트) → headline/hint/↻ 만 갈아끼운다.
+   끝나면(done) 그때 **한 번** 새로고침한다 — 프리렌더가 구워 둔 그림을 그대로
+   받으므로 '재진입 네트워크 0' 이득은 그대로다.
+   탭이 숨겨져 있으면 아예 안 묻는다(배터리·데이터). #}
+<script data-progress-url="{{ url_for('review_progress', rid=review.id) }}"
+        data-status="{{ progress.status }}">
+(function () {
+  var ds = document.currentScript && document.currentScript.dataset;
+  if (!ds || !ds.progressUrl || !window.fetch) return;
+  var url = ds.progressUrl, was = ds.status;
+  var box = document.getElementById('rv-progress');
+  var BASE = 4000, MAX_MS = 60 * 60 * 1000, started = Date.now();
+  var wait = BASE, timer = null, stopped = false;
+
+  function el(name) {
+    if (!box) return null;
+    if (box.dataset.rv === name) return box;        // 박스 자신이 그 칸일 수도
+    return box.querySelector('[data-rv="' + name + '"]');
+  }
+
+  function paint(d) {
+    var h = el('headline'); if (h && d.headline) h.textContent = d.headline;
+    var t = el('hint');
+    if (t) { t.textContent = d.hint || ''; t.hidden = !d.hint; }
+    var r = el('retry'); if (r) r.hidden = !d.retry;
+  }
+
+  function schedule() {
+    if (stopped) return;
+    if (Date.now() - started > MAX_MS) return;   // 버려진 탭이 영원히 묻지 않게
+    timer = setTimeout(tick, wait);
+  }
+
+  function tick() {
+    if (stopped) return;
+    if (document.hidden) { schedule(); return; }  // 안 보이는 탭은 안 묻는다
+    fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        wait = BASE;
+        // 끝났거나(done) 상태가 바뀌었으면(pending → ready/failed) 화면을 새로
+        // 그린다 — 그래야 '작성중' 안내가 이미 선 초안 위에 남지 않는다.
+        if (d && (d.done || d.status !== was)) {
+          stopped = true; window.location.reload(); return;
+        }
+        paint(d || {});
+        schedule();
+      })
+      .catch(function () {
+        wait = Math.min(wait * 2, 30000);   // 서버가 안 받아 주면 천천히
+        schedule();
+      });
+  }
+
+  // 다시 보이면 기다리지 않고 바로 한 번 묻는다(숨은 동안 끝났을 수 있다).
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden || stopped) return;
+    if (timer) { clearTimeout(timer); timer = null; }
+    tick();
+  });
+  schedule();
+})();
+</script>
 {% endif %}
 
 <div class="review-detail-actions">

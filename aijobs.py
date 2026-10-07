@@ -83,6 +83,35 @@ _pump_stop = threading.Event()
 # 테스트·진단용 카운터(처리한 잡 수). 운영 로직은 이 값을 보지 않는다.
 processed = 0
 
+# ---- 펌프 심장박동 ---------------------------------------------------------
+# '줄에는 서 있는데 아무도 집어가지 않는다'를 화면이 **구분해서 말할 수 있어야**
+# 한다(큐가 비어 있지 않은데 펌프가 죽었거나 한 잡에 물려 있는 상태). 그 판정의
+# 재료는 DB 가 아니라 **이 프로세스의 사실**이다 — 이 앱은 gunicorn 워커 1개가
+# 전제이므로 요청을 처리하는 스레드와 펌프 스레드가 같은 프로세스에 산다.
+#   _last_tick   : 펌프 루프가 마지막으로 한 바퀴 돈 시각(monotonic)
+#   _current_key : 지금 붙들고 있는 job_key (없으면 None)
+# ⚠️ 워커를 2개 이상으로 늘리면 이 두 값은 '내 프로세스의 사실'일 뿐이다. 그래서
+#    화면 판정은 이것만 믿지 않고 DB 쪽 신호(오래 queued 인데 아무도 running 이
+#    아니다)와 **같이** 본다 — ``app.py`` 의 진척 뷰가 그 둘을 합친다.
+_last_tick = None
+_current_key = None
+
+# 펌프가 '멎었다'고 볼 간격. 루프는 빈 큐에서도 POLL_SEC 마다 한 바퀴 돈다.
+PUMP_SILENT_SEC = float(os.environ.get("AI_JOB_PUMP_SILENT_SEC", "30"))
+
+
+def pump_status():
+    """이 프로세스 펌프의 지금 모습 — 화면이 '펌프가 안 돈다'를 말할 근거.
+
+    반환 ``{"alive", "silent_sec", "current_key"}``.
+    ``silent_sec`` 은 마지막 루프 이후 흐른 초(한 번도 안 돌았으면 None).
+    """
+    th = _pump_thread
+    alive = bool(th is not None and th.is_alive())
+    tick = _last_tick
+    silent = None if tick is None else max(0.0, time.monotonic() - tick)
+    return {"alive": alive, "silent_sec": silent, "current_key": _current_key}
+
 
 def register(kind, handler):
     """``kind`` 를 처리할 함수를 등록한다 — ``handler(app, payload: dict)``."""
@@ -159,6 +188,87 @@ def depth():
     except Exception:  # noqa: BLE001
         db.session.rollback()
         return 0
+
+
+def progress(job_key, step, index=None, total=None):
+    """**돌고 있는 쪽이** 자기 진척을 자기 행에 적는다(적었으면 True).
+
+    왜 이게 있나 — ``status='running'`` 만으로는 사람이 '오래 걸리는 건지 죽은
+    건지'를 구분할 수 없다. 후기 한 건은 claude 콜이 3+N 번이고 한 콜이 수십 초~수
+    분이라, 그 사이 화면은 **아무 변화도 보지 못한다.** 콜과 콜 사이에 이걸 한 번
+    부르면 "4/8단계 (본문 쓰는 중)"가 뜨고, 그 한 줄이 *살아 있다*는 증거가 된다.
+
+    ⚠️ **시간으로 혼자 올라가는 가짜 진행률이 아니다.** 일이 실제로 다음 단계로
+    넘어갈 때만 바뀌고, 안 바뀌면 안 바뀐 채로 보인다 — 멈춘 것은 멈춰 보여야 한다.
+
+    ``updated_at`` 도 같이 민다. 그래서 긴 작업이 ``recover()`` 의 stale 상한에
+    걸려 **돌고 있는데 되돌려지는** 일이 없다(진척이 곧 생존 신호다).
+
+    절대 raise 하지 않는다 — 진척 보고가 실제 작업을 깨뜨리면 본말전도다.
+    """
+    try:
+        now = _utcnow()
+        values = {"step": (step or "")[:60] or None, "updated_at": now}
+        if index is not None:
+            values["step_index"] = int(index)
+        if total is not None:
+            values["step_total"] = int(total)
+        updated = (
+            db.session.query(AiJob)
+            .filter(AiJob.job_key == job_key)
+            .update(values, synchronize_session=False)
+        )
+        db.session.commit()
+        return bool(updated)
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.debug("ai job: 진척 기록 실패 (%s)", job_key, exc_info=True)
+        return False
+
+
+def snapshot(job_key):
+    """그 일거리의 지금 모습(없으면 None) — 화면이 사람에게 말할 재료.
+
+    ``ahead`` 는 **앞에 몇 개가 먼저인가**다(도착순 = id 오름차순이므로 id 가 더
+    작은 행의 수). 'queued' 인 사람이 가장 알고 싶어 하는 숫자다.
+    """
+    try:
+        row = AiJob.query.filter_by(job_key=job_key).first()
+        if row is None:
+            return None
+        ahead = (
+            db.session.query(AiJob).filter(AiJob.id < row.id).count()
+        )
+        return {
+            "kind": row.kind,
+            "status": row.status,
+            "owner": row.owner,
+            "attempts": row.attempts or 0,
+            "ahead": ahead,
+            "created_at": row.created_at,
+            "started_at": row.started_at,
+            "updated_at": row.updated_at,
+            "step": row.step,
+            "step_index": row.step_index,
+            "step_total": row.step_total,
+        }
+    except Exception:  # noqa: BLE001 — 진단 조회가 페이지를 깨뜨리지 않게
+        db.session.rollback()
+        log.debug("ai job: snapshot 실패 (%s)", job_key, exc_info=True)
+        return None
+
+
+def anyone_running():
+    """지금 누군가 집어서 돌리고 있는 행이 하나라도 있나.
+
+    'queued 인데 아무도 running 이 아니다'는 **펌프가 안 돈다**의 DB 쪽 신호다
+    (이 프로세스 바깥에 펌프가 있는 배치에서도 성립한다).
+    """
+    try:
+        return db.session.query(AiJob).filter_by(status="running").count() > 0
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        return False
 
 
 def claim_next():
@@ -247,11 +357,12 @@ def run_one(app):
 
     테스트는 펌프 스레드 없이 이 함수만 불러 큐 동작을 검증한다.
     """
-    global processed
+    global processed, _current_key
     job = claim_next()
     if job is None:
         return False
     kind, job_id, key = job.kind, job.id, job.job_key
+    _current_key = key
     try:
         payload = json.loads(job.payload_json or "{}")
     except (TypeError, ValueError):
@@ -260,6 +371,7 @@ def run_one(app):
     if handler is None:
         log.error("ai job: 핸들러 없음 kind=%s — 버린다 (key=%s)", kind, key)
         finish(job_id)
+        _current_key = None
         return True
     try:
         handler(app, payload)
@@ -268,17 +380,23 @@ def run_one(app):
     finally:
         finish(job_id)
         processed += 1
+        _current_key = None
     return True
 
 
 def _pump_loop(app):
+    global _last_tick
     with app.app_context():
+        _last_tick = time.monotonic()
         try:
             recover()
         except Exception:  # noqa: BLE001
             log.exception("ai job: 부팅 복구 실패")
         last_recover = time.time()
         while not _pump_stop.is_set():
+            # 한 바퀴 돌 때마다 심장박동을 찍는다 — 화면이 '아무도 안 집어간다'를
+            # 추측이 아니라 **사실**로 말할 수 있게 하는 유일한 근거다.
+            _last_tick = time.monotonic()
             try:
                 did = run_one(app)
             except Exception:  # noqa: BLE001 — 펌프는 절대 죽지 않는다

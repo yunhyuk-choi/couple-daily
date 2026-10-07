@@ -1799,6 +1799,10 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
   border-radius: var(--radius); padding: 14px 16px; margin-top: 16px;
   font-weight: 700;
 }
+/* 진행 상태 바로 아래 한 줄 — 예상 범위·시도 횟수처럼 '안심/경고'에 쓰는 설명.
+   placeholder 와 붙여 한 덩어리로 읽히게 한다. */
+.rv-progress-hint { margin: 6px 2px 0; line-height: 1.6; }
+
 .review-detail-actions { display: flex; gap: 8px; margin-top: 18px; }
 
 /* ---- P2: 실패 안내 ---- */

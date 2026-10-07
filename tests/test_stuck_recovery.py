@@ -242,7 +242,8 @@ def test_detail_page_of_a_live_generation_still_just_waits(client, make_review,
     review = make_review(status="pending")
     app_module._generating_reviews.add(review.id)
     html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
-    assert "블로그 초안을 쓰고 있어요" in html
+    # 말투가 반말체로 통일됐다(앱 전체와 같은 말투) — 뜻은 그대로다.
+    assert "블로그 초안을 쓰고 있어" in html
     assert "중단된 것 같아" not in html
     assert spawned["review"] == []
 
