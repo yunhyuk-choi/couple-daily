@@ -643,6 +643,13 @@ body.lb-open { overflow: hidden; }
   border-radius: 12px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
+/* 원본이 오기 전 '즉시 보이는' 자리 — 이미 받아 둔 썸네일을 흐리게 깔아 둔다
+   (Next.js 의 blur placeholder 와 같은 수법). 레이아웃은 그대로라 시프트가 없고,
+   원본이 도착하면 그대로 바뀐다 — 최종 픽셀은 변하지 않는다. */
+.lb-img.lb-placeholder {
+  filter: blur(8px);
+  transform: scale(1.02); /* blur 가장자리 비침 방지 */
+}
 .lb-meta {
   width: 100%;
   max-width: 560px;
