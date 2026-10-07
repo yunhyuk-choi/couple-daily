@@ -210,6 +210,30 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {get_access_token()}"}
 
 
+def _json_body(r, what):
+    """``r.json()`` 을 **절대 raw 예외로 새지 않게** 읽는다 — 실패는 OneDriveError.
+
+    ⛔ 2026-10-07 운영 500 의 정체가 이것이었다. Graph 가 200 으로 **JSON 이 아닌 것**
+    (에러 페이지·빈 본문·잘린 JSON)을 돌려주면 ``requests`` 가
+    ``JSONDecodeError`` 를 던진다. 그건 ``OneDriveError`` 가 아니라서 호출부의
+    ``except onedrive.OneDriveError`` 폴백에 **안 걸리고** 그대로 500 이 됐다
+    (``/blog-img`` 본문 이미지가 전부 엑박 — 설계돼 있던 원본 폴백에 영영 못 닿았다).
+
+    이 모듈 밖으로 나가는 실패는 **언제나 OneDriveError 하나**여야 한다. 그래야
+    호출부가 "그럼 다른 길로"를 할 수 있다. 응답 앞머리를 로그에 남겨 다음 사람이
+    'Graph 가 뭘 줬는지'를 추측하지 않게 한다(민감값 없음 — 에러 본문이다).
+    """
+    try:
+        return r.json() or {}
+    except Exception as e:  # noqa: BLE001 — JSONDecodeError/ValueError 등 전부
+        head = (r.text or "")[:200].replace("\n", " ")
+        ctype = r.headers.get("Content-Type") if r.headers else None
+        raise OneDriveError(
+            f"{what}: non-JSON response (status={r.status_code} "
+            f"ctype={ctype} head={head!r})"
+        ) from e
+
+
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -525,7 +549,7 @@ def get_item_meta(item_id: str, refresh: bool = False):
         return None
     if r.status_code != 200:
         raise OneDriveError(f"item meta fetch failed (status={r.status_code})")
-    body = r.json() or {}
+    body = _json_body(r, "item meta")
     image = body.get("image") or {}
     photo = body.get("photo") or {}
     file_facet = body.get("file") or {}
@@ -564,12 +588,46 @@ def rendition_name(long_edge) -> str:
     return f"c{n}x{n}"
 
 
+# Graph 가 **이름으로** 내주는 기본 렌디션 — 큰 것부터. 커스텀 ``c{W}x{H}`` 를
+# 받지 않는 드라이브에서 내려갈 사다리의 두 번째 칸이다(세 번째 칸은 원본).
+_NAMED_RENDITIONS = ("large", "medium", "small")
+
+# 이 드라이브가 커스텀 스펙을 받아 주나 — None=아직 모름 / True / False.
+# ⛔ 왜 기억하나: 안 받는 드라이브에서는 **매 요청마다** 똑같이 실패하고 Graph 왕복
+# 비용만 치른다(실측: 개인 OneDrive 가 ``c1707x1707`` 에 JSON 아닌 응답을 줬다).
+# 한 번 알아내면 그 뒤로는 바로 named 로 간다. 프로세스 재시작이면 다시 모르는
+# 상태로 돌아가는데, 그게 맞다 — 드라이브·서비스가 바뀌었을 수 있다.
+_custom_renditions_ok = None
+_CUSTOM_RENDITION_ENV = (os.environ.get("ONEDRIVE_CUSTOM_RENDITIONS") or "").strip()
+
+
+def custom_renditions_supported():
+    """지금까지 관찰한 '이 드라이브가 커스텀 렌디션을 받나' (모르면 None)."""
+    if _CUSTOM_RENDITION_ENV in ("0", "off", "false", "no"):
+        return False
+    if _CUSTOM_RENDITION_ENV in ("1", "on", "true", "yes"):
+        return True
+    return _custom_renditions_ok
+
+
+def _note_custom_rendition(ok):
+    global _custom_renditions_ok
+    if _custom_renditions_ok is ok:
+        return
+    _custom_renditions_ok = ok
+    log.info("OneDrive 커스텀 렌디션 지원 = %s (관찰값)", ok)
+
+
 def get_rendition_meta(item_id: str, spec: str):
     """렌디션 **메타데이터**(가로·세로·URL) — 바이트는 아직 안 받는다.
 
     ``{"width":…, "height":…, "url":…}`` 또는 지원 안 함/없음이면 ``None``.
     이 단계에서 크기를 먼저 알 수 있어, **원하는 해상도가 아니면 바이트를
     아예 안 받고** 다음 후보로 넘어갈 수 있다.
+
+    ⛔ 실패는 **언제나 OneDriveError** 다. 예전엔 ``r.json()`` 이 그대로 터져
+    ``JSONDecodeError`` 가 모듈 밖으로 샜고, 호출부의 폴백이 그걸 못 잡아 운영에서
+    ``/blog-img`` 가 500 을 냈다(``_json_body`` 머리말).
     """
     try:
         r = requests.get(
@@ -584,13 +642,35 @@ def get_rendition_meta(item_id: str, spec: str):
         return None
     if r.status_code != 200:
         raise OneDriveError(f"rendition meta failed (status={r.status_code})")
-    body = r.json() or {}
+    body = _json_body(r, f"rendition meta ({spec})")
     url = body.get("url")
-    w = int(body.get("width") or 0)
-    h = int(body.get("height") or 0)
+    try:
+        w = int(body.get("width") or 0)
+        h = int(body.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
     if not url or w <= 0 or h <= 0:
         return None
     return {"width": w, "height": h, "url": url}
+
+
+def _rendition_meta_or_none(item_id, spec, custom):
+    """``get_rendition_meta`` 를 **절대 raise 하지 않게** 감싼다.
+
+    커스텀 스펙에서 실패하면 "이 드라이브는 커스텀을 안 받는다"로 기억해 다음
+    요청부터 바로 named 사다리로 내려간다. 성공하면 반대로 기억한다.
+    """
+    try:
+        meta = get_rendition_meta(item_id, spec)
+    except Exception:  # noqa: BLE001 — 렌디션은 최적화지 전제가 아니다
+        log.warning("렌디션 메타 조회 실패 (item=%s spec=%s)", item_id, spec,
+                    exc_info=True)
+        if custom:
+            _note_custom_rendition(False)
+        return None
+    if custom:
+        _note_custom_rendition(meta is not None)
+    return meta
 
 
 def get_rendition(item_id: str, long_edge, min_long_edge=None,
@@ -610,19 +690,13 @@ def get_rendition(item_id: str, long_edge, min_long_edge=None,
         한도는 추측하지 않고 *돌아온 값으로* 안다. 모자라면 ``None`` 을
         돌려주고, 호출부가 더 큰 후보나 원본으로 간다.
 
-    못 쓰면 ``None``(예외 아님 — 폴백이 정상 경로다).
-    """
-    spec = rendition_name(long_edge)
-    try:
-        meta = get_rendition_meta(item_id, spec)
-    except OneDriveError:
-        log.warning("렌디션 메타 조회 실패 (item=%s spec=%s)", item_id, spec,
-                    exc_info=True)
-        return None
-    if not meta:
-        return None
-    w, h = meta["width"], meta["height"]
+    못 쓰면 ``None``(예외 아님 — 폴백이 정상 경로다). **그 약속을 이제 정말 지킨다** —
+    예전엔 바이트 받기가 ``OneDriveError`` 를 던졌고, 메타 파싱은 raw
+    ``JSONDecodeError`` 까지 흘렸다(운영 500 의 원인).
 
+    **사다리**: 커스텀 ``c{N}x{N}`` → named(large/medium/small) → ``None``(호출부가
+    원본으로). 커스텀을 안 받는 드라이브로 판명되면 그 뒤로는 바로 named 부터 본다.
+    """
     want = expect_aspect
     if want is None:
         try:
@@ -639,27 +713,43 @@ def get_rendition(item_id: str, long_edge, min_long_edge=None,
     elif not isinstance(want, tuple):
         want = (float(want), 1.0 / float(want))
 
-    if want:
-        got = w / h
-        if not any(abs(got / cand - 1.0) <= _RENDITION_ASPECT_TOL
-                   for cand in want if cand):
-            log.warning(
-                "렌디션 비율이 원본과 다르다 — 쓰지 않는다 "
-                "(item=%s spec=%s got=%sx%s)", item_id, spec, w, h,
-            )
+    specs = []
+    if custom_renditions_supported() is not False:
+        specs.append((rendition_name(long_edge), True))
+    specs.extend((name, False) for name in _NAMED_RENDITIONS)
+
+    for spec, custom in specs:
+        meta = _rendition_meta_or_none(item_id, spec, custom)
+        if not meta:
+            continue
+        w, h = meta["width"], meta["height"]
+        if want:
+            got = w / h if h else 0
+            if not got or not any(abs(got / cand - 1.0) <= _RENDITION_ASPECT_TOL
+                                  for cand in want if cand):
+                log.warning(
+                    "렌디션 비율이 원본과 다르다 — 쓰지 않는다 "
+                    "(item=%s spec=%s got=%sx%s)", item_id, spec, w, h,
+                )
+                continue
+        if min_long_edge and max(w, h) < int(min_long_edge):
+            # 요구 해상도에 못 미친다. named 는 이것보다 **더 작으므로** 더 볼 게
+            # 없다 — 괜히 Graph 를 세 번 더 왕복하지 않고 바로 원본으로 넘긴다.
             return None
-
-    if min_long_edge and max(w, h) < int(min_long_edge):
-        return None
-
-    try:
-        # 렌디션 URL 은 이미 인증된 CDN 링크다 — Bearer 를 붙이지 않는다.
-        ir = requests.get(meta["url"], timeout=HTTP_TIMEOUT)
-    except requests.RequestException as e:
-        raise OneDriveError(f"rendition fetch failed: {e}") from e
-    if ir.status_code != 200:
-        raise OneDriveError(f"rendition fetch failed (status={ir.status_code})")
-    return ir.content, (ir.headers.get("Content-Type") or "image/jpeg"), (w, h)
+        try:
+            # 렌디션 URL 은 이미 인증된 CDN 링크다 — Bearer 를 붙이지 않는다.
+            ir = requests.get(meta["url"], timeout=HTTP_TIMEOUT)
+            if ir.status_code != 200:
+                raise OneDriveError(
+                    f"rendition fetch failed (status={ir.status_code})"
+                )
+            return (ir.content,
+                    (ir.headers.get("Content-Type") or "image/jpeg"), (w, h))
+        except Exception:  # noqa: BLE001 — 바이트를 못 받으면 다음 후보/원본으로
+            log.warning("렌디션 바이트 수신 실패 (item=%s spec=%s)", item_id, spec,
+                        exc_info=True)
+            continue
+    return None
 
 
 def probe_renditions(item_id: str, long_edges=None):
@@ -677,7 +767,12 @@ def probe_renditions(item_id: str, long_edges=None):
     """
     edges = list(long_edges or (800, 1280, 1600, 1920, 2048, 2560,
                                 3200, 4096, 8192, 16384))
-    meta = get_item_meta(item_id, refresh=True)
+    try:
+        meta = get_item_meta(item_id, refresh=True)
+    except OneDriveError as err:
+        # 원본 메타를 못 얻어도 **렌디션 표는 뽑는다** — 이 도구의 요점은 한도다.
+        log.warning("probe: 원본 메타 조회 실패 — 비율 판정 없이 진행 (%s)", err)
+        meta = None
     out = {
         "original": {
             "width": (meta or {}).get("width"),
