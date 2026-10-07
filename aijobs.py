@@ -303,6 +303,33 @@ def claim_next():
         return None
 
 
+def cancel(job_key):
+    """사람이 멈춘 일거리를 줄에서 **치운다**(치웠으면 True).
+
+    ``finish`` 와 다른 점은 '누가·언제'다 — 저건 다 끝난 뒤 **돌고 있는 쪽**이
+    부르고, 이건 **밖에서**(중단 라우트) 부른다. 아직 ``queued`` 든 지금
+    ``running`` 이든 같은 한 줄을 지운다:
+
+      * queued  — 아직 아무도 안 집었으니 지우면 그걸로 끝이다.
+      * running — 일하던 쪽은 ``ai.Cancelled`` 로 접히고, 그 뒤 ``finish(job_id)``
+        가 돌아도 이미 없는 행이라 no-op 이다(두 번 지워도 안전하다).
+
+    절대 raise 하지 않는다 — 중단이 페이지를 깨뜨리면 본말전도다.
+    """
+    try:
+        deleted = (
+            db.session.query(AiJob)
+            .filter(AiJob.job_key == job_key)
+            .delete(synchronize_session=False)
+        )
+        db.session.commit()
+        return bool(deleted)
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        log.exception("ai job: 중단 삭제 실패 (%s)", job_key)
+        return False
+
+
 def finish(job_id):
     """끝난 일거리를 **지운다**(완료 기록은 각 기능의 자기 테이블에 남는다)."""
     try:

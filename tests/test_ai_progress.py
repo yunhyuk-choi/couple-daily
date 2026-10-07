@@ -319,8 +319,11 @@ def test_3_a_long_but_normal_run_says_the_expected_range(flask_app, make_review,
     assert v["state"] == "running_long"
     assert "아직 정상 범위야" in v["headline"] and "9분째" in v["headline"]
     assert "추정이야" in v["hint"], "예상 범위를 '추정'이라고 밝히지 않았다"
-    assert "25분을 넘기면" in v["hint"]
+    # 예상 범위를 말하되 **끊지 않는다**고 함께 말한다 — 기다리는 사람이 가장
+    # 궁금한 건 '언제 내가 잘리나'가 아니라 '안 잘린다'는 사실이다.
+    assert "내가 끊지는 않아" in v["hint"]
     assert v["retry"] is False, "정상 범위인데 탈출구부터 들이민다"
+    assert v["can_stop"] is True, "정상 범위여도 멈출 길은 늘 있어야 한다"
 
 
 def test_4_overdue_says_it_is_abnormal_and_offers_the_escape_hatch(
@@ -330,8 +333,13 @@ def test_4_overdue_says_it_is_abnormal_and_offers_the_escape_hatch(
                started_at=datetime.utcnow() - timedelta(minutes=40))
     v = _view(flask_app, review)
     assert v["state"] == "overdue"
-    assert "상한을 넘겼어" in v["headline"]
+    # ⚠️ '상한을 넘겼어'는 이제 거짓이다 — 25분은 **끊는 상한이 아니라 경고 기준**
+    # 이고, 그 순간에도 claude 는 돌고 있을 수 있다(경과 시간 상한을 걷어낸 뒤의
+    # 계약). 사실만 말하고, 기다릴지 멈출지는 사람이 고른다.
+    assert "오래 걸려" in v["headline"]
+    assert "끊지는 않았어" in v["headline"]
     assert v["retry"] is True
+    assert v["can_stop"] is True, "경고만 하고 멈출 길을 안 줬다"
 
 
 def test_4b_piled_up_attempts_are_said_out_loud(flask_app, make_review,

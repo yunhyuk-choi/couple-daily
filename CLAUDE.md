@@ -408,9 +408,30 @@ import 만 하자(HTTP 요청 0회) 0.3초 만에 되살려 처리했다. 그러
   임시 이미지를 열어 크롭 좌표를 받아 냈다.
 * 세션이 **못 열리거나 중간에 깨지면 그 호출부터 자동으로 one-shot** 이다 — 초안은
   반드시 나온다('degrade 하되 raise 하지 않는다').
-* 끄는 법: `CLAUDE_SESSION=0`. 수명 백스톱: `CLAUDE_SESSION_MAX_SEC`(1800) /
-  `CLAUDE_SESSION_IDLE_SEC`(600). 종료는 **프로세스 그룹째**(좀비 방지),
-  Windows 에서는 `CREATE_NO_WINDOW`(콘솔 창 금지).
+* 끄는 법: `CLAUDE_SESSION=0`. 백스톱은 **침묵 하나뿐**:
+  `CLAUDE_SESSION_IDLE_SEC`(600) 동안 stream-json 이벤트가 **하나도** 없으면 고장으로
+  보고 거둔다(수명 상한 `CLAUDE_SESSION_MAX_SEC` 는 없앴다 — 경과 시간 상한이었다).
+  종료는 **프로세스 그룹째**(좀비 방지), Windows 에서는 `CREATE_NO_WINDOW`.
+
+### ⛔ 느리다고 죽이지 않는다 (경과 시간 상한 없음)
+
+백그라운드 claude 콜에는 **경과 시간 상한이 없다.** 예전 `CLAUDE_TIMEOUT`(120s)은
+본문 생성 실측(**73.7초** — 로컬, Render 는 0.1 CPU 라 더 느리다)을 자주 넘겨
+**일하고 있는 claude 를 우리가 끊었고**, 그 결과가 후기 `failed` 였다. 대신 둘:
+
+1. **사람의 명시적 중단** — 진행 화면 `✋ 그만할래` → `POST /reviews/<id>/cancel`.
+   ① `ai.request_cancel` 이 등록된 claude 프로세스를 **그룹째** 죽이고
+   ② `aijobs.cancel` 이 큐 행을 치우고 ③ 인프로세스 가드를 풀고
+   ④ 상태를 `cancelled` 로 (이미 초안이 떴으면 `ready` 그대로 — 글은 안 버린다).
+2. **침묵 감지** — '오래 걸림'(이벤트가 흐른다)과 '아무 소식 없음'을 **구분**한다.
+   그래서 one-shot 도 `--output-format stream-json` 으로 받는다 — 기본 텍스트 출력은
+   다 끝난 뒤 한 번에 나와서 '살아 있나'를 물어볼 창구가 없다.
+
+상한이 **남아 있는 두 곳**(성질이 다르다): 요청 경로의 '오늘의 질문'
+(`ai.CLAUDE_TIMEOUT`, gunicorn `--timeout 180` 응답 예산 — 못 맞추면 폴백 질문으로
+즉시 응답)과 팝업 수집(`ai.POPUP_TIMEOUT`, 외부 웹에 물리고 실패해도 잃는 산출물이
+없다). `ai.CAPTION_EST_SEC` 는 상한이 아니라 **화면이 쓰는 추정치**다.
+`_STUCK_REVIEW`(25분) 역시 **경고용 기준**이고 아무것도 끊지 않는다.
 
 ## 아키텍처
 

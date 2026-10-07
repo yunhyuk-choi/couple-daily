@@ -1191,6 +1191,9 @@ class BlogReview(db.Model):
       * 'pending' — (P2) 백그라운드 생성 대기/진행 중.
       * 'ready'   — (P2) ai_json 채워짐(미리보기 렌더 가능).
       * 'failed'  — (P2) 생성 실패.
+      * 'cancelled' — (P2) **사람이 '✋ 그만할래'로 멈췄다.** 'failed' 와 일부러
+        구분한다 — 실패는 한 번 자동 재시도하지만(``resume_review_if_failed``)
+        중단은 사람의 뜻이라 아무도 혼자 되살리지 않는다. 다시 만들려면 ↻ 다.
     """
     __tablename__ = "blog_reviews"
 

@@ -62,13 +62,13 @@ def spawned(monkeypatch):
 def test_review_threshold_is_longer_than_the_monthly_one():
     """후기 생성은 claude 콜이 여러 번이라 월간 회고의 5분을 그대로 쓰면 안 된다.
 
-    실측 정상치 ~170초 + 사진마다 비전 크롭(ai.CAPTION_TIMEOUT=180s)이 붙는다 —
-    사진 5장이면 21분까지 '정상'이다. 상한이 그보다 짧으면 정상 생성을 stale 로
-    오인한다.
+    실측 정상치 ~170초 + 사진마다 비전 크롭(ai.CAPTION_EST_SEC=180s **추정**)이
+    붙는다 — 사진 5장이면 21분까지 '정상'이다. 기준이 그보다 짧으면 정상 생성을
+    stale 로 오인한다. (이 기준은 **경고용**이고 아무것도 끊지 않는다.)
     """
     import ai
 
-    worst = (3 * ai.CLAUDE_TIMEOUT) + (5 * ai.CAPTION_TIMEOUT)  # 초
+    worst = (3 * ai.CLAUDE_TIMEOUT) + (5 * ai.CAPTION_EST_SEC)  # 초
     assert app_module._STUCK_REVIEW > app_module._STUCK_GENERATING
     assert app_module._STUCK_REVIEW >= timedelta(seconds=worst), (
         "후기 상한이 '사진 5장짜리 최악의 정상 생성'보다 짧다 — 정상 생성을 "
@@ -250,12 +250,20 @@ def test_detail_page_of_a_live_generation_still_just_waits(client, make_review,
 
 def test_detail_page_of_a_hung_generation_offers_the_escape_hatch(
         client, make_review, spawned):
+    """오래 끄는 생성 화면은 **단정하지 않고** 두 탈출구를 준다.
+
+    ⚠️ 예전엔 "중단된 것 같아" 라고 단정했는데, 시간 상한을 걷어낸 뒤로 그건 거짓일
+    수 있다 — 25분은 '끊는 상한'이 아니라 '오래 걸린다고 말해 주는 기준'이고, 그
+    순간에도 claude 는 돌고 있을 수 있다. 그래서 사실만 말하고 ↻ 와 ✋ 를 준다.
+    """
     review = make_review(status="pending")
     app_module._generating_reviews.add(review.id)
     _age(review, 60)
     html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
-    assert "중단된 것 같아" in html
+    assert "중단된 것 같아" not in html, "아직 돌고 있을 수 있는데 죽었다고 단정했다"
+    assert "오래 걸려" in html
     assert f"/reviews/{review.id}/regenerate" in html
+    assert f"/reviews/{review.id}/cancel" in html, "멈출 길이 화면에 없다"
     assert spawned["review"] == [], "hung 생성에 두 번째 claude 를 붙이지 않는다"
 
 

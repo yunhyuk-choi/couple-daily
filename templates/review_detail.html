@@ -200,9 +200,16 @@
 {# 초안은 떴지만 **사진 크롭이 아직 돈다** — 파이프라인이 본문을 크롭 전에 먼저
    커밋하기 때문이다(거기서 죽어도 쓸 수 있는 초안이 남게). 가장 긴 구간이 여기라,
    조용히 한 줄로 알려 주고 끝나면 폴링이 화면을 한 번 더 그린다. #}
-<p id="rv-progress" class="muted small rv-progress-hint"
-   data-url="{{ url_for('review_progress', rid=review.id) }}"
-   data-rv="headline">{{ progress.headline }}</p>
+<div id="rv-progress" data-url="{{ url_for('review_progress', rid=review.id) }}">
+  <p class="muted small rv-progress-hint" data-rv="headline">{{ progress.headline }}</p>
+  {# 여기(사진 크롭)가 파이프라인에서 가장 긴 구간이다 — 초안은 이미 손에 있으니
+     "이쯤에서 됐다" 가 충분히 합리적인 선택이다. 멈춰도 초안은 그대로 남는다. #}
+  <div data-rv="stop"{% if not progress.can_stop %} hidden{% endif %}>
+    <form method="post" action="{{ url_for('review_cancel', rid=review.id) }}">
+      <button type="submit" class="btn ghost sm">✋ 여기까지만</button>
+    </form>
+  </div>
+</div>
 {% endif %}
 {% if review.status == 'pending' %}
 <div id="rv-progress" data-url="{{ url_for('review_progress', rid=review.id) }}">
@@ -218,11 +225,31 @@
       <button type="submit" class="btn primary sm">↻ 다시 생성</button>
     </form>
   </div>
+  {# ✋ **명시적 중단** — 시간 상한을 걷어낸 자리에 들어온 사람의 손.
+     예전엔 120초가 지나면 서버가 알아서 claude 를 끊었는데, 그게 **일하고 있는**
+     claude 를 끊어 후기를 실패로 만들었다. 이제 안 끊는다 — 대신 기다릴지 말지를
+     여기서 사람이 고른다. 오래 걸릴 때만 뜨면 그땐 이미 늦어서, 기다리는 동안
+     **계속** 보인다. #}
+  <div data-rv="stop"{% if not progress.can_stop %} hidden{% endif %}
+       style="margin-top:8px;">
+    <form method="post" action="{{ url_for('review_cancel', rid=review.id) }}">
+      <button type="submit" class="btn ghost sm">✋ 그만할래</button>
+    </form>
+  </div>
 </div>
 
 {% elif review.status == 'failed' %}
 <div class="review-failed">
   <p>초안 생성이 잘 안 됐어. 잠시 뒤 다시 시도해줘 🙏</p>
+  <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
+    <button type="submit" class="btn primary sm">↻ 다시 생성</button>
+  </form>
+</div>
+
+{% elif review.status == 'cancelled' %}
+{# 사람이 멈춘 자리 — '실패'와 다른 말로 말한다(우리가 끊은 게 아니다). #}
+<div class="review-failed">
+  <p>✋ 여기서 멈췄어. 다시 만들고 싶으면 눌러줘.</p>
   <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}">
     <button type="submit" class="btn primary sm">↻ 다시 생성</button>
   </form>
@@ -1022,6 +1049,9 @@
     var t = el('hint');
     if (t) { t.textContent = d.hint || ''; t.hidden = !d.hint; }
     var r = el('retry'); if (r) r.hidden = !d.retry;
+    // ✋ 중단 버튼 — 기다리는 동안은 계속 보여야 한다(끝나면 폴링이 화면을
+    // 새로 그리므로 여기서 숨길 일은 거의 없다).
+    var s = el('stop'); if (s) s.hidden = !d.can_stop;
   }
 
   function schedule() {
