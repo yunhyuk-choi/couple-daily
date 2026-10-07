@@ -33,6 +33,9 @@
           <span class="chip small">완료</span>
         {% elif r.status == 'failed' %}
           <span class="chip small">실패</span>
+        {% elif r.status == 'cancelled' %}
+          {# 사람이 ✋ 로 멈춘 것 — '실패'와 다른 말로 말한다. #}
+          <span class="chip small">멈춤</span>
         {% endif %}
       </div>
     </a>

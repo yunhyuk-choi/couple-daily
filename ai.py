@@ -25,11 +25,38 @@ import time
 
 log = logging.getLogger(__name__)
 
-CLAUDE_TIMEOUT = 120  # seconds; `claude -p` is an agent and can be slow
-# Vision (reading an image off disk) is markedly slower than a text prompt on
-# the 0.1-CPU free tier — give it generous headroom so it isn't killed mid-read.
-CAPTION_TIMEOUT = 180
-# 팝업 수집은 웹 검색(WebSearch/WebFetch)을 돌리므로 훨씬 느리다(~120s+).
+# --------------------------------------------------------------------------- #
+# ⛔ **느리다고 죽이지 않는다** — 경과 시간 상한을 걷어낸 이유
+# --------------------------------------------------------------------------- #
+# 예전엔 모든 claude 콜에 ``CLAUDE_TIMEOUT``(120s)가 걸려 있었다. 그런데 본문 생성
+# 한 콜을 실제로 재니 **73.7초**였다(사진 11장·자유서술·상세 7칸, 로컬 실측).
+# Render 는 0.1 CPU 라 그보다 느리다 — 즉 **우리가 일하고 있는 claude 를 120초에
+# 끊고 있었다.** 끊으면 ``ask()`` 가 프로세스를 죽이고 one-shot 으로 한 번 더(또
+# 120초) 돌린 뒤 ``failed`` 로 끝났다. 느려서 끊고, 끊어서 더 느려지고, 결국 글이
+# 안 나왔다.
+#
+# 그래서 **백그라운드 claude 콜에는 경과 시간 상한을 걸지 않는다.** 대신 둘을 세운다:
+#
+#   1. **사람의 명시적 중단** — 진행 화면의 '✋ 그만할래'. 누르면 지금 돌고 있는
+#      claude 프로세스를 실제로 죽이고 큐 행을 치운다(``request_cancel``).
+#   2. **침묵 감지** — '오래 걸림'과 '아무 소식 없음'은 다르다. stream-json 은 턴이
+#      도는 동안 이벤트가 계속 흐르므로, **이벤트가 하나도 없는 침묵**은 느린 게
+#      아니라 고장이다. 상한은 경과가 아니라 **침묵**에 건다(``SESSION_IDLE_SEC``).
+#
+# 아래 상수 중 '상한'은 ``CLAUDE_TIMEOUT``·``POPUP_TIMEOUT`` 둘뿐이고, 둘 다
+# **성질이 다른 자리**에만 쓴다.
+
+# 요청 경로(= 사람이 HTTP 응답을 기다리는 '오늘의 질문') **전용** 하드 상한.
+# 여기만 성질이 다르다 — gunicorn ``--timeout 180`` 이 워커를 통째로 죽이므로 이
+# 예산은 '살았나 죽었나' 판정이 아니라 **응답 예산**이다. 못 맞추면 폴백 질문으로
+# 즉시 응답하고 백그라운드가 같은 행을 올려준다(기능이 깎이지 않는다).
+CLAUDE_TIMEOUT = 120
+# 비전 콜 한 번의 **추정 소요**(상한이 아니다). 화면이 "느릴 땐 N분까지도 정상이야"
+# 라고 말할 때 쓰는 숫자일 뿐, 이 시간이 지나도 아무것도 끊지 않는다.
+CAPTION_EST_SEC = 180
+# 팝업 수집(events.py)은 웹 검색을 돌려 훨씬 느리다. 여기는 **상한을 남겨 둔다** —
+# 외부 웹에 물려 늘어지는 성질이고, 실패해도 '팝업 없음'으로 degrade 할 뿐 사람이
+# 기다리던 산출물을 잃지 않는다(본문 생성과 성질이 다르다).
 POPUP_TIMEOUT = 300
 
 # Gentle fallbacks used only if the CLI is unavailable / errors out.
@@ -132,8 +159,17 @@ def _claude_argv(allow_web: bool = False) -> list:
 SESSION_ENABLED = (os.environ.get("CLAUDE_SESSION") or "1").strip().lower() not in (
     "0", "false", "no", "off"
 )
-# 세션 수명 백스톱 — 행·누수 안전망(jira-auto-dispatcher 의 agent_runner 와 같은 사상).
-SESSION_MAX_SEC = int(os.environ.get("CLAUDE_SESSION_MAX_SEC", "1800"))
+# **침묵 상한** — 이 시간 동안 stream-json 이벤트가 **하나도** 없으면 고장으로 본다.
+#
+# ⚠️ 경과 시간이 아니라 **침묵 시간**이다. 턴이 도는 동안에는 assistant·tool·
+# rate_limit 이벤트가 줄줄이 흐르므로(실호출로 확인), 10분 동안 단 한 줄도 안 오면
+# 그건 '느린 것'이 아니라 '죽은 것'이다. 73.7초짜리 정상 콜은 물론, 그보다 10배
+# 느린 콜도 이벤트만 흐르면 끊기지 않는다.
+#
+# (예전에 있던 ``SESSION_MAX_SEC``(30분 수명 상한)은 **없앴다** — 그것도 경과 시간
+# 상한이라, 긴 파이프라인의 뒤쪽 콜을 전부 one-shot 으로 떨어뜨렸다. 세션은
+# ``claude_session()`` 블록이 finally 에서 반드시 거두므로 누수 백스톱이 따로
+# 필요하지 않다.)
 SESSION_IDLE_SEC = int(os.environ.get("CLAUDE_SESSION_IDLE_SEC", "600"))
 TERMINATE_GRACE_SEC = 5
 
@@ -166,6 +202,141 @@ class SessionError(RuntimeError):
     """지속 세션이 쓸 수 없는 상태 — 호출부는 one-shot 으로 되돌아간다."""
 
 
+class Cancelled(RuntimeError):
+    """**사람이 명시적으로 중단했다.**
+
+    ``SessionError`` 와 결정적으로 다르다 — 저건 "이 길이 막혔으니 다른 길로"지만
+    이건 "그만하라"다. 그래서 호출부는 one-shot 으로 **되돌아가지 않는다**(되돌아가면
+    중단 버튼을 눌렀는데 claude 가 한 번 더 뜬다).
+    """
+
+
+# --------------------------------------------------------------------------- #
+# 명시적 중단 — 시간 상한을 걷어낸 자리에 세우는 **사람의 손**
+# --------------------------------------------------------------------------- #
+# 느리다고 죽이지 않기로 했으면, 대신 **사람이 멈출 수 있어야** 한다. 그러려면 "지금
+# 돌고 있는 claude 프로세스가 누구 것인가"를 알아야 하므로, 작업 단위에 **키**를
+# 붙이고(``cancel_scope("review:12")``) 그 스코프 안에서 뜬 프로세스를 등록해 둔다.
+# 중단 요청은 ① 플래그를 세우고 ② 등록된 프로세스를 **실제로 죽인다.**
+#
+# 키는 큐 행의 ``job_key`` 와 같은 문자열을 쓴다 — 화면·큐·여기가 같은 이름으로 같은
+# 일을 가리켜야 '중단'이 세 군데에서 같은 뜻이 된다.
+_cancel_lock = threading.Lock()
+_cancel_keys = set()      # 중단 요청이 걸린 작업 키
+_cancel_procs = {}        # 작업 키 -> 지금 그 작업이 띄워 둔 claude 프로세스들
+_scope_tls = threading.local()
+
+
+def current_scope():
+    """이 스레드가 지금 어떤 작업 키로 claude 를 부르고 있나(없으면 None)."""
+    return getattr(_scope_tls, "key", None)
+
+
+def enter_cancel_scope(key):
+    """이 스레드의 claude 호출을 ``key`` 라는 중단 단위로 묶는다(이전 키 반환).
+
+    컨텍스트 매니저를 못 쓰는 자리(이미 긴 try 블록 안)에서 쓰라고 따로 열어 둔다.
+    짝은 반드시 ``exit_cancel_scope`` 이며 ``finally`` 에 둔다.
+    """
+    prev = getattr(_scope_tls, "key", None)
+    _scope_tls.key = key
+    return prev
+
+
+def exit_cancel_scope(key, prev=None):
+    """스코프를 닫고 그 키의 흔적(플래그·프로세스 등록)을 지운다.
+
+    지우는 이유 — 다음 생성이 지난 중단 요청을 물려받으면 ↻ 를 눌러도 즉시 접힌다.
+    """
+    _scope_tls.key = prev
+    with _cancel_lock:
+        _cancel_keys.discard(key)
+        _cancel_procs.pop(key, None)
+
+
+@contextlib.contextmanager
+def cancel_scope(key):
+    """이 블록 안의 claude 호출을 ``key`` 라는 중단 단위로 묶는다."""
+    prev = enter_cancel_scope(key)
+    try:
+        yield key
+    finally:
+        exit_cancel_scope(key, prev)
+
+
+def is_cancelled(key=None):
+    """그 작업에 중단이 걸렸나(키를 안 주면 이 스레드의 스코프)."""
+    key = key or current_scope()
+    if key is None:
+        return False
+    with _cancel_lock:
+        return key in _cancel_keys
+
+
+def clear_cancel(key):
+    """중단 표시를 지운다 — 같은 대상을 다시 돌릴 때 호출부가 부른다."""
+    with _cancel_lock:
+        _cancel_keys.discard(key)
+
+
+def request_cancel(key):
+    """**중단한다** — 플래그를 세우고 지금 돌고 있는 claude 를 죽인다(죽인 수 반환).
+
+    프로세스가 죽으면 읽기 루프가 EOF 로 끝나고 ``ask``/one-shot 이 ``Cancelled`` 를
+    올린다. 아직 claude 가 안 떠 있어도(큐에서 대기 중) 플래그는 남으므로, 그 작업이
+    다음 claude 를 부르려는 순간 바로 접힌다.
+    """
+    with _cancel_lock:
+        _cancel_keys.add(key)
+        procs = list(_cancel_procs.get(key) or ())
+    killed = 0
+    for proc in procs:
+        if _kill_proc(proc):
+            killed += 1
+    return killed
+
+
+def _raise_if_cancelled():
+    if is_cancelled():
+        raise Cancelled("사람이 중단을 눌렀다")
+
+
+def _register_proc(proc):
+    key = current_scope()
+    if key is None or proc is None:
+        return
+    with _cancel_lock:
+        _cancel_procs.setdefault(key, set()).add(proc)
+
+
+def _unregister_proc(proc):
+    if proc is None:
+        return
+    with _cancel_lock:
+        for procs in _cancel_procs.values():
+            procs.discard(proc)
+
+
+def _kill_proc(proc):
+    """프로세스를 **그룹째** 거둔다(죽였으면 True). 절대 raise 하지 않는다."""
+    if proc is None or proc.poll() is not None:
+        return False
+    pgid = None
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:  # noqa: BLE001
+            pgid = None
+    for killer in (_kill_group, _kill_one):
+        try:
+            killer(proc, pgid)
+            proc.wait(timeout=TERMINATE_GRACE_SEC)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return proc.poll() is not None
+
+
 class ClaudeSession:
     """``claude -p`` 프로세스 **하나**에 여러 턴을 밀어 넣는 살아 있는 세션.
 
@@ -173,9 +344,8 @@ class ClaudeSession:
     ``_run_claude`` 가 자동으로 이 세션을 탄다(호출부 13곳을 고치지 않는다).
     """
 
-    def __init__(self, allow_web=False, max_sec=None, idle_sec=None):
+    def __init__(self, allow_web=False, idle_sec=None):
         self.allow_web = bool(allow_web)
-        self.max_sec = max_sec if max_sec is not None else SESSION_MAX_SEC
         self.idle_sec = idle_sec if idle_sec is not None else SESSION_IDLE_SEC
         self.proc = None
         self.session_id = None
@@ -222,6 +392,8 @@ class ClaudeSession:
         except Exception as e:  # noqa: BLE001
             raise SessionError(f"claude session spawn failed: {e}") from e
         self.started_at = self.last_event_at = time.time()
+        # 사람이 '✋ 그만할래' 를 누르면 **이 프로세스**가 죽어야 한다.
+        _register_proc(self.proc)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         return self
@@ -249,25 +421,42 @@ class ClaudeSession:
                 self._cv.notify_all()
 
     def healthy(self):
+        """살아 있나 — **침묵으로만** 판정한다(얼마나 오래 돌았는지는 안 본다).
+
+        ⛔ 경과 시간 상한이 없다. 한 파이프라인이 30분을 넘겨도 이벤트가 흐르는
+        한 같은 세션을 계속 쓴다 — 오래 걸린다고 세션을 버리면 남은 콜이 전부
+        one-shot 이 되어 **느려서 버렸는데 더 느려진다.**
+        """
         if self.dead or self.proc is None or self.proc.poll() is not None:
             return False
-        now = time.time()
-        if self.started_at and (now - self.started_at) > self.max_sec:
-            return False
-        if self.last_event_at and (now - self.last_event_at) > self.idle_sec:
+        if self.last_event_at and (time.time() - self.last_event_at) > self.idle_sec:
             return False
         return True
 
     # -- 한 턴 ---------------------------------------------------------------
-    def ask(self, prompt, timeout=CLAUDE_TIMEOUT):
-        """프롬프트 한 턴을 밀어 넣고 결과 텍스트를 받는다.
+    def ask(self, prompt, timeout=None):
+        """프롬프트 한 턴을 밀어 넣고 결과 텍스트를 받는다 — **시간으로 안 끊는다.**
 
-        실패(쓰기 불가·EOF·타임아웃)면 세션을 죽이고 ``SessionError`` — 호출부가
-        같은 프롬프트로 one-shot 을 돌린다(글은 반드시 나온다).
+        ⛔ ``timeout`` 은 **더 이상 경과 시간 상한이 아니다.** 예전엔 여기서
+        ``deadline = now + 120s`` 를 넘기면 ``close()`` 로 claude 를 죽였는데, 본문
+        생성 한 콜의 실측이 73.7초고 Render(0.1 CPU)는 그보다 느리다 — 일하고 있는
+        프로세스를 우리가 끊고 있었다. 지금은 **결과가 올 때까지 기다린다.**
+
+        기다림을 깨는 것은 둘뿐이다:
+
+          * **침묵** — stream-json 이벤트가 ``idle_sec`` 동안 **하나도** 없으면
+            그건 느린 게 아니라 고장이다. 그때만 죽이고 ``SessionError``.
+          * **사람의 명시적 중단** — ``request_cancel`` 이 프로세스를 죽이면 읽기
+            루프가 EOF 로 끝나고, 여기서 ``Cancelled`` 로 올린다(폴백 금지 —
+            one-shot 으로 다시 돌리면 중단이 아니다).
+
+        ``timeout`` 인자는 호출부 호환을 위해 남겨 두고 **무시한다**(요청 경로의
+        진짜 상한은 세션이 아니라 ``_run_claude_oneshot`` 쪽에서만 산다).
         """
         if not self.healthy():
             self.close()
             raise SessionError("claude session is not healthy")
+        _raise_if_cancelled()
         with self._cv:
             self._results.clear()
         try:
@@ -277,16 +466,24 @@ class ClaudeSession:
             self.close()
             raise SessionError(f"claude session stdin write failed: {e}") from e
 
-        deadline = time.time() + max(1, int(timeout))
+        silent_for = 0.0
         with self._cv:
             while not self._results and not self._eof:
-                if not self._cv.wait(min(1.0, max(0.05, deadline - time.time()))):
-                    pass
-                if time.time() >= deadline:
+                self._cv.wait(1.0)
+                # ⚠️ 경과가 아니라 **침묵**을 잰다 — 이벤트가 흐르는 한 안 끊는다.
+                silent_for = time.time() - (self.last_event_at or time.time())
+                if silent_for > self.idle_sec:
                     break
             event = self._results.pop(0) if self._results else None
         if event is None:
             self.close()
+            if is_cancelled():
+                raise Cancelled("사람이 중단했다 — 세션 턴을 접는다")
+            if silent_for > self.idle_sec:
+                raise SessionError(
+                    f"claude session went silent for {int(silent_for)}s "
+                    f"(> {self.idle_sec}s) — 느린 게 아니라 멈춘 것으로 본다"
+                )
             raise SessionError("claude session turn produced no result")
         self.turns += 1
         if event.get("is_error"):
@@ -303,6 +500,7 @@ class ClaudeSession:
         proc, self.proc = self.proc, None
         if proc is None:
             return
+        _unregister_proc(proc)
         pgid = None
         if hasattr(os, "getpgid"):
             try:
@@ -442,9 +640,25 @@ def claude_session(allow_web=False, enabled=None):
                 log.debug("claude session close failed", exc_info=True)
 
 
-def _run_claude_oneshot(prompt: str, timeout: int = CLAUDE_TIMEOUT,
+def _run_claude_oneshot(prompt: str, timeout: int = None,
                         allow_web: bool = False) -> str:
-    """예전 경로 그대로 — 프로세스를 새로 띄워 한 번 묻고 죽인다."""
+    """프로세스를 새로 띄워 한 번 묻고 죽인다.
+
+    길이 **둘**이다 — 갈림길은 ``timeout``:
+
+      * ``timeout=None`` (기본, 백그라운드 전부) — **경과 시간으로 안 끊는다.**
+        stream-json 으로 받아서 **침묵**(이벤트 0)만 감시한다. 느린 콜은 끝까지
+        기다리고, 정말 죽은 프로세스는 ``SESSION_IDLE_SEC`` 침묵에서 잡는다.
+      * ``timeout=<초>`` (요청 경로 전용) — 예전 그대로 ``subprocess.run`` 의 하드
+        상한. gunicorn 응답 예산 안에 **반드시** 들어와야 하는 자리에서만 쓴다.
+    """
+    if timeout is not None:
+        return _run_claude_capped(prompt, int(timeout), allow_web)
+    return _run_claude_streamed(prompt, allow_web)
+
+
+def _run_claude_capped(prompt: str, timeout: int, allow_web: bool) -> str:
+    """하드 상한이 있는 one-shot — **요청 경로 전용**(오늘의 질문)."""
     argv = _claude_argv(allow_web)
     try:
         proc = subprocess.run(
@@ -469,7 +683,113 @@ def _run_claude_oneshot(prompt: str, timeout: int = CLAUDE_TIMEOUT,
     return (proc.stdout or "").strip()
 
 
-def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
+def _run_claude_streamed(prompt: str, allow_web: bool,
+                         idle_sec: int = None) -> str:
+    """상한 없는 one-shot — **침묵만** 감시한다.
+
+    왜 stream-json 인가: 기본 텍스트 출력은 다 끝난 뒤에 한 번에 나오므로 '살아
+    있나'를 물어볼 창구가 없다 — 그 상태에서 상한을 걸면 그건 결국 **경과 시간
+    상한**이다. stream-json 은 턴이 도는 동안 이벤트가 줄줄이 흐르므로(실호출로
+    확인), '오래 걸림'과 '아무 소식 없음'을 **구분**할 수 있다. 프롬프트는 예전과
+    똑같이 stdin 으로 밀어 넣는다(``--input-format`` 은 안 쓴다 — 세션이 못 뜨는
+    환경에서도 이 길은 열려 있어야 하므로 단방향 그대로다).
+    """
+    idle = int(idle_sec if idle_sec is not None else SESSION_IDLE_SEC)
+    argv = _claude_argv(allow_web) + [
+        "--output-format", "stream-json", "--verbose",
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            **_popen_kwargs(),
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("claude CLI not found on PATH") from e
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"claude CLI spawn failed: {e}") from e
+
+    _register_proc(proc)
+    state = {"last": time.time(), "result": None, "texts": [], "noise": []}
+
+    def _read():
+        try:
+            for line in proc.stdout:
+                state["last"] = time.time()
+                event = _parse_stream_event(line)
+                if event is None:
+                    s = _strip_ansi(line).strip()
+                    if s:
+                        state["noise"].append(s)
+                    continue
+                if event.get("type") == "result":
+                    state["result"] = event
+                elif event.get("type") == "assistant":
+                    # result 이벤트를 못 받는 CLI 버전 대비 보조 수집.
+                    for blk in ((event.get("message") or {}).get("content") or []):
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            state["texts"].append(str(blk.get("text") or ""))
+        except Exception:  # noqa: BLE001 — 읽기 실패 = 그 콜 실패
+            log.debug("claude one-shot reader ended", exc_info=True)
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except Exception as e:  # noqa: BLE001
+        _kill_proc(proc)
+        _unregister_proc(proc)
+        raise RuntimeError(f"claude CLI stdin write failed: {e}") from e
+
+    silent = 0.0
+    try:
+        while True:
+            reader.join(timeout=1.0)
+            if not reader.is_alive():
+                break
+            # ⚠️ 경과가 아니라 **침묵**이다 — 이벤트가 흐르는 한 안 끊는다.
+            silent = time.time() - state["last"]
+            if silent > idle:
+                _kill_proc(proc)
+                raise RuntimeError(
+                    f"claude CLI went silent for {int(silent)}s (> {idle}s) — "
+                    "느린 게 아니라 멈춘 것으로 본다"
+                )
+        try:
+            proc.wait(timeout=TERMINATE_GRACE_SEC)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _unregister_proc(proc)
+
+    if is_cancelled():
+        raise Cancelled("사람이 중단했다 — one-shot 을 접는다")
+    event = state["result"]
+    if event is not None:
+        if event.get("is_error"):
+            raise RuntimeError(
+                f"claude CLI errored: {str(event.get('result') or '')[:300]}"
+            )
+        out = _strip_ansi(str(event.get("result") or "")).strip()
+        if out:
+            return out
+    joined = _strip_ansi("".join(state["texts"])).strip()
+    if joined:
+        return joined
+    raise RuntimeError(
+        f"claude CLI exited {proc.returncode} with no result: "
+        f"{' '.join(state['noise'])[:300]}"
+    )
+
+
+def _run_claude(prompt: str, timeout: int = None,
                 allow_web: bool = False) -> str:
     """Run `claude -p`, feeding the prompt via stdin. Returns raw stdout text.
 
@@ -479,12 +799,18 @@ def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
     페처 전용). 요청 경로의 데일리 질문 콜에도 안전하다(도구를 안 쓰면 그만 —
     여기에 세마포어·블로킹을 추가하지 않는다).
 
-    Raises RuntimeError on non-zero exit / timeout / missing binary.
+    Raises RuntimeError on non-zero exit / missing binary / 침묵.
+
+    ⛔ ``timeout`` 의 기본은 **None = 경과 시간으로 안 끊는다.** 숫자를 주는 자리는
+    요청 경로(오늘의 질문)·팝업 수집처럼 **성질이 다른** 두 곳뿐이다. 느린 것을
+    끊지 않는 대신, 사람이 ``request_cancel`` 로 멈추고 침묵은 자동으로 잡는다.
 
     **지속 세션**: 이 스레드가 ``claude_session()`` 블록 안에 있으면 프로세스를 새로
     띄우지 않고 그 세션에 턴을 이어 붙인다(부팅 1회). 세션이 없거나·웹 권한이 다르거나·
     중간에 깨지면 **그 자리에서 one-shot 으로 되돌아간다** — 호출부는 차이를 모른다.
+    단 ``Cancelled``(사람이 멈춤)는 폴백하지 않고 그대로 올린다.
     """
+    _raise_if_cancelled()
     sess = current_session()
     if sess is not None and sess.allow_web == bool(allow_web):
         try:
@@ -493,8 +819,11 @@ def _run_claude(prompt: str, timeout: int = CLAUDE_TIMEOUT,
                 return out
             # 빈 응답은 세션 탓일 수 있다 — 조용히 one-shot 으로 한 번 더 묻는다.
             log.warning("claude 세션 턴이 빈 응답 — one-shot 으로 재시도")
+        except Cancelled:
+            raise
         except SessionError:
             log.warning("claude 세션 턴 실패 — one-shot 으로 폴백", exc_info=True)
+    _raise_if_cancelled()
     return _run_claude_oneshot(prompt, timeout=timeout, allow_web=allow_web)
 
 
@@ -582,7 +911,10 @@ def generate_daily_question(recent_pairs, past_questions=None):
         '{"question": "..."}'
     )
     try:
-        raw = _run_claude(prompt)
+        # ⚠️ 이 앱에서 claude 가 **요청 경로**에서 도는 유일한 자리 — 여기만 하드
+        # 상한을 남긴다(gunicorn --timeout 180 예산). 못 맞추면 폴백 질문으로 즉시
+        # 응답하고 백그라운드가 같은 행을 개인화 질문으로 올려준다.
+        raw = _run_claude(prompt, timeout=CLAUDE_TIMEOUT)
         data = _extract_json(raw)
         q = (data.get("question") or "").strip()
         if q:
@@ -812,7 +1144,8 @@ def caption_image(image_path):
         '{"caption": "...", "tags": ["...", "..."]}'
     )
     try:
-        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT)
+        # 백그라운드 큐 잡이다 — **느리다고 끊지 않는다**(침묵만 감시).
+        raw = _run_claude(prompt)
         data = _extract_json(raw)
         caption = (data.get("caption") or "").strip()
         raw_tags = data.get("tags") or []
@@ -928,9 +1261,12 @@ def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg",
             "출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
             '{"x": 0.12, "y": 0.05, "w": 0.55, "h": 0.42}'
         )
-        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT, allow_web=tools_web)
+        # 백그라운드 큐 잡이다 — **느리다고 끊지 않는다**(침묵만 감시).
+        raw = _run_claude(prompt, allow_web=tools_web)
         data = _extract_json(raw)
         return _normalize_crop_box(data)
+    except Cancelled:
+        raise  # 사람이 멈춘 건 '비전 실패'가 아니다 — 중앙 크롭으로 넘기지 않는다
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] suggest_crop failed: {e}", file=sys.stderr)
         return None
@@ -1626,6 +1962,8 @@ def suggest_keyword_candidates(input_block):
     prompt = template.replace("{{INPUT_BLOCK}}", input_block)
     try:
         data = _extract_json(_run_claude(prompt))
+    except Cancelled:
+        raise  # 사람이 멈췄다 — best-effort 로 삼키면 파이프라인이 계속 돈다
     except Exception as e:  # noqa: BLE001 — 조사는 best-effort
         print(f"[ai] keyword candidates failed: {e}", file=sys.stderr)
         return None
@@ -1685,6 +2023,8 @@ def select_keywords(input_block, evidence_block, candidates):
     )
     try:
         data = _extract_json(_run_claude(prompt))
+    except Cancelled:
+        raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
     except Exception as e:  # noqa: BLE001
         print(f"[ai] keyword selection failed: {e}", file=sys.stderr)
         return None
@@ -1854,6 +2194,8 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
         if not result:
             raise ValueError("empty review")
         return result
+    except Cancelled:
+        raise  # 사람이 멈춘 것은 '생성 실패'가 아니다 — 호출부가 구분해야 한다
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
         print(f"[ai] blog review generation failed: {e}", file=sys.stderr)
         return None

@@ -2466,18 +2466,19 @@ def resume_recommendation_if_orphaned(app_obj, couple_id):
 _generating_reviews_lock = threading.Lock()
 _generating_reviews: set[int] = set()
 
-# 후기 초안 전용 stale 상한 — 월간 회고의 _STUCK_GENERATING(5분)을 **그대로 쓰면 안
-# 된다.** 후기 생성은 claude 를 여러 번 부르고, 그 전부가 캡션·채점·추천과 공유하는
-# _CAPTION_SEM 뒤에 줄을 선다:
-#     키워드 후보 + 선정   = 2 × ai.CLAUDE_TIMEOUT(120s)  = 240s
-#     본문 생성(write_review) = 1 × ai.CLAUDE_TIMEOUT(120s) = 120s
-#     사진 블록마다 비전 크롭  = N × ai.CAPTION_TIMEOUT(180s)
-# 실측 정상치는 ~170초지만(Step 3) 상한은 사진 수에 비례해 늘어난다 — 사진 5장이면
-# 360 + 900 = 1260s(21분)까지 '정상'이다. 5분을 그대로 쓰면 정상 생성을 stale 로
-# 오인한다. 그래서 25분: 사진 5장짜리 최악 생성(21분)보다 넉넉하고, '어제부터 멈춘
-# 행'은 확실히 잡는다. (재시작으로 스레드가 죽은 경우는 이 상한을 **기다리지 않는다** —
-# 인프로세스 가드가 즉시 'orphaned' 로 판정한다. 이 25분은 스레드가 살아 있는데도
-# 안 끝나는 경우(hang)에만 쓰이는 사람 탈출구의 기준이다.)
+# 후기 초안이 '오래 걸린다'고 **말해 줄** 기준 — ⛔ 끊는 상한이 아니다.
+#
+# 이 25분이 지나도 **아무것도 죽이지 않는다.** 생성은 계속 돌고, 화면이 한 줄 더
+# 말할 뿐이다("오래 걸리고 있어 — 계속 기다릴래, 아니면 ✋ 그만할래?"). 실제로
+# 끊는 것은 둘뿐이다: **사람의 중단 버튼**과 **침묵 감지**(ai.SESSION_IDLE_SEC).
+#
+# 근거(추정): 후기 생성은 claude 를 여러 번 부르고 전부 _CAPTION_SEM 뒤에 줄을 선다 —
+#     키워드 후보 + 선정   ≈ 2 × ai.CLAUDE_TIMEOUT(120s) = 240s
+#     본문 생성(write_review) ≈ 1콜 (로컬 실측 73.7s, Render 0.1 CPU 는 더 느리다)
+#     사진 블록마다 비전 크롭  ≈ N × ai.CAPTION_EST_SEC(180s)
+# 사진 5장이면 20분대까지도 '느리지만 정상'이다. 월간 회고의 _STUCK_GENERATING(5분)을
+# 그대로 쓰면 정상 생성을 멈춘 것으로 오인한다. (재시작으로 스레드가 죽은 경우는 이
+# 기준을 **기다리지 않는다** — 인프로세스 가드가 즉시 'orphaned' 로 판정한다.)
 _STUCK_REVIEW = timedelta(minutes=25)
 
 
@@ -2600,11 +2601,12 @@ _QUEUE_STALL = timedelta(seconds=90)
 def _review_eta(n_photos):
     """이 후기 한 건의 (claude 콜 수, '느려도 정상'인 최대 분).
 
-    근거는 상한 상수들뿐이다 — 조사 2 + 본문 1 = 3 × ``ai.CLAUDE_TIMEOUT``,
-    사진마다 비전 1 × ``ai.CAPTION_TIMEOUT``. **추정이지 약속이 아니다.**
+    근거는 콜 하나의 **추정 소요**뿐이다 — 조사 2 + 본문 1 = 3 × 120초,
+    사진마다 비전 1 × ``ai.CAPTION_EST_SEC``. **추정이지 약속이 아니고, 이 시간이
+    지나도 아무것도 끊지 않는다**(끊는 건 사람의 중단 버튼과 침묵 감지뿐).
     """
     calls = 3 + max(0, int(n_photos))
-    worst_sec = 3 * ai.CLAUDE_TIMEOUT + max(0, int(n_photos)) * ai.CAPTION_TIMEOUT
+    worst_sec = 3 * ai.CLAUDE_TIMEOUT + max(0, int(n_photos)) * ai.CAPTION_EST_SEC
     return calls, max(1, int(round(worst_sec / 60.0)))
 
 
@@ -2641,6 +2643,10 @@ def review_progress_view(app_obj, review, resumed=False):
         "headline": "",
         "hint": "",
         "retry": False,
+        # 사람이 멈출 수 있는 상태인가 — '✋ 그만할래' 버튼의 노출 조건.
+        # 시간 상한을 걷어낸 자리에 들어온 **유일한 명시적 탈출구**라, 오래 걸리는
+        # 동안 **항상** 보여야 한다(오래 걸릴 때만 뜨면 그땐 이미 늦다).
+        "can_stop": False,
         "ahead": None,
         "elapsed_min": None,
         "step": None,
@@ -2665,9 +2671,15 @@ def review_progress_view(app_obj, review, resumed=False):
     if review.status != "pending":
         if snap is not None:
             # 초안은 떴고 사진 크롭만 남았다 — 그림이 한 번 더 바뀐다고 미리 말한다.
+            # 여기도 아직 claude 가 돌고 있으니 멈출 수 있어야 한다.
             out["state"] = "finishing"
+            out["can_stop"] = True
             label = snap["step"] or "마무리하는 중"
             out["headline"] = f"✨ {label} — 다 되면 사진이 한 번 더 바뀔 거야."
+        elif review.status == "cancelled":
+            out["state"] = "cancelled"
+            out["headline"] = "✋ 여기서 멈췄어 — 다시 만들고 싶으면 눌러줘."
+            out["retry"] = True
         return out
 
     now = datetime.utcnow()
@@ -2682,10 +2694,13 @@ def review_progress_view(app_obj, review, resumed=False):
         if n_photos else f"사진이 없으니 claude 를 {calls}번 불러"
     )
     base_hint = (
-        f"{how_many} — 서버가 느려서 보통 3분쯤, 느릴 땐 {worst_min}분까지도 "
-        f"정상이야(추정이야). {limit_min}분을 넘기면 중단된 걸로 보고 알려줄게."
+        f"{how_many} — 보통 3분쯤, 느릴 땐 {worst_min}분까지도 정상이야(추정이야). "
+        "오래 걸려도 내가 끊지는 않아 — 그만하려면 ✋ 를 눌러줘."
     )
     out["hint"] = base_hint
+    # 'pending' 인 동안은 언제든 멈출 수 있다 — 줄에 서 있든(큐 행만 치운다),
+    # claude 가 돌고 있든(프로세스를 죽인다) 같은 버튼 하나다.
+    out["can_stop"] = True
 
     def _mins(since):
         return max(0, int((now - (since or now)).total_seconds() // 60))
@@ -2701,10 +2716,13 @@ def review_progress_view(app_obj, review, resumed=False):
         m = _mins(review.updated_at)
         out["elapsed_min"] = m
         if verdict == "overdue":
+            # ⚠️ '죽었다'고 단정하지 않는다 — 시간 상한을 걷어낸 뒤로 이건 **아직
+            # 돌고 있는데 오래 걸리는 것**일 수 있다(그게 보통이다). 사실만 말하고
+            # 선택지를 준다.
             out["state"] = "overdue"
             out["headline"] = (
-                f"⏳ {m}분째인데 {limit_min}분 상한을 넘겼어 — 중단된 것 같아. "
-                "다시 시도해줄래?"
+                f"⏳ {m}분째야 — 예상({limit_min}분)보다 오래 걸려. 아직 돌고 "
+                "있을 수도 있어서 내가 끊지는 않았어. 더 기다리거나 ✋ 로 멈춰도 돼."
             )
             out["retry"] = True
         elif verdict == "orphaned":
@@ -2733,10 +2751,12 @@ def review_progress_view(app_obj, review, resumed=False):
             where = "아직 어느 단계인지 안 적혔어"
         when = "방금 시작했어" if m == 0 else f"{m}분째"
         if m >= limit_min:
+            # ⚠️ 경고지 판결이 아니다 — 큐 행은 지금도 'running' 이고, 단계가
+            # 바뀌고 있으면 그건 **살아 있다는 증거**다. 끊지 않고 알려만 준다.
             out["state"] = "overdue"
             out["headline"] = (
-                f"⏳ {m}분째야 — {limit_min}분 상한을 넘겼어. 중단된 것 같아, "
-                "다시 시도해줄래?"
+                f"⏳ {m}분째야 — 예상({limit_min}분)보다 오래 걸려 · {where}. "
+                "끊지는 않았어. 더 기다리거나 ✋ 로 멈춰도 돼."
             )
             out["retry"] = True
         elif m >= 5:
@@ -2833,7 +2853,7 @@ def _crop_hint_for_image(blocks, idx):
 # 즉 **속도를 크게 내주고 메모리를 조금 얻는** 교환이라 기본은 'file' 이다. URL 경로는
 # 그대로 살아 있고(만료 5분 서명 URL — 네이버 발행이 쓰는 그 설비), 환경변수로 켠다.
 _CROP_VISION_SOURCE = (os.environ.get("CROP_VISION_SOURCE") or "file").strip().lower()
-# claude 콜 하나가 끝나기에 충분한 최소 만료(ai.CAPTION_TIMEOUT 180s + 여유).
+# claude 콜 하나가 끝나기에 충분한 최소 만료(비전 콜 추정 180s + 여유).
 _CROP_VISION_URL_TTL = 300
 
 
@@ -2932,8 +2952,8 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None
 
     ``on_step(done, total)`` — 선택. 사진 한 장의 비전 콜에 **들어가기 직전** 불린다
     (1-based ``done``, 실제 image 블록 수 ``total``). 이 구간이 파이프라인에서 가장
-    길다(사진당 최대 ``ai.CAPTION_TIMEOUT``) — 여기서 아무 소식이 없으면 사람은
-    죽은 줄 안다. 콜백이 터져도 크롭은 그대로 간다.
+    길다(사진당 ``ai.CAPTION_EST_SEC`` 안팎, **상한은 없다**) — 여기서 아무 소식이
+    없으면 사람은 죽은 줄 안다. 콜백이 터져도 크롭은 그대로 간다.
     """
     if not result or not isinstance(result, dict):
         return
@@ -2983,6 +3003,8 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None
                 focus = ai.suggest_crop(
                     data, hint, _BLOG_CROP_ASPECT, ext=ext, image_url=vision_url,
                 )
+            except ai.Cancelled:
+                raise  # 사람이 멈췄다 — 중앙 크롭 폴백으로 '성공'처럼 넘기지 않는다
             except Exception:  # noqa: BLE001 — 비전 실패는 중앙 크롭으로 폴백
                 log.exception("suggest_crop raised (photo=%s)", p.id)
                 focus = None
@@ -2991,6 +3013,8 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None
                     _CAPTION_SEM.release()
             rect = compute_crop_rect(img_w, img_h, focus, _BLOG_CROP_ASPECT)
             blk["crop"] = [round(v, 4) for v in rect]
+        except ai.Cancelled:
+            raise  # 사람이 멈췄다 — 남은 사진으로 넘어가지 않는다
         except Exception:  # noqa: BLE001 — 사진당 실패 격리(초안은 계속)
             log.exception(
                 "image crop 계산 실패 (photo_index=%s)", blk.get("photo_index")
@@ -3071,10 +3095,19 @@ def generate_review(app, review_id):
     **키워드 조사(선택) → ``ai.write_review``** 순으로 호출한다. 성공하면 ai_json + status='ready',
     실패하면 status='failed'(단, 직전에 쓸 만한 ai_json이 있으면 그걸 유지해
     'ready'로 둔다). 커밋은 rollback 가드. 절대 raise 안 하고 finally에서 가드 해제.
+
+    ⛔ **시간으로 끊지 않는다.** 예전엔 claude 콜마다 120초 상한이 걸려 있었는데
+    본문 생성 한 콜의 실측이 73.7초고 Render 는 그보다 느리다 — 일하는 claude 를
+    우리가 끊고 있었다(그래서 ``failed``). 지금은 ① 사람이 '✋ 그만할래'로 멈추고
+    (``ai.request_cancel`` → ``ai.Cancelled``) ② 침묵은 ``ai`` 가 자동으로 잡는다.
     """
+    cancel_key = f"review:{review_id}"
     try:
         with app.app_context():
             try:
+                # 이 스레드에서 뜨는 claude 를 전부 이 키에 묶는다 — '✋ 그만할래'가
+                # 죽일 수 있는 것은 등록된 프로세스뿐이다.
+                ai.enter_cancel_scope(cancel_key)
                 review = db.session.get(BlogReview, review_id)
                 if review is None:
                     return  # 생성 전에 삭제됐을 수 있음
@@ -3151,6 +3184,8 @@ def generate_review(app, review_id):
                                 client_id=creds[0], client_secret=creds[1],
                                 key_owner=key_owner, on_step=prog.step,
                             )
+                        except ai.Cancelled:
+                            raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
                         except Exception:  # noqa: BLE001 — 조사는 best-effort
                             log.exception(
                                 "keyword research raised (review=%s)", review_id
@@ -3162,6 +3197,8 @@ def generate_review(app, review_id):
                                 topic, location, prose, overall, photos_arg,
                                 details=details, research=research,
                             )
+                        except ai.Cancelled:
+                            raise  # 사람이 멈췄다 — '실패'로 접지 않는다
                         except Exception:  # noqa: BLE001
                             log.exception(
                                 "claude write_review raised (review=%s)", review_id
@@ -3195,6 +3232,8 @@ def generate_review(app, review_id):
                                     result, photos_ordered_list, acquire_sem=False,
                                     on_step=_crop_step,
                                 )
+                            except ai.Cancelled:
+                                raise  # 사람이 멈췄다 — 남은 사진을 더 돌리지 않는다
                             except Exception:  # noqa: BLE001 — belt & suspenders
                                 log.exception(
                                     "attach section crops failed (review=%s)",
@@ -3236,9 +3275,18 @@ def generate_review(app, review_id):
                 if result or prior_ok:
                     _enqueue_ai(app, "prerender", f"prerender:{review_id}",
                                 {"review_id": review_id})
+            except ai.Cancelled:
+                # 사람이 멈췄다 — **실패가 아니다.** 상태는 중단 라우트가 이미
+                # 'cancelled' 로 적어 뒀고(본문이 이미 커밋돼 있었으면 'ready' 로
+                # 그대로 둔다), 여기서는 아무것도 덮어쓰지 않는다. 남은 단계(크롭·
+                # 프리렌더)도 돌리지 않는다.
+                db.session.rollback()
+                log.info("후기 초안 생성을 사람이 중단했다 (review=%s)", review_id)
             except Exception:  # noqa: BLE001 — belt & suspenders; 절대 탈출 금지
                 db.session.rollback()
                 log.exception("generate_review failed (review=%s)", review_id)
+            finally:
+                ai.exit_cancel_scope(cancel_key)
     finally:
         with _generating_reviews_lock:
             _generating_reviews.discard(review_id)
@@ -3318,7 +3366,11 @@ def _spawn_generate_review(app, review_id):
     """이 후기 초안 생성 백그라운드 스레드를 스폰(이미 진행 중이면 no-op).
 
     judge_case 스폰과 같은 패턴 — review_id 가드로 중복(더블탭)을 떨군다. 절대
-    raise 안 하고, 스폰 실패 시 가드 키를 되돌린다."""
+    raise 안 하고, 스폰 실패 시 가드 키를 되돌린다.
+
+    ⚠️ 지난 '중단' 표시를 먼저 지운다 — 안 지우면 사람이 ↻ 로 다시 돌린 생성이 옛
+    중단 요청을 물려받아 첫 claude 콜에서 그대로 접힌다."""
+    ai.clear_cancel(f"review:{review_id}")
     spawn = False
     with _generating_reviews_lock:
         if review_id not in _generating_reviews:
@@ -8148,6 +8200,53 @@ def _register_routes(app: Flask):
         db.session.commit()
         _spawn_generate_review(current_app._get_current_object(), review.id)
         flash("초안을 다시 만드는 중이야 ✍️", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
+    @app.route("/reviews/<int:rid>/cancel", methods=["POST"])
+    @active_couple_required
+    def review_cancel(rid):
+        """초안 생성 **중단** — 사람이 '✋ 그만할래'를 눌렀다. cross-couple은 404.
+
+        왜 이게 있나 — 예전엔 claude 콜마다 120초 상한이 있었고, 그게 **일하고 있는
+        claude 를 끊어** 후기를 ``failed`` 로 만들었다(본문 1콜 실측 73.7초, Render 는
+        더 느리다). 상한을 걷어낸 대신, 멈추는 권한을 **사람에게** 준다.
+
+        누르면 실제로 넷을 치운다 — 하나라도 빠지면 '멈췄다'는 말이 거짓이 된다:
+
+          1. **claude 프로세스** — ``ai.request_cancel`` 이 등록된 프로세스를 그룹째
+             죽인다. 그러면 일하던 쪽은 ``ai.Cancelled`` 로 접힌다.
+          2. **큐 행** — ``aijobs.cancel`` 이 ``review:<id>`` 행을 지운다(아직 줄만
+             서 있던 경우도 여기서 사라진다).
+          3. **인프로세스 가드** — 안 풀면 나중에 ↻ 를 눌러도 스폰이 조용히 no-op 다.
+          4. **후기 상태** — 'pending' 이었으면 'cancelled'. 이미 초안이 떠 있었다면
+             (크롭만 남은 단계) 그 초안은 **그대로 둔다** — 쓸 수 있는 글을 사람이
+             멈췄다고 버리지 않는다.
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        key = f"review:{rid}"
+        killed = ai.request_cancel(key)
+        aijobs.cancel(key)
+        with _generating_reviews_lock:
+            _generating_reviews.discard(rid)
+        had_draft = review.ai is not None
+        if review.status == "pending":
+            review.status = "cancelled"
+            review.updated_at = datetime.utcnow()
+            try:
+                db.session.commit()
+            except Exception:  # noqa: BLE001 — 중단이 페이지를 깨뜨리지 않게
+                db.session.rollback()
+                log.exception("후기 초안 중단 커밋 실패 (review=%s)", rid)
+        log.info("후기 초안 생성을 사람이 중단했다 (review=%s, 죽인 claude=%s)",
+                 rid, killed)
+        flash(
+            "여기까지만 하고 멈췄어. 지금까지 쓴 초안은 그대로 둘게 ✋"
+            if had_draft else "초안 만들기를 멈췄어 ✋",
+            "success",
+        )
         return redirect(url_for("review_detail", rid=review.id))
 
     @app.route("/reviews/<int:rid>/save-text", methods=["POST"])
