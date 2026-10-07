@@ -87,6 +87,21 @@ _THUMB_CACHE_TTL = 3600  # seconds
 _THUMB_CACHE_MAX = 192
 _thumb_cache: dict[tuple[str, str], tuple[bytes, str, float]] = {}
 
+# 아이템 **메타데이터** 캐시 — 픽셀이 아니라 숫자 몇 개(이름·크기·가로세로·촬영일)만
+# 담는다. 항목당 200바이트 남짓이라 1024개가 가득 차도 0.2MB 수준이고, 이 캐시의
+# 목적은 메모리 절약이 아니라 **Graph 왕복 횟수를 지키는 것**이다(바이트 캐시를
+# 디스크로 내보내고 프록시를 스트리밍으로 바꾸면서, 예전엔 바이트 캐시가 덤으로
+# 막아 주던 '같은 사진 메타 재조회'가 노출됐다).
+_META_CACHE_TTL = 900  # seconds
+_META_CACHE_MAX = 1024
+_meta_cache: dict[str, tuple[dict, float]] = {}
+
+# Graph 커스텀 렌디션을 받아들이기 전에 **원본 비율과 대조**할 때 허용하는 오차.
+# `c{W}x{H}` 는 문서상 '박스 안에 들어가도록 비율 유지'지만, 문서를 믿고 끝내지
+# 않는다 — 돌아온 가로세로를 원본과 대조해 어긋나면 **쓰지 않는다**(잘린 그림을
+# 조용히 내보내느니 원본 경로로 폴백한다).
+_RENDITION_ASPECT_TOL = 0.02
+
 
 class OneDriveError(RuntimeError):
     """Any OneDrive/Graph failure surfaced to the caller."""
@@ -276,6 +291,54 @@ def upload_photo(file_bytes: bytes, filename: str):
         raise OneDriveError(f"upload request failed: {e}") from e
 
 
+def upload_photo_stream(stream, size, filename):
+    """파일류 객체를 ``couple-daily/<unique-name>`` 으로 **메모리에 담지 않고** 올린다.
+
+    ``upload_photo(file_bytes, …)`` 의 스트리밍 판이다. 사진 업로드 경로가
+    ``file.read()`` 로 최대 50MB 를 파이썬 힙에 올리던 것을 없애려고 만들었다
+    (영상이 이미 ``upload_stream`` 으로 하던 것과 같은 사상).
+
+    크기에 따라 두 길로 간다 — **왕복 횟수를 괜히 늘리지 않으려고** 가른다:
+
+      * ``size <= _CHUNK``(3.2MiB, 사진 대부분) → **단순 PUT 한 번**. 본문으로
+        스트림 객체를 그대로 넘기고 ``Content-Length`` 를 명시하면 requests 가
+        조각내어 보낸다 — 바이트가 변수에 담기지 않는다.
+      * 그보다 크면 → ``upload_stream``(업로드 세션 청크 PUT). 한 번에 메모리에
+        있는 것은 청크 하나뿐이다.
+
+    반환·예외는 ``upload_photo`` 와 같다 — ``(item_id, stored_name)`` / OneDriveError.
+    """
+    if size is None or size <= 0:
+        raise OneDriveError("upload stream has no bytes")
+    if size > _CHUNK:
+        return upload_stream(stream, size, filename)
+    try:
+        _ensure_folder()
+        name = _safe_unique_name(filename)
+        url = f"{GRAPH_BASE}/me/drive/root:/{FOLDER}/{name}:/content"
+        r = requests.put(
+            url,
+            headers={
+                **_auth_headers(),
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(int(size)),
+            },
+            data=stream,
+            timeout=UPLOAD_TIMEOUT,
+        )
+        if r.status_code not in (200, 201):
+            raise OneDriveError(f"upload failed (status={r.status_code})")
+        item = r.json()
+        item_id = item.get("id")
+        if not item_id:
+            raise OneDriveError("upload returned no item id")
+        return item_id, item.get("name") or name
+    except OneDriveError:
+        raise
+    except requests.RequestException as e:
+        raise OneDriveError(f"upload request failed: {e}") from e
+
+
 def get_download_url(item_id: str):
     """Return a short-lived direct download URL for an item.
 
@@ -399,6 +462,258 @@ def get_thumbnail(item_id: str, size: str = "medium"):
                 _thumb_cache.pop(oldest, None)
         _thumb_cache[key] = (data, ctype, now + _THUMB_CACHE_TTL)
     return data, ctype
+
+
+# --------------------------------------------------------------------------- #
+# 메타데이터 · 렌디션 — **서버가 원본 픽셀을 만지지 않기 위한 두 설비**
+# --------------------------------------------------------------------------- #
+# 이 앱의 이미지 경로는 두 가지만 있으면 원본 바이트를 안 열어도 된다:
+#
+#   (1) 사진의 **표시 기준 가로세로** — 크롭 사각형 계산은 정규화 좌표라
+#       *비율만* 알면 된다. Graph 의 ``image`` 패싯이 숫자로 알려 준다.
+#       예전엔 이걸 알려고 3MB 원본을 받아 Pillow 로 열었다.
+#   (2) **작은 다운스케일본** — Graph 가 서버에서 렌더해 준다(우리 CPU·메모리 0).
+#       미리보기·크롭 UI·비전 판단에는 원본 해상도가 필요 없다.
+#
+# 원본 바이트가 정말 필요한 곳은 **발행용 크롭 산출** 한 곳뿐인데, 그건 이제
+# 브라우저가 Canvas 로 한다(app.py 의 blog_img 머리말 참고). 그래서 서버는
+# 원본을 '흘려보내기만' 한다 — 디코드하지 않는다.
+
+_META_SELECT = "id,name,size,file,image,photo,eTag"
+
+
+def _put_meta(item_id, meta):
+    if len(_meta_cache) >= _META_CACHE_MAX:
+        now = time.time()
+        for k in [k for k, v in _meta_cache.items() if v[1] <= now]:
+            _meta_cache.pop(k, None)
+        if len(_meta_cache) >= _META_CACHE_MAX:
+            _meta_cache.clear()  # 숫자 몇 개짜리 테이블이라 통째로 비워도 싸다
+    _meta_cache[item_id] = (meta, time.time() + _META_CACHE_TTL)
+
+
+def get_item_meta(item_id: str, refresh: bool = False):
+    """드라이브 아이템의 **메타데이터만** — 픽셀을 한 바이트도 받지 않는다.
+
+    ``GET /me/drive/items/<id>?$select=...`` 는 1KB 남짓의 JSON 을 돌려준다.
+    여기서 꺼내 쓰는 것:
+
+      * ``width``/``height`` — Graph 의 ``image`` 패싯. **EXIF 방향이 적용된
+        표시 기준**이 아니라 '저장된' 픽셀 크기일 수 있으므로, 방향이 중요한
+        계산에는 렌디션의 가로세로(이미 똑바로 세워져 온다)를 우선한다.
+      * ``taken_at`` — ``photo.takenDateTime``. Graph 가 EXIF 를 서버에서 읽어
+        준다. 업로드 경로가 바이트를 안 읽고도 촬영일을 채울 수 있는 길.
+      * ``size``/``ctype``/``etag`` — 스트리밍 프록시의 조건부 응답용.
+
+    없으면 ``None``. 실패는 OneDriveError.
+    """
+    if not item_id:
+        return None
+    if not refresh:
+        hit = _meta_cache.get(item_id)
+        if hit and time.time() < hit[1]:
+            return hit[0]
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}?$select={_META_SELECT}",
+            headers=_auth_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise OneDriveError(f"item meta request failed: {e}") from e
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise OneDriveError(f"item meta fetch failed (status={r.status_code})")
+    body = r.json() or {}
+    image = body.get("image") or {}
+    photo = body.get("photo") or {}
+    file_facet = body.get("file") or {}
+    taken = photo.get("takenDateTime")
+    taken_dt = None
+    if taken:
+        try:
+            taken_dt = datetime.fromisoformat(str(taken).replace("Z", "+00:00"))
+            if taken_dt.tzinfo is not None:
+                taken_dt = taken_dt.replace(tzinfo=None)  # 앱 전체가 naive UTC
+        except (TypeError, ValueError):
+            taken_dt = None
+    meta = {
+        "id": body.get("id") or item_id,
+        "name": body.get("name") or "",
+        "size": int(body.get("size") or 0),
+        "ctype": file_facet.get("mimeType") or "",
+        "width": int(image.get("width") or 0) or None,
+        "height": int(image.get("height") or 0) or None,
+        "taken_at": taken_dt,
+        "etag": body.get("eTag") or "",
+    }
+    _put_meta(item_id, meta)
+    return meta
+
+
+def rendition_name(long_edge) -> str:
+    """긴 변이 ``long_edge`` 를 넘지 않는 **비율 유지** 렌디션의 Graph 이름.
+
+    Microsoft 문서: ``c{W}x{H}`` = "Generate a thumbnail that fits inside a
+    WxH pixel box, maintaining aspect ratio". (``_crop`` 접미사는 **채우고
+    잘라낸다** — 우리는 절대 쓰지 않는다. 자르는 위치를 우리가 정해야 하므로.)
+    정사각 박스를 주면 가로·세로 어느 쪽이 길든 그 변이 상한이 된다.
+    """
+    n = max(1, int(long_edge))
+    return f"c{n}x{n}"
+
+
+def get_rendition_meta(item_id: str, spec: str):
+    """렌디션 **메타데이터**(가로·세로·URL) — 바이트는 아직 안 받는다.
+
+    ``{"width":…, "height":…, "url":…}`` 또는 지원 안 함/없음이면 ``None``.
+    이 단계에서 크기를 먼저 알 수 있어, **원하는 해상도가 아니면 바이트를
+    아예 안 받고** 다음 후보로 넘어갈 수 있다.
+    """
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/thumbnails/0/{spec}",
+            headers=_auth_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise OneDriveError(f"rendition meta request failed: {e}") from e
+    # 404 = 아이템이 없거나 이 크기를 못 만든다. 400 = 이름을 거부했다.
+    if r.status_code in (400, 404):
+        return None
+    if r.status_code != 200:
+        raise OneDriveError(f"rendition meta failed (status={r.status_code})")
+    body = r.json() or {}
+    url = body.get("url")
+    w = int(body.get("width") or 0)
+    h = int(body.get("height") or 0)
+    if not url or w <= 0 or h <= 0:
+        return None
+    return {"width": w, "height": h, "url": url}
+
+
+def get_rendition(item_id: str, long_edge, min_long_edge=None,
+                  expect_aspect=None):
+    """Graph 가 **서버에서 렌더한** 다운스케일본 — ``(bytes, ctype, (w, h))``.
+
+    우리 CPU·메모리를 전혀 쓰지 않고 작은 JPEG 를 얻는 길이다. HEIC 원본도
+    Graph 가 알아서 JPEG 로 내준다(브라우저가 못 여는 포맷 문제도 같이 풀린다).
+
+    **주장하지 않고 검증한다** — 돌아온 가로세로를 보고 두 가지를 확인한다:
+
+      * 비율이 원본과 같은가 (``expect_aspect``, 없으면 ``image`` 패싯에서).
+        어긋나면 ``None`` — 문서를 잘못 읽었거나 서비스가 바뀌어도 **잘린
+        그림을 조용히 내보내지 않는다.**
+      * 긴 변이 ``min_long_edge`` 이상인가. Graph 는 "요청한 크기와 정확히
+        같지 않을 수 있다"고 명시하고 **상한이 문서화돼 있지 않다** — 그래서
+        한도는 추측하지 않고 *돌아온 값으로* 안다. 모자라면 ``None`` 을
+        돌려주고, 호출부가 더 큰 후보나 원본으로 간다.
+
+    못 쓰면 ``None``(예외 아님 — 폴백이 정상 경로다).
+    """
+    spec = rendition_name(long_edge)
+    try:
+        meta = get_rendition_meta(item_id, spec)
+    except OneDriveError:
+        log.warning("렌디션 메타 조회 실패 (item=%s spec=%s)", item_id, spec,
+                    exc_info=True)
+        return None
+    if not meta:
+        return None
+    w, h = meta["width"], meta["height"]
+
+    want = expect_aspect
+    if want is None:
+        try:
+            im = get_item_meta(item_id)
+        except OneDriveError:
+            im = None
+        if im and im.get("width") and im.get("height"):
+            a = im["width"] / im["height"]
+            # ``image`` 패싯은 EXIF 회전 전 값일 수 있다 — 세로/가로 어느 쪽이든
+            # 같은 '비율 쌍'으로 보고 둘 다 허용한다(회전만 다른 것은 정상).
+            want = (a, 1.0 / a) if a else None
+        else:
+            want = None
+    elif not isinstance(want, tuple):
+        want = (float(want), 1.0 / float(want))
+
+    if want:
+        got = w / h
+        if not any(abs(got / cand - 1.0) <= _RENDITION_ASPECT_TOL
+                   for cand in want if cand):
+            log.warning(
+                "렌디션 비율이 원본과 다르다 — 쓰지 않는다 "
+                "(item=%s spec=%s got=%sx%s)", item_id, spec, w, h,
+            )
+            return None
+
+    if min_long_edge and max(w, h) < int(min_long_edge):
+        return None
+
+    try:
+        # 렌디션 URL 은 이미 인증된 CDN 링크다 — Bearer 를 붙이지 않는다.
+        ir = requests.get(meta["url"], timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        raise OneDriveError(f"rendition fetch failed: {e}") from e
+    if ir.status_code != 200:
+        raise OneDriveError(f"rendition fetch failed (status={ir.status_code})")
+    return ir.content, (ir.headers.get("Content-Type") or "image/jpeg"), (w, h)
+
+
+def probe_renditions(item_id: str, long_edges=None):
+    """**실측 도구**: 이 드라이브가 어느 커스텀 렌디션 크기까지 실제로 내주는가.
+
+    Microsoft 문서는 ``c{W}x{H}`` 의 **상한을 적어 두지 않았고**, "요청한 것보다
+    크거나 작은 것이 올 수 있다"고만 말한다. 그러니 한도는 **재서** 안다.
+    운영 환경에서 ``tools/probe_graph_renditions.py`` 로 한 번 돌리면 된다.
+
+    ⚠️ 반환값에 **URL 을 절대 담지 않는다** — pre-auth CDN 링크는 그 자체가
+    자격증명이다(``probe_direct_cors`` 와 같은 규율).
+
+    반환: ``{"original": {w,h,size}, "renditions": [{spec, ok, width, height,
+    bytes, aspect_ok}, …]}``
+    """
+    edges = list(long_edges or (800, 1280, 1600, 1920, 2048, 2560,
+                                3200, 4096, 8192, 16384))
+    meta = get_item_meta(item_id, refresh=True)
+    out = {
+        "original": {
+            "width": (meta or {}).get("width"),
+            "height": (meta or {}).get("height"),
+            "size": (meta or {}).get("size"),
+        },
+        "renditions": [],
+    }
+    oa = None
+    if meta and meta.get("width") and meta.get("height"):
+        oa = meta["width"] / meta["height"]
+    for e in edges:
+        spec = rendition_name(e)
+        row = {"spec": spec, "ok": False, "width": None, "height": None,
+               "bytes": None, "aspect_ok": None}
+        try:
+            rm = get_rendition_meta(item_id, spec)
+        except OneDriveError as err:
+            row["error"] = str(err)[:120]
+            out["renditions"].append(row)
+            continue
+        if not rm:
+            out["renditions"].append(row)
+            continue
+        row.update(ok=True, width=rm["width"], height=rm["height"])
+        if oa:
+            got = rm["width"] / rm["height"]
+            row["aspect_ok"] = (abs(got / oa - 1) <= _RENDITION_ASPECT_TOL
+                                or abs(got * oa - 1) <= _RENDITION_ASPECT_TOL)
+        try:
+            ir = requests.get(rm["url"], timeout=HTTP_TIMEOUT)
+            row["bytes"] = len(ir.content) if ir.status_code == 200 else None
+        except requests.RequestException:
+            pass
+        out["renditions"].append(row)
+    return out
 
 
 def delete_photo(item_id: str):
