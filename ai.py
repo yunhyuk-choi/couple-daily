@@ -491,27 +491,48 @@ def _normalize_crop_box(data):
     return [x, y, w, h]
 
 
-def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg"):
+def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg",
+                 image_url=None):
     """사진에서 '이 단락이 말하는 대상'이 담긴 가장 중요한 영역의 정규화 바운딩박스.
 
-    캡셔너와 '똑같은' 방식(임시파일 + ``claude -p`` 비전)으로 이미지를 claude에
-    보여주고, 랜드스케이프 크롭이 전경에 둬야 할 핵심 영역 [x,y,w,h](0..1, 폭/높이
-    기준)를 strict JSON으로 받는다. ``subject_hint``는 해당 섹션의 소제목+본문 일부
-    (무엇에 관한 단락인지)다. 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함).
+    돌려주는 박스는 **0~1 정규화 좌표**다 — 해상도와 무관하다. 그래서 claude 에게
+    보여 주는 그림은 **원본일 필요가 전혀 없다**: 작은 다운스케일본으로 '어디를
+    남길지'만 정하면, 실제 크롭은 나중에 **원본 픽셀에서** 이뤄진다(브라우저 Canvas).
+    호출부는 Graph 렌디션(수백 KB)을 넘긴다 — 예전엔 3MB 원본을 넘겼다.
+
+    이미지를 claude 에게 보여 주는 길은 둘이다:
+
+      * ``image_url`` — 만료 있는 **서명 URL**. ``claude -p --allowedTools
+        WebFetch Read`` 가 그 URL 을 받아 자기 쪽에 내려받고 Read 로 픽셀을 본다.
+        우리 파이썬 프로세스는 바이트를 **한 번도 안 만진다.**
+        ⚠️ 실측(2026-10-07): 된다. 다만 WebFetch 왕복이 붙어 **한 장에 30~33초**가
+        더 든다(사진 N장이면 N배). 그리고 큰 이미지(10MB JPEG)에서는 WebFetch 가
+        픽셀 대신 텍스트로 변환해 **실패**했다 — 작은 렌디션에서만 믿을 수 있다.
+      * ``image_bytes`` — 임시파일에 떨구고 ``Read`` 로 보여 준다(기본). 렌디션이면
+        디스크·메모리 모두 수백 KB다.
+
+    ``subject_hint``는 해당 섹션의 소제목+본문 일부(무엇에 관한 단락인지)다.
+    어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함).
 
     동시성: 호출부(백그라운드 워커)가 캡션과 '같은' _CAPTION_SEM으로 직렬화한다 —
     여기서는 세마포어를 잡지 않는다(_run_claude에도 추가하지 않는다).
     ``target_aspect``는 프롬프트 참고용 힌트로만 넘긴다(강제 비율은 결정론적
     ``compute_crop_rect``가 처리).
     """
-    if not image_bytes:
+    if not image_bytes and not image_url:
         return None
     tmp_path = None
     try:
-        suffix = ext if ext in _CROP_IMAGE_EXTS else ".jpg"
-        fd, tmp_path = tempfile.mkstemp(prefix="cd_crop_", suffix=suffix)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(image_bytes)
+        if image_url:
+            where = f"다음 URL 의 이미지를 WebFetch 로 받아서 실제로 보고: {image_url}"
+            tools_web = True
+        else:
+            suffix = ext if ext in _CROP_IMAGE_EXTS else ".jpg"
+            fd, tmp_path = tempfile.mkstemp(prefix="cd_crop_", suffix=suffix)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(image_bytes)
+            where = f"다음 경로의 이미지 파일을 읽어서 실제로 보고: {tmp_path}"
+            tools_web = False
 
         hint = (subject_hint or "").strip()[:400] or "(설명 없음)"
         try:
@@ -519,7 +540,7 @@ def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg"):
         except (TypeError, ValueError):
             aspect_txt = "1.333"
         prompt = (
-            f"다음 경로의 이미지 파일을 읽어서 실제로 보고 답해줘: {tmp_path}\n\n"
+            f"{where} 답해줘.\n\n"
             "너는 블로그 후기 사진을 가로형(landscape)으로 자를 때 '무엇을 반드시 "
             "남길지'를 정하는 도우미야. 이 사진이 실릴 단락은 아래 내용에 관한 거야:\n"
             f"[단락 주제] {hint}\n\n"
@@ -538,7 +559,7 @@ def suggest_crop(image_bytes, subject_hint, target_aspect, ext=".jpg"):
             "출력은 반드시 JSON 객체 하나만, 다른 텍스트/설명/코드펜스 없이:\n"
             '{"x": 0.12, "y": 0.05, "w": 0.55, "h": 0.42}'
         )
-        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT)
+        raw = _run_claude(prompt, timeout=CAPTION_TIMEOUT, allow_web=tools_web)
         data = _extract_json(raw)
         return _normalize_crop_box(data)
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise

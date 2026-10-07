@@ -613,6 +613,12 @@
    setDocumentData로 네이티브 문서를 조립할 때 쓴다. #}
 <script type="application/json" id="cd-doc-data">{{ doc_data | tojson }}</script>
 {% endif %}
+{% if export_images %}
+{# 발행용 재료 — 사진마다 (매칭 키 src · **자르지 않은 원본** url · 크롭 좌표).
+   📤 를 누르면 브라우저가 원본을 받아 Canvas 로 자른다(서버는 픽셀을 안 만진다). #}
+<script type="application/json" id="cd-export-images">{{ export_images | tojson }}</script>
+<script src="{{ url_for('static', filename='imagecrop.js') }}" defer></script>
+{% endif %}
 <div class="copy-toast" id="copy-toast" hidden>복사됨!</div>
 
 <script>
@@ -736,7 +742,29 @@
     });
   }
 
-  // 미리보기 HTML + 각 <img> 바이트(data URI)를 담은 페이로드를 만든다.
+  // 미리보기 사진 로딩 힌트 — **HTML 문자열이 아니라 DOM 에만** 붙인다.
+  // (copy_html 은 네이버에 그대로 붙여넣는 본문이라 우리 최적화 속성을 섞지 않는다.)
+  // 첫 장은 즉시(eager+high) 받아 첫 화면이 비어 보이지 않게 하고, 나머지는 lazy 다.
+  try {
+    var pvImgs = box.querySelectorAll('img');
+    Array.prototype.forEach.call(pvImgs, function (im, i) {
+      im.setAttribute('decoding', 'async');
+      if (i === 0) {
+        im.setAttribute('loading', 'eager');
+        try { im.fetchPriority = 'high'; } catch (e) {}
+      } else {
+        im.setAttribute('loading', 'lazy');
+      }
+    });
+  } catch (e) {}
+
+  // 미리보기 HTML + 각 이미지 바이트(data URI)를 담은 페이로드를 만든다.
+  //
+  // ⛔ 발행용 크롭은 **여기(브라우저)에서** 굽는다 — 서버는 픽셀을 만지지 않는다.
+  //    `v=orig` 로 **자르지 않은 원본**을 받아 Canvas 로 자르므로 결과 화질은
+  //    원본 픽셀 그대로다(서버가 1280 다운스케일본에서 자르던 것보다 낫다).
+  //    한 장씩 순차로 처리해 폰 메모리를 지키고, 진행률을 토스트로 보여 준다
+  //    (썸네일·GIF 가 쓰는 패턴과 같다). 자세한 규율은 static/imagecrop.js 머리말.
   function buildExportPayload() {
     var copyHtml = box.innerHTML;
     // 정식 삽입용 구조화 데이터(있으면) — 북마클릿이 setDocumentData로 조립할 재료.
@@ -745,39 +773,41 @@
       var docEl = document.getElementById('cd-doc-data');
       if (docEl) doc = JSON.parse(docEl.textContent || 'null');
     } catch (e) { doc = null; }
-    var imgs = box.querySelectorAll('img');
-    var jobs = [];
-    var seen = {};
-    Array.prototype.forEach.call(imgs, function (im) {
-      var src = im.getAttribute('src') || '';   // copy_html에 나타난 그대로의 src
-      if (!src || seen[src]) return;
-      seen[src] = true;
-      // 바이트는 hq(원본 해상도)로 가져온다 — 네이버엔 고화질이 붙게. 단, payload의
-      // src 필드는 원본 서명 URL(hq 없음) 그대로 둔다(북마클릿 키/순서 불변). hq는
-      // 서명 대상이 아니라 서명된 URL에 &hq=1을 덧붙여도 통과한다.
-      var hqSrc = src + (src.indexOf('?') === -1 ? '?' : '&') + 'hq=1';
-      // 우리 앱의 same-origin /blog-img — CORS 불필요.
-      jobs.push(
-        fetch(hqSrc, { credentials: 'same-origin' })
-          .then(function (r) {
-            if (!r.ok) throw new Error('img fetch ' + r.status);
-            return r.blob();
-          })
-          .then(blobToDataUri)
-          .then(function (dataUri) { return { src: src, dataUri: dataUri }; })
-      );
-    });
-    return Promise.all(jobs).then(function (images) {
-      return { copy_html: copyHtml, images: images, doc: doc };
-    });
-  }
 
-  function blobToDataUri(blob) {
-    return new Promise(function (resolve, reject) {
-      var fr = new FileReader();
-      fr.onload = function () { resolve(fr.result); };
-      fr.onerror = function () { reject(fr.error || new Error('read fail')); };
-      fr.readAsDataURL(blob);
+    // 서버가 내려준 (src, 원본 URL, 크롭) 목록 — 블록 순서 그대로.
+    var specs = [];
+    try {
+      var exEl = document.getElementById('cd-export-images');
+      if (exEl) specs = JSON.parse(exEl.textContent || '[]') || [];
+    } catch (e) { specs = []; }
+    if (!specs.length) {
+      // 폴백: 구조화 데이터가 없는 옛 후기 — 미리보기의 <img> 를 그대로 쓴다
+      // (이미 서버가 잘라 준 std 바이트. 화질은 1280px 미리보기 수준).
+      var seen = {};
+      Array.prototype.forEach.call(box.querySelectorAll('img'), function (im) {
+        var src = im.getAttribute('src') || '';
+        if (!src || seen[src]) return;
+        seen[src] = true;
+        specs.push({ src: src, url: src, crop: null });
+      });
+    }
+    if (!specs.length) {
+      return Promise.resolve({ copy_html: copyHtml, images: [], doc: doc });
+    }
+
+    var IC = window.cdImageCrop;
+    return IC.prepare(specs, function (done, total, phase) {
+      var label = phase === 'crop' ? '자르는 중' : '사진 받는 중';
+      showToast(label + '… ' + Math.min(done + 1, total) + '/' + total);
+    }).then(function (results) {
+      return Promise.all(results.map(function (r) {
+        return IC.blobToDataUri(r.blob);
+      }));
+    }).then(function (uris) {
+      var images = uris.map(function (dataUri, i) {
+        return { src: specs[i].src, dataUri: dataUri };
+      });
+      return { copy_html: copyHtml, images: images, doc: doc };
     });
   }
 })();
