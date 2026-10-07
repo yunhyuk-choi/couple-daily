@@ -252,6 +252,27 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding blog_reviews.%s", col
                     )
+
+        # 8) ai_jobs 진척 칸 — '아직도 작성중'을 사람이 읽을 수 있게 하는 세 칸.
+        #    ai_jobs 는 직전 배포에서 brand-new 로 만들어졌으므로 **이미 존재하는**
+        #    테이블이다(create_all 은 ALTER 를 안 한다). 그래서 여기서 붙인다.
+        if "ai_jobs" in insp.get_table_names():
+            jcols = {c["name"] for c in insp.get_columns("ai_jobs")}
+            for col, ddl in (
+                ("step", "VARCHAR(60)"),
+                ("step_index", "INTEGER"),
+                ("step_total", "INTEGER"),
+            ):
+                if col in jcols:
+                    continue
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE ai_jobs ADD COLUMN {col} {ddl}")
+                        )
+                    log.info("startup migration: added ai_jobs.%s", col)
+                except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                    log.exception("startup migration: failed adding ai_jobs.%s", col)
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -572,6 +593,17 @@ class AiJob(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     started_at = db.Column(db.DateTime, nullable=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    # ---- 진척 — **일하는 쪽이 자기 진척을 적는다** --------------------------
+    # status/started_at 만으로는 사람이 '죽었나 도는 중인가'를 구분할 수 없다.
+    # 후기 한 건은 claude 콜이 3+N 번이고 한 콜이 수십 초~수 분이라, 그 사이 화면은
+    # 아무 변화도 보지 못한다. 그래서 **claude 콜 사이에** 이 세 칸을 갱신한다 —
+    # "4/8단계 (본문 쓰는 중)" 한 줄이면 '살아 있다'는 증거가 된다.
+    # ⚠️ 시간으로 혼자 올라가는 가짜 진행률이 아니다. 일이 실제로 다음 단계로
+    #    넘어갈 때만 바뀌고, 안 바뀌면 안 바뀐 채로 보인다(그게 정보다).
+    step = db.Column(db.String(60), nullable=True)      # 사람이 읽는 단계 이름
+    step_index = db.Column(db.Integer, nullable=True)   # 1-based
+    step_total = db.Column(db.Integer, nullable=True)   # 계획된 단계 수(추정 포함)
 
 
 class PhotoPreview(db.Model):

@@ -2574,6 +2574,225 @@ def resume_review_if_failed(app_obj, review):
     return True
 
 
+# --------------------------------------------------------------------------- #
+# '작성중' 한 줄을 사람이 구분할 수 있는 **다섯 상태**로 펼친다
+# --------------------------------------------------------------------------- #
+# 2026-10-07 사고의 남은 절반: 큐 행(``ai_jobs``)은 필요한 걸 이미 다 갖고 있었는데
+# (status·owner·attempts·created_at·started_at) **그걸 화면에 꺼내는 길이 없었다.**
+# 사용자가 본 것은 "AI가 블로그 초안을 쓰고 있어요…" 하나뿐이었고, 그래서
+# "오래 걸리는 건지 죽은 건지" 알 수 없었다.
+#
+# 여기서 구분해 말하는 다섯:
+#   1. queued   — 아직 내 차례가 아니다 (앞에 몇 개)
+#   2. running  — 지금 돌고 있다 (몇 분째 · 몇/몇 단계 · 무슨 단계)
+#   3. running(오래) — 오래 걸리지만 정상 범위다 (예상 범위를 같이 말한다)
+#   4. overdue / attempts — 비정상이다 (탈출구 ↻)
+#   5. stalled  — 줄에는 섰는데 **아무도 집어가지 않는다** (펌프가 안 돈다)
+#
+# ⛔ 가짜 진행률을 만들지 않는다. 숫자는 전부 **일하는 쪽이 적은 것**(step/step_index)
+#    이거나 **DB 가 아는 사실**(ahead·attempts·started_at)이고, 추정은 추정이라고 쓴다.
+
+# 큐에 서 있는데 아무도 'running' 이 아닌 채 이만큼 지나면 '집어갈 사람이 없다'로 본다.
+# 펌프는 빈 큐에서도 ``aijobs.POLL_SEC``(2초)마다 한 바퀴 돈다 — 90초면 넉넉하다.
+_QUEUE_STALL = timedelta(seconds=90)
+
+
+def _review_eta(n_photos):
+    """이 후기 한 건의 (claude 콜 수, '느려도 정상'인 최대 분).
+
+    근거는 상한 상수들뿐이다 — 조사 2 + 본문 1 = 3 × ``ai.CLAUDE_TIMEOUT``,
+    사진마다 비전 1 × ``ai.CAPTION_TIMEOUT``. **추정이지 약속이 아니다.**
+    """
+    calls = 3 + max(0, int(n_photos))
+    worst_sec = 3 * ai.CLAUDE_TIMEOUT + max(0, int(n_photos)) * ai.CAPTION_TIMEOUT
+    return calls, max(1, int(round(worst_sec / 60.0)))
+
+
+def _pump_looks_stalled(snap, pump, now):
+    """'줄에 있는데 아무도 집어가지 않는다'인가 — 두 신호를 **같이** 본다.
+
+    * 프로세스 안쪽 사실: 펌프 스레드가 죽었거나, 아무 잡도 안 쥔 채 오래 조용하다.
+      (잡을 쥐고 있으면 조용한 게 정상이다 — 한 잡이 21분까지 간다.)
+    * DB 쪽 사실: 오래 queued 인데 **running 인 행이 하나도 없다**. 펌프가 이
+      프로세스 밖에 있는 배치에서도 성립하는 신호다.
+    """
+    if not pump["alive"]:
+        return True
+    silent = pump["silent_sec"]
+    if (pump["current_key"] is None and silent is not None
+            and silent > aijobs.PUMP_SILENT_SEC):
+        return True
+    waited = now - (snap["created_at"] or now)
+    return waited >= _QUEUE_STALL and not aijobs.anyone_running()
+
+
+def review_progress_view(app_obj, review, resumed=False):
+    """후기 초안 생성의 지금 상태를 **사람의 문장**으로 만든다 (단일 원천).
+
+    템플릿(첫 렌더)과 폴링 JSON 이 **같은 이 함수**를 쓴다 — 두 곳에서 따로 쓰면
+    말이 갈라진다. 절대 raise 하지 않는다(상태 표시가 페이지를 깨뜨리면 본말전도).
+    """
+    thumb = review.thumbnail or {}
+    thumb_pending = (thumb.get("status") == "pending")
+    out = {
+        "status": review.status,
+        "done": False,          # 아래에서 확정한다
+        "state": review.status,
+        "headline": "",
+        "hint": "",
+        "retry": False,
+        "ahead": None,
+        "elapsed_min": None,
+        "step": None,
+        "step_index": None,
+        "step_total": None,
+        "attempts": None,
+    }
+    snap = aijobs.snapshot(f"review:{review.id}")
+    if snap:
+        out["attempts"] = snap["attempts"]
+        out["step"] = snap["step"]
+        out["step_index"] = snap["step_index"]
+        out["step_total"] = snap["step_total"]
+    # done = 더 기다릴 게 없다 → 화면을 한 번 새로 그리면 끝.
+    # ⚠️ 'ready' 라고 끝난 게 아니다 — 파이프라인은 **본문을 크롭 전에 먼저 커밋**
+    #    한다(거기서 죽어도 쓸 수 있는 초안이 남게). 그래서 초안이 떠도 사진 크롭은
+    #    아직 돌고 있을 수 있고, 그게 가장 긴 구간이다. 큐 행이 사라져야 진짜 끝이다.
+    out["done"] = (
+        review.status != "pending" and not thumb_pending and snap is None
+    )
+
+    if review.status != "pending":
+        if snap is not None:
+            # 초안은 떴고 사진 크롭만 남았다 — 그림이 한 번 더 바뀐다고 미리 말한다.
+            out["state"] = "finishing"
+            label = snap["step"] or "마무리하는 중"
+            out["headline"] = f"✨ {label} — 다 되면 사진이 한 번 더 바뀔 거야."
+        return out
+
+    now = datetime.utcnow()
+    limit_min = int(_STUCK_REVIEW.total_seconds() // 60)
+    try:
+        n_photos = len(review.photos_ordered)
+    except Exception:  # noqa: BLE001
+        n_photos = 0
+    calls, worst_min = _review_eta(n_photos)
+    how_many = (
+        f"사진 {n_photos}장이면 claude 를 {calls}번 불러"
+        if n_photos else f"사진이 없으니 claude 를 {calls}번 불러"
+    )
+    base_hint = (
+        f"{how_many} — 서버가 느려서 보통 3분쯤, 느릴 땐 {worst_min}분까지도 "
+        f"정상이야(추정이야). {limit_min}분을 넘기면 중단된 걸로 보고 알려줄게."
+    )
+    out["hint"] = base_hint
+
+    def _mins(since):
+        return max(0, int((now - (since or now)).total_seconds() // 60))
+
+    if resumed:
+        out["state"] = "resumed"
+        out["headline"] = "↻ 생성이 중단된 것 같아 방금 다시 시작했어 — 조금만 기다려줘!"
+        out["retry"] = True
+    elif snap is None:
+        # 큐에 행이 없다 — 막 세우는 중이거나(인프로세스 가드만 쥔 찰나), 되살리지
+        # 못한 경우다. 진척을 적을 행이 없으니 **단계는 모른다고 말한다.**
+        verdict = review_pending_verdict(review)
+        m = _mins(review.updated_at)
+        out["elapsed_min"] = m
+        if verdict == "overdue":
+            out["state"] = "overdue"
+            out["headline"] = (
+                f"⏳ {m}분째인데 {limit_min}분 상한을 넘겼어 — 중단된 것 같아. "
+                "다시 시도해줄래?"
+            )
+            out["retry"] = True
+        elif verdict == "orphaned":
+            # resume 이 실패했을 때만 여기 온다(보통은 위 resumed 가 잡는다).
+            out["state"] = "orphaned"
+            out["headline"] = "⏳ 만들던 게 사라진 것 같아 — 다시 시도해줄래?"
+            out["retry"] = True
+        elif m == 0:
+            out["state"] = "starting"
+            out["headline"] = "✨ AI가 블로그 초안을 쓰고 있어 — 방금 시작했어."
+        else:
+            out["state"] = "running"
+            out["headline"] = (
+                f"✨ AI가 블로그 초안을 쓰고 있어 — {m}분째. "
+                "(어느 단계인지는 아직 안 적혔어)"
+            )
+    elif snap["status"] == "running":
+        m = _mins(snap["started_at"] or review.updated_at)
+        out["elapsed_min"] = m
+        i, t, label = snap["step_index"], snap["step_total"], snap["step"]
+        if i and t:
+            where = f"{i}/{t}단계" + (f" ({label})" if label else "")
+        elif label:
+            where = label
+        else:
+            where = "아직 어느 단계인지 안 적혔어"
+        when = "방금 시작했어" if m == 0 else f"{m}분째"
+        if m >= limit_min:
+            out["state"] = "overdue"
+            out["headline"] = (
+                f"⏳ {m}분째야 — {limit_min}분 상한을 넘겼어. 중단된 것 같아, "
+                "다시 시도해줄래?"
+            )
+            out["retry"] = True
+        elif m >= 5:
+            # 3번 상태: 오래 걸리지만 정상이다. 불안하지 않게 범위를 같이 말한다.
+            out["state"] = "running_long"
+            out["headline"] = (
+                f"✨ 오래 걸리고 있지만 아직 정상 범위야 — {when} · {where}"
+            )
+        else:
+            out["state"] = "running"
+            out["headline"] = f"✨ 지금 쓰고 있어 — {when} · {where}"
+    else:  # queued
+        m = _mins(snap["created_at"])
+        out["elapsed_min"] = m
+        out["ahead"] = snap["ahead"]
+        pump = aijobs.pump_status()
+        if _pump_looks_stalled(snap, pump, now):
+            out["state"] = "stalled"
+            # 안 돌고 있을 때**만** 깨우고, 깨웠을 때**만** 깨웠다고 말한다 —
+            # 이미 살아 있는데 "방금 깨웠어"라고 하면 그건 거짓말이다.
+            woke = False
+            if not pump["alive"]:
+                try:
+                    woke = aijobs.start_pump(app_obj) is not None
+                except Exception:  # noqa: BLE001 — 깨우기가 페이지를 깨뜨리지 않게
+                    log.exception("큐 펌프 재기동 실패")
+            out["headline"] = (
+                f"🚧 줄에는 서 있는데 {m}분째 아무도 집어가질 않아 — "
+                "일꾼(작업 큐)이 멈춘 것 같아."
+                + (" 방금 다시 깨웠어." if woke else "")
+            )
+            out["hint"] = (
+                "조금 기다려도 안 바뀌면 ↻ 로 다시 넣어줘. "
+                "그래도 그대로면 서버가 뜨지 않은 거야."
+            )
+            out["retry"] = True
+        elif snap["ahead"]:
+            out["state"] = "queued"
+            out["headline"] = (
+                f"⏳ 아직 내 차례가 아니야 — 앞에 {snap['ahead']}개가 먼저야."
+            )
+            out["hint"] = "앞 작업이 끝나면 바로 시작해. " + base_hint
+        else:
+            out["state"] = "queued"
+            out["headline"] = "⏳ 줄 맨 앞이야 — 곧 시작해."
+
+    # 재시도가 쌓였으면 그대로 말한다 — '정상인데 느린 것'과 섞이면 안 된다.
+    if (out["attempts"] or 0) >= 2 and out["state"] not in ("overdue", "stalled"):
+        out["hint"] = (
+            f"이 작업은 벌써 {out['attempts']}번째 시도야 — 계속 실패하는 중일 수 "
+            "있어. 안 끝나면 ↻ 로 다시 돌려줘. " + out["hint"]
+        )
+        out["retry"] = True
+    return out
+
+
 def _crop_hint_for_image(blocks, idx):
     """image 블록(blocks[idx]) 주변에서 크롭 힌트(그 사진이 말하는 대상)를 뽑는다.
 
@@ -2690,7 +2909,7 @@ def _crop_vision_url(photo):
     return f"{base}/blog-img/{photo.id}?e={exp}&t={sig}&v={variant}"
 
 
-def _attach_section_crops(result, photos_ordered, acquire_sem=True):
+def _attach_section_crops(result, photos_ordered, acquire_sem=True, on_step=None):
     """result['blocks']의 각 image 블록에 정규화 크롭 [x,y,w,h]를 채운다(내용 인지).
 
     ⛔ **원본 바이트를 받지 않는다.** 크롭 박스는 0~1 정규화 좌표라 **해상도와
@@ -2710,6 +2929,11 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True):
     ``acquire_sem`` — 비전 콜마다 ``_CAPTION_SEM`` 을 쥘 것인가. 후기 파이프라인은
     **이미 바깥에서 쥔 채** 부르므로 False 다(같은 스레드가 Semaphore(1) 을 두 번
     잡으면 영원히 멈춘다). 단독 호출(재크롭 등)에서는 True 가 맞다.
+
+    ``on_step(done, total)`` — 선택. 사진 한 장의 비전 콜에 **들어가기 직전** 불린다
+    (1-based ``done``, 실제 image 블록 수 ``total``). 이 구간이 파이프라인에서 가장
+    길다(사진당 최대 ``ai.CAPTION_TIMEOUT``) — 여기서 아무 소식이 없으면 사람은
+    죽은 줄 안다. 콜백이 터져도 크롭은 그대로 간다.
     """
     if not result or not isinstance(result, dict):
         return
@@ -2718,6 +2942,15 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True):
     blocks = result.get("blocks")
     if not isinstance(blocks, list):
         return
+    # 실제로 비전 콜이 붙는 블록 수 — '사진 3/5' 의 분모다. 사진 개수가 아니라
+    # **본문이 실제로 쓴 image 블록 수**여야 숫자가 정직하다.
+    total_imgs = sum(
+        1 for b in blocks
+        if isinstance(b, dict) and b.get("type") == "image"
+        and isinstance(b.get("photo_index"), int)
+        and 0 <= b["photo_index"] < n
+    )
+    done_imgs = 0
     for i, blk in enumerate(blocks):
         try:
             if not isinstance(blk, dict) or blk.get("type") != "image":
@@ -2726,6 +2959,12 @@ def _attach_section_crops(result, photos_ordered, acquire_sem=True):
             if not isinstance(pi, int) or pi < 0 or pi >= n:
                 continue
             p = photos_ordered[pi]
+            done_imgs += 1
+            if on_step is not None:
+                try:
+                    on_step(done_imgs, total_imgs)
+                except Exception:  # noqa: BLE001 — 진척 보고가 크롭을 깨뜨리지 않게
+                    log.debug("crop on_step 실패", exc_info=True)
             dims = _crop_vision_dims(p)   # 픽셀 0바이트
             if not dims:
                 continue  # 크기를 못 알아냄 → 크롭 없이(서빙은 다운스케일만)
@@ -2784,6 +3023,46 @@ def _naver_credentials_for(review):
     return (None, None), ""
 
 
+class _JobProgress:
+    """한 작업이 **자기 진척을 적는** 작은 리포터 (큐 행의 step/step_index/step_total).
+
+    왜 작업이 직접 적나 — 진행 단계는 **일하는 쪽만 안다.** 바깥에서 시간을 보고
+    추측하면 그건 가짜 진행률이고, 멈춘 작업도 계속 올라간다. 그래서 claude 콜과
+    콜 사이에 이 리포터를 한 번씩 부른다. 안 부르면 숫자가 안 바뀌고, **안 바뀌는
+    것 자체가 정보**다(그 단계에서 오래 걸리고 있다는 뜻).
+
+    ``total`` 은 **계획**이라 추정이 섞인다(본문이 사진을 몇 장이나 쓸지는 쓰기
+    전엔 모른다). 실제 수가 밝혀지면 ``retotal`` 로 분모를 고친다 — 분자가 분모를
+    넘는 거짓말은 하지 않는다.
+    """
+
+    def __init__(self, job_key, total):
+        self.job_key = job_key
+        self.total = max(1, int(total or 1))
+        self.index = 0
+
+    def retotal(self, total):
+        """실제 단계 수가 밝혀졌다 — 분모를 고친다(이미 지난 단계보다는 크게)."""
+        try:
+            self.total = max(self.index, int(total))
+        except (TypeError, ValueError):
+            pass
+
+    def step(self, label):
+        """다음 단계에 **들어가기 직전** 호출. 절대 raise 하지 않는다."""
+        self.index += 1
+        if self.index > self.total:
+            self.total = self.index   # 계획보다 길어졌으면 분모를 늘린다
+        aijobs.progress(self.job_key, label, self.index, self.total)
+
+    def note(self, label):
+        """단계는 안 넘기고 **지금 뭘 하는지만** 바꾼다(예: 세마포어 대기).
+
+        단계 밖의 대기도 사람에겐 '멈춘 것'으로 보이므로 이름을 붙여 준다.
+        """
+        aijobs.progress(self.job_key, label)
+
+
 def generate_review(app, review_id):
     """백그라운드 워커: 한 BlogReview의 네이버 블로그 초안을 생성한다.
 
@@ -2825,6 +3104,20 @@ def generate_review(app, review_id):
                 # 메모에 남는다). 아무도 안 넣었으면 조사는 그냥 꺼진다.
                 creds, key_owner = _naver_credentials_for(review)
 
+                # ---- 진척 계획 — 화면이 "4/8단계"를 말할 수 있게 ----------
+                # 이 파이프라인의 단계는 **claude 를 부르는 횟수**가 아니라 사람이
+                # 기다리는 구간이다: 조사 3(키가 있을 때만) + 본문 1 + 사진당 1.
+                # 사진 수는 **계획 시점의 추정**이다(본문이 실제로 몇 장을 쓸지는
+                # 쓰기 전엔 모른다) — 실제 수가 나오면 분모를 고친다.
+                research_on = bool(
+                    (creds[0] or "").strip() and (creds[1] or "").strip()
+                )
+                prog = _JobProgress(
+                    f"review:{review_id}",
+                    (len(keyword_research.STEPS) if research_on else 0)
+                    + 1 + len(photos_ordered_list),
+                )
+
                 # ⛔ **세마포어 하나 · claude 프로세스 하나로 파이프라인 전체를 덮는다.**
                 #
                 # 세마포어: 캡션·채점·추천과 '같은' 문이다(512MB 한 칸에 claude 가
@@ -2841,6 +3134,11 @@ def generate_review(app, review_id):
                 # ⚠️ 블록 안에서는 ``_CAPTION_SEM`` 을 **다시 잡지 않는다** — 같은
                 # 스레드가 Semaphore(1) 을 두 번 잡으면 영원히 멈춘다. 그래서
                 # ``_attach_section_crops(acquire_sem=False)`` 다.
+                #
+                # 이 문 앞에서 기다리는 시간도 사람에겐 '멈춘 것'으로 보인다 —
+                # 큐 밖 claude 경로(오늘의 질문·크론 선채점)가 쥐고 있으면 여기서
+                # 한참 선다. 그래서 들어가기 전에 이름을 붙여 둔다.
+                prog.note("claude 차례 기다리는 중")
                 _CAPTION_SEM.acquire()
                 try:
                     with ai.claude_session():
@@ -2851,13 +3149,14 @@ def generate_review(app, review_id):
                             research = keyword_research.research(
                                 topic, location, prose, overall, details,
                                 client_id=creds[0], client_secret=creds[1],
-                                key_owner=key_owner,
+                                key_owner=key_owner, on_step=prog.step,
                             )
                         except Exception:  # noqa: BLE001 — 조사는 best-effort
                             log.exception(
                                 "keyword research raised (review=%s)", review_id
                             )
                             research = {"status": "failed", "reason": "exception"}
+                        prog.step("본문 쓰는 중")
                         try:
                             result = ai.write_review(
                                 topic, location, prose, overall, photos_arg,
@@ -2883,9 +3182,18 @@ def generate_review(app, review_id):
                         # 각 섹션 사진에 '내용 인지' 크롭을 계산해 result에 심는다
                         # (서빙 시 적용). 크롭 실패는 초안 저장을 막지 않는다.
                         if result:
+                            crop_base = prog.index   # 여기까지 소화한 단계 수
+
+                            def _crop_step(done, total, _base=crop_base):
+                                # 본문이 실제로 쓴 사진 수가 여기서 밝혀진다 —
+                                # 추정이었던 분모를 그때 고친다.
+                                prog.retotal(_base + total)
+                                prog.step(f"사진 {done}/{total} 자르는 중")
+
                             try:
                                 _attach_section_crops(
-                                    result, photos_ordered_list, acquire_sem=False
+                                    result, photos_ordered_list, acquire_sem=False,
+                                    on_step=_crop_step,
                                 )
                             except Exception:  # noqa: BLE001 — belt & suspenders
                                 log.exception(
@@ -7635,9 +7943,41 @@ def _register_routes(app: Flask):
             review_resumed=review_resumed,
             thumb_state=thumbnail_pending_verdict(review),
             thumb_resumed=thumb_resumed,
+            # 다섯 상태로 펼친 '지금 무슨 일이 일어나고 있나' — 첫 렌더는 서버가
+            # 그려 두고, 그 뒤 갱신은 /progress JSON 이 **같은 함수**로 만든다.
+            progress=review_progress_view(app_obj, review, resumed=review_resumed),
             # 첫 화면 첫 사진 — <head> 에서 프리로드할 URL(없으면 None → 링크 생략).
             preview_preload=_first_img_src(copy_html),
         )
+
+    @app.route("/reviews/<int:rid>/progress")
+    @active_couple_required
+    def review_progress(rid):
+        """지금 그 초안이 **어디까지 왔나**를 작은 JSON 하나로 돌려준다.
+
+        ⛔ 왜 페이지 새로고침이 아니라 이건가 — 예전엔 'pending' 동안 ``meta
+        refresh`` 가 4초마다 **상세 페이지 전체**를 다시 그렸다. 그 페이지는
+        사진·썸네일·GIF·복사본 HTML 까지 다 세우는 가장 무거운 화면이라, 기다리는
+        동안 가장 비싼 요청을 가장 자주 보내고 있었던 셈이다. 여기서는 후기 행 +
+        큐 행만 보고 수백 바이트를 돌려준다. **프리렌더와 '재진입 네트워크 0'은
+        그대로다** — 이 경로는 그림을 하나도 건드리지 않는다.
+
+        그리고 이 엔드포인트가 **셀프힐 자리**를 그대로 물려받는다(상세 화면이
+        하던 ``resume_*``). 폴링이 페이지 새로고침을 대신하므로, 복구가 '사람이
+        화면을 다시 열어야' 도는 일이 되면 안 된다 (CLAUDE.md: 판정·재개·탈출구).
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+        app_obj = current_app._get_current_object()
+        resumed = resume_review_if_orphaned(app_obj, review)
+        resumed = resume_review_if_failed(app_obj, review) or resumed
+        thumb_resumed = resume_thumbnail_if_orphaned(app_obj, review)
+        view = review_progress_view(app_obj, review, resumed=resumed)
+        view["thumb_pending"] = (review.thumbnail or {}).get("status") == "pending"
+        view["thumb_resumed"] = bool(thumb_resumed)
+        return jsonify(view)
 
     # ---- 네이버 자동 export(v2) ----
     @app.route("/api/naver-export/mark/<int:rid>", methods=["POST"])
