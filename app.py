@@ -3746,13 +3746,17 @@ def _star_bar(score):
     return "★" * full + "⯪" * half + "☆" * empty
 
 
-# --- 감성 후기 v2 인라인 강조 토큰 ------------------------------------------
+# --- 인라인 강조 토큰 (docs/blog-review-spec.md §5.3 가 정본) ----------------
 # AI는 색을 직접 내지 않고 아래 가벼운 토큰으로 '단어만' 감싼다. 빌더가 고정
 # 팔레트의 인라인 <span>으로 바꿔 일관성을 강제한다(AI-slop·색남발 방지).
 #   **굵게**     → <b>            (반드시 * 보다 먼저 파싱)
-#   *핑크*       → 감정·상호·핵심어 (#e64980)
-#   `파랑`       → 가격·주차·시간 등 팩트 (#1c7ed6)
+#   *핑크*       → '무엇' — 상호·메뉴 이름 (#e64980)
+#   `파랑`       → '어디·언제·얼마' — 위치·시간·가격 (#1c7ed6)
 #   ==형광펜==   → 배경 하이라이트 (#ffec99)
+# ⚠️ 색은 둘뿐이다(사용자 지시 '2색정도'). 늘리지 마라 — 늘리면 북마클릿
+# (emphNodes)·테스트(tests/test_review_emphasis.py)와 같이 갈라진다.
+# ⛔ 이 토큰 '지시'가 프롬프트에서 빠져 강조가 통째로 증발한 적이 있다(5a45ead).
+#    변환기만 살아 있으면 소용없다 — prompts/blog-review.md 를 같이 봐라.
 # 항상 escape(구조/스크립트 주입 차단) '먼저' 하고, 그 위에 토큰만 span으로
 # 치환한다. HTML escape는 * ` = 를 건드리지 않으므로 토큰은 그대로 남아 매칭된다.
 # 매칭 안 되는 기호는 이스케이프된 원문 그대로 남는다.
@@ -3846,7 +3850,7 @@ def _review_copy_text(review):
 
     자유형 blocks를 순서대로 평문화한다. 이미지는 네이버에 붙여넣을 수 없으니
     사진 자리에는 ``[사진 N] — 캡션`` 마커를 둔다(사진 순서대로 1부터 번호).
-    강조 토큰은 제거(v2는 애초에 강조를 쓰지 않지만, 옛 후기에는 남아 있다).
+    강조 토큰은 제거한다 — text/plain 에는 서식이 없다(HTML 경로만 span 으로 바꾼다).
 
     v2 스키마는 para/heading/image/quote + 시스템이 붙이는 ratings 하나뿐이다.
     ``info``(요약표)·``faq``(고정 Q&A) 분기는 **옛 후기 호환용으로만** 남겨 둔다 —
@@ -4409,8 +4413,11 @@ def _review_copy_html(review):
     # 1) 제목(가운데). 줄바꿈은 <br>로.
     title = (data.get("title") or "").strip()
     if title:
+        # ⚠️ 제목은 **평문**이다 — 토큰이 섞여 들어오면 벗긴다. 네이티브 발행
+        # (북마클릿 documentTitle)은 doc.title 을 emphNodes 없이 그대로 넣으므로,
+        # 여기서만 서식을 입히면 화면 제목과 실제 글 제목이 갈라진다 (§5.3).
         title_html = "<br>".join(
-            _emph_html(t.strip())
+            esc(_strip_emph(t.strip()))
             for t in title.replace("\r\n", "\n").split("\n") if t.strip()
         )
         out.append(
@@ -4421,7 +4428,7 @@ def _review_copy_html(review):
     # 2) 시스템 헤더 — 실제 방문 날짜 + 핑크 내돈내산 라인(항상, 위치 고정).
     if visit_ymd:
         out.append(
-            # 볼드 금지(v2) — 시스템 헤더도 평문으로.
+            # 시스템 헤더는 평문이다 — 강조는 본문(AI 토큰)에서만 나온다(§5.3).
             f'<p style="text-align:center;margin:2px 0;line-height:2;">'
             f'방문 날짜 : {esc(visit_ymd)}</p>'
         )
@@ -4443,7 +4450,7 @@ def _review_copy_html(review):
             if "방문" in label and ("날짜" in label or "일" in label):
                 continue  # 방문 날짜는 시스템 헤더가 담당 → AI값 무시(중복·지어냄 방지)
             rows.append(
-                # 볼드 금지(v2). info 블록은 이제 생성되지 않고 옛 후기에만 남아 있다.
+                # 시스템 크롬이라 평문. info 블록은 이제 생성되지 않고 옛 후기에만 남아 있다.
                 f'<p style="text-align:center;margin:2px 0;line-height:2;">'
                 f'{esc(label)} : {esc(value)}</p>'
             )
