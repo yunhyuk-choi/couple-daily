@@ -41,7 +41,19 @@
   var SPEC = readJson("rv-gif-spec");
   var STATE = readJson("rv-gif-state") || {};
   var VIDEOS = readJson("rv-gif-videos") || [];
-  if (!SPEC) return;
+  // ⛔ 예전엔 여기서 그냥 ``return`` 했다 — 스펙을 못 읽으면 카드의 모든 버튼이
+  //    **배선조차 되지 않은 채** 아무 말 없이 죽는다(눌러도 무반응). 조용히 죽는
+  //    길을 하나도 남기지 않기로 했으므로, 말하고 죽는다.
+  if (!SPEC) {
+    var s0 = root.querySelector(".rv-gif-status");
+    if (s0) {
+      s0.textContent =
+        "GIF 설정(rv-gif-spec)을 읽지 못해서 이 카드가 동작하지 않아 — 페이지를 새로고침해줘. " +
+        "계속 이러면 서버 쪽 문제야.";
+      s0.className = "rv-gif-status small error";
+    }
+    return;
+  }
 
   var STATE_URL = root.getAttribute("data-state-url");
   var UPLOAD_URL = root.getAttribute("data-upload-url");
@@ -95,6 +107,7 @@
     videoSel: root.querySelector(".rv-gif-video"),
     upload: root.querySelector(".rv-gif-upload"),
     uploadBtn: root.querySelector(".rv-gif-upload-btn"),
+    uploadCancel: root.querySelector(".rv-gif-upload-cancel"),
     del: root.querySelector(".rv-gif-delete"),
     video: root.querySelector(".rv-gif-player"),
     start: root.querySelector(".rv-gif-start"),
@@ -667,7 +680,12 @@
   // 7. 만들기 — 네이티브 → (실패하면) WASM → 인코딩 → **용량 가드**
   // ----------------------------------------------------------------- //
   function make() {
-    if (busy || !current) return;
+    // 눌렀는데 아무 일도 안 일어나는 길을 남기지 않는다 — 두 경우 모두 말한다.
+    if (busy) { say("이미 만드는 중이야 — 끝나면 알려줄게."); return; }
+    if (!current) {
+      say("먼저 영상을 골라줘 (없으면 '＋ 영상 올리기').", "error");
+      return;
+    }
     var s = settings();
     // 원본 해상도는 `<video>` 메타데이터에서 온다 — **네이티브가 실패한 기기에서는
     // 그걸 못 읽는다.** 폴백 경로는 그게 없어도 돈다(ffmpeg 의 `scale=W:-2` 가 높이를
@@ -683,6 +701,12 @@
     invalidate();
     if (el.make) el.make.disabled = true;
     warn("");
+    // 클릭이 먹었다는 걸 **즉시** 말한다. 어느 디코더로 가는지도 여기서 밝힌다 —
+    // WASM 경로면 32MB 다운로드가 뒤따르므로 사람이 기다릴 이유를 알아야 한다.
+    progress(0.01, nativeOK
+      ? "GIF 만들기 시작 — 이 기기의 네이티브 디코더로 프레임을 뽑을게."
+      : "GIF 만들기 시작 — 브라우저 안 디코더(WASM)로 갈게. 처음 한 번 약 " +
+        FF_CORE_MB + "MB 를 받아.");
 
     var usedPath = null;
     var chain;
@@ -754,7 +778,14 @@
   }
 
   function download() {
-    if (!lastBlob || !lastResult || lastResult.bytes > SPEC.max_bytes) return;
+    if (!lastBlob || !lastResult) {
+      say("아직 내려받을 GIF 가 없어 — 먼저 'GIF 만들기'를 눌러.", "error");
+      return;
+    }
+    if (lastResult.bytes > SPEC.max_bytes) {
+      say("한도를 넘은 GIF 는 내려받지 않아 — 위 경고의 안내대로 길이를 줄여줘.", "error");
+      return;
+    }
     var a = document.createElement("a");
     a.href = URL.createObjectURL(lastBlob);
     a.download = TOPIC.replace(/[\\/:*?"<>|]/g, "") + ".gif";
@@ -778,7 +809,8 @@
     if (!current) { showDiag("no-video", ""); return; }
     if (el.panel) el.panel.hidden = false;
     if (el.make) el.make.disabled = true;
-    say("영상 불러오는 중…");
+    // 단계마다 말한다 — 어느 칸에서 멈췄는지가 곧 '어디서 죽었나'의 답이다.
+    say("영상 불러오는 중… (1/3) 바이트를 어디서 받을지 서버에 물어보는 중");
     // (a) OneDrive 직접 / (b) 앱 프록시 — **서버가 실제로 재 보고** 알려 준다.
     fetch(current.source_url, { credentials: "same-origin" })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -786,6 +818,8 @@
       .then(function (src) {
         sourceMode = (src && src.mode) || "proxy";
         var url = (src && src.url) || current.stream_url;
+        say("영상 불러오는 중… (2/3) 영상 정보를 읽는 중 · " +
+            (sourceMode === "direct" ? "OneDrive 직접" : "앱 프록시"));
         return loadMetadata(el.video, url, sourceMode === "direct");
       })
       .then(function (meta) {
@@ -795,7 +829,9 @@
           // 메타데이터조차 못 읽었다 = 네이티브는 끝. 그래도 **기능을 끄지는 않는다** —
           // 폴백 디코더가 남아 있다. 다만 무슨 일이 벌어지는지 먼저 말한다.
           showDiag("wasm-ok", meta.why);
-          say("");
+          // 상태줄을 비우지 않는다 — 진단만 뜨고 상태가 공백이면 사람은 여전히
+          // "그래서 지금 뭘 하면 되는데?" 를 모른다.
+          say("준비됐어 — 폴백 디코더로 만들 수 있어. 'GIF 만들기'를 눌러.");
           if (el.make) el.make.disabled = false;
           refreshEstimate();
           return saveDiag("decode-failed", { detail: meta.why });
@@ -804,14 +840,29 @@
         srcH = el.video.videoHeight;
         setupTrim(el.video.duration);
         watchDuration(el.video);
+        say("영상 불러오는 중… (3/3) 이 기기가 이 영상을 디코딩할 수 있는지 재보는 중");
         return probeNative(el.video).then(function (res) {
           nativeOK = res.ok;
           showDiag(res.ok ? "native-ok" : "wasm-ok", res.why);
-          say("");
+          say("준비됐어 — 구간을 고르고 'GIF 만들기'를 눌러.");
           if (el.make) el.make.disabled = false;
           refreshEstimate();
           return saveDiag(res.ok ? "native-ok" : res.code, { detail: res.why });
         });
+      })
+      // ⛔ 예전엔 이 체인에 **종착 catch 가 없었다** — 위 단계 중 하나가 예외로 끝나면
+      //    처리되지 않은 거부로 사라지고, 화면은 "영상 불러오는 중…" 에 영원히 머물며
+      //    'GIF 만들기' 는 disabled 로 잠긴 채 남았다. 조용한 죽음의 두 번째 자리였다.
+      .catch(function (e) {
+        progress(null);
+        showDiag("decode-failed", (e && e.message) || "");
+        warn("영상을 불러오는 중에 예상 못 한 오류가 났어 — " +
+             ((e && e.message) || "원인 미상") +
+             ". 폴백 디코더는 아직 쓸 수 있으니 'GIF 만들기'를 눌러 봐도 돼. " +
+             "그래도 안 되면 새로고침하거나 다른 영상으로 해봐.");
+        say("영상 정보를 읽지 못했어.", "error");
+        nativeOK = false;
+        if (el.make) el.make.disabled = false;
       });
   }
 
@@ -855,7 +906,10 @@
   // 구간 미리보기 — 시작점으로 가서 길이만큼만 재생하고 멈춘다.
   var playTimer = null;
   function playRange() {
-    if (!current || !el.video) return;
+    if (!current || !el.video) {
+      say("먼저 영상을 골라줘.", "error");
+      return;
+    }
     var s = settings();
     clearTimeout(playTimer);
     seek(el.video, s.start).then(function () {
@@ -870,36 +924,170 @@
   // ----------------------------------------------------------------- //
   // 9. 업로드 — 사진과 같은 자리(OneDrive)에 올리고 목록에 더한다
   // ----------------------------------------------------------------- //
+  // 올리기 전에 **여기서** 막고 말한다. 50MB 를 몇 분 동안 올린 끝에 413 을 받는
+  // 것은 사람 입장에서 '조용히 죽은 것'과 구별되지 않는다 — 서버에 1바이트도
+  // 보내기 전에 판정이 가능한 두 가지(형식·크기)는 여기서 끝낸다.
+  function uploadPrecheck(file) {
+    var exts = SPEC.video_exts || [];
+    var m = (file.name || "").match(/\.[A-Za-z0-9]+$/);
+    var ext = m ? m[0].toLowerCase() : "";
+    var typeOK = (file.type || "").toLowerCase().indexOf("video/") === 0 ||
+                 exts.indexOf(ext) >= 0;
+    if (!typeOK) {
+      return "동영상 파일만 올릴 수 있어 — 고른 건 \"" + (file.name || "이름 없는 파일") +
+             "\" 야" + (exts.length ? " (" + exts.join(", ") + " 중 하나로 골라줘)" : "") + ".";
+    }
+    var max = SPEC.max_video_bytes || 0;
+    if (max && file.size > max) {
+      return "이 영상은 " + mb(file.size) + " 라 보관 한도 " + mb(max) + " 를 " +
+             mb(file.size - max) + " 넘었어 — 서버에 보내기 전에 막았어(헛되이 " +
+             "올리고 있지 않아). 폰에서 필요한 구간만 먼저 잘라 짧게 만든 뒤 올려줘. " +
+             "이 한도는 GIF 를 굽는 쪽이 아니라, 원본을 OneDrive 에 보관하는 업로드에 걸리는 거야.";
+    }
+    return "";
+  }
+
+  // 실패는 전부 사람이 읽는 문장으로 바꾼다. HTTP 상태를 통째로 버리던 자리
+  // (``r.json().catch(() => null)``)가 "영상을 올리지 못했어." 한 줄로 모든 원인을
+  // 뭉개고 있었다 — 413(너무 큼)·401(로그인 풀림)·502(OneDrive)가 구별되지 않았다.
+  function uploadFailureText(status, text) {
+    var j = null;
+    try { j = JSON.parse(text); } catch (e) { j = null; }
+    if (j && j.reason) return j.reason + " (HTTP " + status + ")";
+    if (status === 0) {
+      return "요청이 서버에 닿지 못했어 — 네트워크가 끊겼거나, 서버가 받다가 연결을 " +
+             "끊었어(파일이 너무 크면 이렇게 보이기도 해). 와이파이를 확인하고 다시 해줘.";
+    }
+    if (status === 413) {
+      return "서버가 받을 수 있는 요청 크기를 넘었어 (HTTP 413). 한도 " +
+             mb(SPEC.max_video_bytes || 0) + " 안으로 잘라서 올려줘.";
+    }
+    if (status === 401 || status === 403) {
+      return "로그인이 풀린 것 같아 (HTTP " + status + "). 새로고침해서 다시 로그인한 뒤 올려줘.";
+    }
+    if (status === 502 || status === 503 || status === 504) {
+      return "OneDrive 쪽이 응답하지 않았어 (HTTP " + status + "). 잠시 뒤 다시 해줘.";
+    }
+    // 모르는 실패여도 **무엇을 받았는지는 보여 준다** — HTML 에러 페이지면 태그를
+    // 걷어내고 앞부분만. '알 수 없는 오류'로 끝내면 다음 사람도 똑같이 헤맨다.
+    var plain = (text || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    return "영상을 올리지 못했어 — HTTP " + status +
+           (plain ? " · " + plain.slice(0, 140) : "") + ". 다시 시도해보고, 계속 이러면 알려줘.";
+  }
+
+  var uploadXhr = null;
+  function setUploading(on) {
+    if (el.uploadBtn) el.uploadBtn.disabled = on;
+    if (el.uploadCancel) el.uploadCancel.hidden = !on;
+  }
+
   function upload(file) {
     if (!UPLOAD_URL || !file) return;
+    warn("");
+    var bad = uploadPrecheck(file);
+    if (bad) {
+      progress(null);
+      warn(bad);
+      say("올리지 않았어 — 위 설명을 봐줘.", "error");
+      return;
+    }
     var fd = new FormData();
     fd.append("video", file);
-    say("영상 올리는 중… (" + mb(file.size) + ")");
-    if (el.uploadBtn) el.uploadBtn.disabled = true;
-    fetch(UPLOAD_URL, { method: "POST", credentials: "same-origin", body: fd })
-      .then(function (r) { return r.json().catch(function () { return null; }); })
-      .then(function (j) {
-        if (!j || !j.ok) {
-          say((j && j.reason) || "영상을 올리지 못했어.", "error");
-          return;
-        }
-        var v = j.video;
-        v.stream_url = "/videos/" + v.id + "/stream";
-        v.source_url = "/videos/" + v.id + "/source";
-        v.delete_url = "/videos/" + v.id + "/delete";
-        VIDEOS.unshift(v);
-        var opt = document.createElement("option");
-        opt.value = v.id;
-        opt.textContent = v.name + " (" + mb(v.size) + ")";
-        el.videoSel.insertBefore(opt, el.videoSel.firstChild);
-        el.videoSel.value = String(v.id);
-        if (el.empty) el.empty.hidden = true;
-        el.videoSel.closest(".rv-gif-field").hidden = false;
-        say("올렸어! 👍");
-        selectVideo(v.id);
-      })
-      .catch(function () { say("영상을 올리지 못했어.", "error"); })
-      .then(function () { if (el.uploadBtn) el.uploadBtn.disabled = false; });
+    say("영상 올리는 중… 0% (0KB / " + mb(file.size) + ")");
+    progress(0);
+    setUploading(true);
+
+    // ⚠️ ``fetch`` 로는 **업로드 진행률을 알 수 없다**(upload progress 이벤트가 없다).
+    //    50MB 를 올리는 몇 분 동안 화면이 아무 말도 못 하던 이유가 이것이다. XHR 은
+    //    ``upload.onprogress`` 를 주므로 "올라가는 중인가"에 화면이 답할 수 있다.
+    // ⛔ ``xhr.timeout`` 은 쓰지 않는다 — 경과 시간으로 일하는 업로드를 끊지 않는다.
+    //    멈추는 길은 사람이 누르는 '올리기 중단' 버튼뿐이다.
+    var xhr = new XMLHttpRequest();
+    uploadXhr = xhr;
+    xhr.open("POST", UPLOAD_URL, true);
+    xhr.withCredentials = true;
+    xhr.timeout = 0;
+    // 이 헤더가 있어야 서버의 413 핸들러가 HTML 에러 **페이지** 대신 JSON 을 준다
+    // (app._wants_json). 없으면 우리가 받은 건 HTML 이고, 그걸 JSON 으로 파싱하다
+    // 실패해 이유가 통째로 사라졌다.
+    xhr.setRequestHeader("X-Requested-With", "fetch");
+    xhr.setRequestHeader("Accept", "application/json");
+
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) {
+        say("영상 올리는 중… (" + mb(file.size) + " · 진행률을 알 수 없어)");
+        return;
+      }
+      var f = e.loaded / e.total;
+      progress(f, "영상 올리는 중… " + Math.round(f * 100) + "% (" +
+                  mb(e.loaded) + " / " + mb(e.total) + ")");
+    };
+    // 브라우저가 다 보낸 뒤 서버가 OneDrive 로 옮기는 시간이 또 있다 — 그 구간도
+    // 말해 준다(여기서 조용해지면 사람은 멈춘 줄 안다).
+    xhr.upload.onload = function () {
+      progress(1, "다 보냈어 — 서버가 OneDrive 에 보관하는 중… (조금 걸려)");
+    };
+    xhr.onerror = function () {
+      progress(null);
+      setUploading(false);
+      uploadXhr = null;
+      warn(uploadFailureText(0, ""));
+      say("영상을 올리지 못했어.", "error");
+    };
+    xhr.onabort = function () {
+      progress(null);
+      setUploading(false);
+      uploadXhr = null;
+      say("올리기를 중단했어.", "error");
+    };
+    xhr.onload = function () {
+      progress(null);
+      setUploading(false);
+      uploadXhr = null;
+      var j = null;
+      try { j = JSON.parse(xhr.responseText); } catch (e) { j = null; }
+      if (xhr.status < 200 || xhr.status >= 300 || !j || !j.ok) {
+        warn(uploadFailureText(xhr.status, xhr.responseText || ""));
+        say("영상을 올리지 못했어.", "error");
+        return;
+      }
+      onUploaded(j);
+    };
+    xhr.send(fd);
+  }
+
+  function cancelUpload() {
+    if (uploadXhr) {
+      say("올리기를 중단하는 중…");
+      uploadXhr.abort();
+    }
+  }
+
+  // 올라간 영상을 목록에 꽂고 바로 고른다. **여기서 터지면 업로드는 성공했는데
+  // 화면만 빈 것처럼 보이므로** 이 조립도 try 로 감싸 말한다.
+  function onUploaded(j) {
+    var v = j.video;
+    try {
+      v.stream_url = "/videos/" + v.id + "/stream";
+      v.source_url = "/videos/" + v.id + "/source";
+      v.delete_url = "/videos/" + v.id + "/delete";
+      VIDEOS.unshift(v);
+      var opt = document.createElement("option");
+      opt.value = v.id;
+      opt.textContent = v.name + " (" + mb(v.size) + ")";
+      el.videoSel.insertBefore(opt, el.videoSel.firstChild);
+      el.videoSel.value = String(v.id);
+      if (el.empty) el.empty.hidden = true;
+      var field = el.videoSel.closest(".rv-gif-field");
+      if (field) field.hidden = false;
+    } catch (e) {
+      warn("영상은 올라갔는데 목록에 꽂다가 문제가 생겼어 — " + ((e && e.message) || "원인 미상") +
+           ". 새로고침하면 목록에 보일 거야.");
+      say("올라갔지만 화면 갱신에 실패했어.", "error");
+      return;
+    }
+    say("올렸어! 👍 (" + mb(v.size) + ") 이제 영상을 읽어 볼게…");
+    selectVideo(v.id);
   }
 
   function removeCurrent() {
@@ -930,11 +1118,25 @@
   // ----------------------------------------------------------------- //
   if (el.upload) {
     el.upload.addEventListener("change", function () {
-      if (el.upload.files && el.upload.files[0]) upload(el.upload.files[0]);
+      var f = el.upload.files && el.upload.files[0];
+      // 파일이 안 왔는데 조용히 끝나지 않는다 — 고른 뒤 '아무 일도 없음'이
+      // 이 기능의 증상이었다. 고르자마자 파일 이름·크기부터 되읽어 준다.
+      if (!f) { say("고른 파일이 없어 — 다시 골라줘."); el.upload.value = ""; return; }
+      say("고른 파일: " + (f.name || "이름 없음") + " · " + mb(f.size) + " — 확인하는 중…");
+      upload(f);
       el.upload.value = "";
     });
   }
-  if (el.uploadBtn) el.uploadBtn.addEventListener("click", function () { el.upload.click(); });
+  if (el.uploadBtn) {
+    el.uploadBtn.addEventListener("click", function () {
+      if (!el.upload) { say("파일 선택기를 열지 못했어 — 페이지를 새로고침해줘.", "error"); return; }
+      // 파일 선택 창이 떠 있는 동안도 화면이 말한다. 사람이 '취소'를 눌렀을 때는
+      // change 이벤트가 오지 않으므로 이 줄이 마지막 상태로 남는 것이 맞다.
+      say("동영상을 고르는 중… (창이 안 뜨면 브라우저 권한을 확인해줘)");
+      el.upload.click();
+    });
+  }
+  if (el.uploadCancel) el.uploadCancel.addEventListener("click", cancelUpload);
   if (el.videoSel) {
     el.videoSel.addEventListener("change", function () {
       selectVideo(parseInt(el.videoSel.value, 10));
@@ -979,5 +1181,6 @@
   } else {
     if (el.panel) el.panel.hidden = true;
     if (el.empty) el.empty.hidden = false;
+    say("준비됐어 — '＋ 영상 올리기'로 동영상을 하나 올려줘.");
   }
 })();
