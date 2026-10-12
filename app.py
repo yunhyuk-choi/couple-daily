@@ -95,6 +95,30 @@ log = logging.getLogger(__name__)
 
 DEFAULT_APP_NAME = os.environ.get("APP_NAME", "우리의 하루")
 
+# ── 지금 떠 있는 코드의 신원 ────────────────────────────────────────────────
+# 머지 후 "배포가 실제로 넘어갔나"를 밖에서 확인할 수 있어야 한다. 새 라우트가
+# 404→302로 바뀌는지, 정적 파일 바이트가 달라지는지 같은 **간접** 신호는 서버
+# 내부 렌더만 바뀐 변경에선 아무 흔적도 남기지 않아 확인이 추측이 된다.
+# Render 는 서비스에 ``RENDER_GIT_COMMIT``(= "The commit SHA for a service or
+# deploy", 빌드·런타임 양쪽에 자동 주입)을 넣어 준다 — 사람이 콘솔에서 등록하는
+# 변수가 아니다. 같은 관례로 이미 ``RENDER_EXTERNAL_URL`` 을 쓰고 있다
+# (``_public_base_url``).
+# 로컬·테스트처럼 그 변수가 없는 환경에서는 **가짜 SHA를 지어내지 않고** None을
+# 그대로 내보낸다 — "모른다"가 정직한 답이다.
+_BUILD_COMMIT_ENV = "RENDER_GIT_COMMIT"
+# 빌드 시각을 주는 Render 변수는 없다. 이 프로세스가 뜬 시각이 곧 '이 코드가
+# 서빙되기 시작한 시각'이므로 그걸 UTC ISO8601로 한 번만 박아 둔다.
+PROCESS_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def build_info():
+    """지금 서빙 중인 코드의 신원 — 인증 없는 엔드포인트에 실어도 되는 것만.
+
+    커밋 SHA와 기동 시각뿐이다. 환경변수를 통째로 비추지 않는다.
+    """
+    commit = (os.environ.get(_BUILD_COMMIT_ENV) or "").strip()
+    return {"commit": commit or None, "started_at": PROCESS_STARTED_AT}
+
 # HEIC/HEIF는 iOS Safari만 <img>로 렌더한다 — Android Chrome·데스크톱은 못 본다.
 # 풀이미지 프록시에서 HEIC 원본을 JPEG로 변환해 서빙하면 갤럭시·PC에서도 보인다.
 # Pillow(+pillow-heif)를 한 번만·방어적으로 로드한다. 없으면 _HEIC_OK=False로
@@ -9217,7 +9241,9 @@ def _register_routes(app: Flask):
 
     @app.route("/healthz")
     def healthz():
-        return {"status": "ok"}
+        # ⚠️ ``status: ok`` 는 계약이다 — Render/Fly 헬스체크가 이걸 본다.
+        # 키는 **추가만** 하고 기존 키·값은 건드리지 않는다.
+        return {"status": "ok", **build_info()}
 
     # ---- themed error handlers ----
     @app.errorhandler(404)
