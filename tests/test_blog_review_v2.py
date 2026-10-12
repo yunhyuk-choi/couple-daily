@@ -33,7 +33,9 @@ def test_prompt_file_loads_and_strips_frontmatter():
 def test_prompt_encodes_the_v2_rules():
     body = ai.load_prompt("blog-review")
     assert "표를 쓰지 마라" in body
-    assert "볼드" in body
+    # 볼드·형광펜·색 강조는 **되살아났다**(사용자 요구) — 금지가 아니라 토큰 지시다.
+    # 그 계약의 정본은 tests/test_review_emphasis.py.
+    assert "강조는 아래 네 가지 표시로만 한다" in body
     assert "글자 수를 고정하지 마라" in body
     assert "것으로 안내돼 있어요" in body      # 경험/조사 어미 구분
     assert "900~1400" not in body             # v1의 고정 분량은 사라졌다
@@ -236,7 +238,10 @@ def test_copy_html_has_no_table_in_either_schema(flask_app, make_review):
         html = app_module._review_copy_html(review)
         assert html
         assert "<table" not in html        # 표 금지(gf-blog 규율)
-        assert "<b>" not in html           # 볼드 금지
+        # 시스템 크롬(헤더·info·FAQ)은 계속 평문이다 — 볼드는 **본문 강조 토큰에서만**
+        # 나온다. 이 fixture 두 개엔 토큰이 없으므로 <b>가 없어야 맞다
+        # (토큰이 있을 때 <b>가 나오는 계약은 tests/test_review_emphasis.py).
+        assert "<b>" not in html
         assert "총점 ★★★★☆ (8/10)" in html or "총점 " in html
 
 

@@ -2315,9 +2315,14 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
     dict를 돌려주거나, 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함). 느린
     서브프로세스라 호출부가 반드시 백그라운드에서 돌린다.
 
-    v2 기준: 글의 내용 규율은 gf-blog 프롬프트가 정본이다. 표·볼드 금지, 글자 수·
+    v2 기준: 글의 내용 규율은 gf-blog 프롬프트가 정본이다. 표 금지, 글자 수·
     키워드 반복·소제목 개수 고정 금지, 경험/조사 어미 구분, 요약표·FAQ 고정 섹션
     폐기. 본문 규율 전체는 ``prompts/blog-review.md``에 있고 여기선 재료만 채운다.
+
+    ⭐ **인라인 강조(`**굵게**` `==형광펜==` `*분홍*` `` `파랑` ``)는 쓴다** — gf-blog 는
+    금지하지만 그쪽은 사람이 네이버 에디터에서 직접 꾸미는 수동 운전이고, 우리는 발행까지
+    자동이라 모델이 안 내면 아무도 안 꾸민다(사용자 명시 지시). 토큰→서식 변환은
+    ``app._emph_html``·북마클릿 ``emphNodes``, 규율은 ``docs/blog-review-spec.md`` §5.3.
     """
     topic = (topic or "").strip()
     if not topic:
