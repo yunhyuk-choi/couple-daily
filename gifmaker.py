@@ -55,18 +55,26 @@ MAX_FRAMES = int(MAX_DURATION * max(FPS_PRESETS))
 
 # 업로드 받는 동영상 — 네 기기(아이폰·갤럭시·맥북·윈도우)가 실제로 만드는 컨테이너.
 ALLOWED_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv")
-# 요청 본문 상한(app.MAX_CONTENT_LENGTH=55MB)보다 작아야 멀티파트 여유가 남는다.
+
+# ⛔ **영상 업로드 바이트 한도는 없다 — 일부러 없앴다** (2026-10-12).
 #
-# ⚠️ 이 값의 **출처를 정직하게 적어 둔다**(2026-10-12 실측 감사). 50MB 는 사진
-#    업로드 한도(`app._MAX_PHOTO_BYTES`)를 그대로 물려받은 숫자지, 영상 경로에서
-#    잰 값이 아니다. 사진은 핸들러가 `file.read()` 로 **통째로 메모리에 올리므로**
-#    그 한도에 OOM 근거가 있지만, 영상은 werkzeug 스풀 → 3.2MiB 청크 PUT 이라
-#    워커 메모리가 영상 크기와 무관하게 평평하다(CLAUDE.md 실측: Δpeak +7.0MB).
-#    즉 **영상에 대해서는 이 값을 정당화하는 실측이 없다.** 그래도 임의로 올리지
-#    않는다 — 올리는 판단은 사람 몫이고, 올리면 Render 요청 시간·OneDrive 세션
-#    동작이 함께 바뀌므로 재측정이 필요하다. 지금은 화면이 이 한도를 **왜 거는지**
-#    (원본 보관 업로드이기 때문) 사람에게 말하는 것으로 둔다.
-MAX_VIDEO_BYTES = 50 * 1024 * 1024
+#    예전엔 `MAX_VIDEO_BYTES = 50MB` 가 있었고, 그 숫자의 출처는 사진 업로드 한도
+#    (`app._MAX_PHOTO_BYTES`)를 물려받은 것이었다. 사진은 핸들러가 `file.read()` 로
+#    통째로 메모리에 올리므로 그 한도에 OOM 근거가 진짜 있다. 영상은 그렇지 않았고
+#    (werkzeug 스풀 → 청크 PUT), 이제는 **바이트가 서버를 아예 지나지 않는다**
+#    — 브라우저가 OneDrive 업로드 세션으로 직접 PUT 한다(app.video_upload_session).
+#    그래서 이 경로에서 그 숫자를 정당화하던 두 근거(워커 메모리·요청 시간)가
+#    통째로 사라졌다. 근거가 없는 한도는 **새 숫자로 바꾸지 않고 지운다** — 임의의
+#    숫자는 '측정된 한도'인 척하며 사람이 멀쩡한 파일을 자르게 만든다.
+#
+#    그래서 **지금 남아 있는 한도**는(각각 다른 곳에 있다):
+#      * OneDrive 계정의 남은 용량 — **Graph 가 직접 거절**한다(507 등). 우리가
+#        미리 재지 않고, 거절 상태코드를 사람 문장으로 바꿔 말한다(static/gif.js).
+#      * GIF 로 굽는 쪽 — 결과물 `MAX_GIF_BYTES`(8MB)와 `MAX_FRAMES`. 업로드와
+#        무관한 별개 한도이고 여기서 바뀌지 않는다.
+#      * 브라우저가 GIF 를 구우려고 **영상을 다시 받아 디코딩**하는 구간(gif.js).
+#        여기엔 기기 메모리라는 실제 한계가 있지만 그 값은 기기마다 달라 우리가
+#        숫자로 적을 수 없다 — 그래서 적지 않는다.
 
 _EXT_CONTENT_TYPES = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
@@ -317,6 +325,7 @@ def spec():
         "max_bytes": MAX_GIF_BYTES,
         "max_frames": MAX_FRAMES,
         "bytes_per_pixel": _BYTES_PER_PIXEL,
-        "max_video_bytes": MAX_VIDEO_BYTES,
+        # ⛔ ``max_video_bytes`` 는 **없다** — 위 주석이 근거다. 화면이 없는 한도를
+        #    말하지 않게 키 자체를 두지 않는다.
         "video_exts": list(ALLOWED_VIDEO_EXTS),
     }

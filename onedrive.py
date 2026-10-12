@@ -864,7 +864,93 @@ def list_folder():
 
 # Graph 업로드 세션 규약: 마지막 청크를 제외한 모든 청크는 320 KiB의 배수여야 한다.
 _CHUNK = 320 * 1024 * 10  # 3.2 MiB — 메모리 상한이자 PUT 한 번의 크기
+UPLOAD_CHUNK_BYTES = _CHUNK  # 브라우저 직접 업로드도 같은 규약을 쓴다 (app → gif.js)
 UPLOAD_TIMEOUT = 120  # 청크 PUT 은 파일 PUT 보다 더 오래 걸릴 수 있다
+
+
+def create_upload_session(filename):
+    """``couple-daily/<unique-name>`` 에 **업로드 세션을 열고** 그 URL을 돌려준다.
+
+    반환 ``(upload_url, name)``. 이 함수는 바이트를 한 개도 보내지 않는다 — 누가
+    보낼지(우리 워커냐 브라우저냐)는 호출자가 정한다.
+
+    ⚠️ **``upload_url`` 은 그 자체가 자격증명(capability URL)이다.** 쿼리에 박힌
+    토큰이 곧 그 자리에 쓸 권한이고, Bearer 를 따로 요구하지 않는다(아래 PUT 이
+    인증 헤더 없이 성공하는 이유가 그것이다). 그래서 이 값은 **로그·DB·에러 메시지·
+    예외 문자열 어디에도 남기지 않는다** — ``probe_direct_cors`` 가 다운로드 URL에
+    대해 지키는 규율과 같다. 돌려받은 쪽도 같은 규율을 진다.
+    """
+    _ensure_folder()
+    name = _safe_unique_name(filename or "video")
+    try:
+        r = requests.post(
+            f"{GRAPH_BASE}/me/drive/root:/{FOLDER}/{name}:/createUploadSession",
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+            json={"item": {"@microsoft.graph.conflictBehavior": "rename"}},
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise OneDriveError(f"upload session request failed: {e}") from e
+    if r.status_code not in (200, 201):
+        raise OneDriveError(f"upload session failed (status={r.status_code})")
+    upload_url = _json_body(r, "upload session").get("uploadUrl")
+    if not upload_url:
+        raise OneDriveError("upload session returned no uploadUrl")
+    return upload_url, name
+
+
+def cancel_upload_session(upload_url):
+    """세션을 취소한다 — 중단된 업로드가 반쪽 파일로 남지 않게. 실패는 삼킨다."""
+    if not upload_url:
+        return
+    try:
+        requests.delete(upload_url, timeout=HTTP_TIMEOUT)
+    except requests.RequestException:
+        pass
+
+
+def find_in_folder(name):
+    """``couple-daily`` 폴더에서 **이름으로** 아이템을 찾는다 (없으면 ``None``).
+
+    브라우저가 "다 올렸다"고 보고한 것을 **믿기 전에 우리가 직접 조회**하는 경로다
+    (클라이언트 보고는 주장이지 증거가 아니다 — 앱 전체의 POLICY-VERIFY 와 같은
+    태도이고, 이 모듈에선 ``probe_direct_cors`` 가 같은 이유로 존재한다).
+
+    **경로로** 조회하므로 우리 폴더 밖은 애초에 조회 범위에 없다 — 남의 아이템을
+    가리키는 이름을 들이밀어도 여기서 ``None`` 이다.
+
+    반환 ``{"id","name","size","ctype"}``. 실패는 OneDriveError.
+    """
+    if not name:
+        return None
+    safe = requests.utils.quote(str(name), safe="")
+    try:
+        r = requests.get(
+            f"{GRAPH_BASE}/me/drive/root:/{FOLDER}/{safe}"
+            "?$select=id,name,size,file,parentReference",
+            headers=_auth_headers(),
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise OneDriveError(f"item lookup request failed: {e}") from e
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise OneDriveError(f"item lookup failed (status={r.status_code})")
+    body = _json_body(r, "item lookup")
+    # 경로로 물었으니 폴더는 정해져 있지만 **돌아온 것도 대조한다** — 공유 폴더·
+    # 리디렉션 같은 변수에서 조용히 다른 자리를 가리키지 않게.
+    parent = (body.get("parentReference") or {}).get("path") or ""
+    if not parent.endswith(f"/{FOLDER}"):
+        return None
+    if not body.get("id"):
+        return None
+    return {
+        "id": body["id"],
+        "name": body.get("name") or name,
+        "size": int(body.get("size") or 0),
+        "ctype": (body.get("file") or {}).get("mimeType") or "",
+    }
 
 
 def upload_stream(stream, size, filename):
@@ -880,19 +966,7 @@ def upload_stream(stream, size, filename):
     if size <= 0:
         raise OneDriveError("upload stream has no bytes")
     try:
-        _ensure_folder()
-        name = _safe_unique_name(filename or "video")
-        r = requests.post(
-            f"{GRAPH_BASE}/me/drive/root:/{FOLDER}/{name}:/createUploadSession",
-            headers={**_auth_headers(), "Content-Type": "application/json"},
-            json={"item": {"@microsoft.graph.conflictBehavior": "rename"}},
-            timeout=HTTP_TIMEOUT,
-        )
-        if r.status_code not in (200, 201):
-            raise OneDriveError(f"upload session failed (status={r.status_code})")
-        upload_url = r.json().get("uploadUrl")
-        if not upload_url:
-            raise OneDriveError("upload session returned no uploadUrl")
+        upload_url, name = create_upload_session(filename)
 
         sent = 0
         item = None
@@ -915,18 +989,12 @@ def upload_stream(stream, size, filename):
                 item = cr.json()
             elif cr.status_code != 202:
                 # 실패하면 세션을 지워 OneDrive 에 반쪽 파일을 남기지 않는다.
-                try:
-                    requests.delete(upload_url, timeout=HTTP_TIMEOUT)
-                except requests.RequestException:
-                    pass
+                cancel_upload_session(upload_url)
                 raise OneDriveError(f"chunk upload failed (status={cr.status_code})")
             sent += len(chunk)
 
         if sent != size:
-            try:
-                requests.delete(upload_url, timeout=HTTP_TIMEOUT)
-            except requests.RequestException:
-                pass
+            cancel_upload_session(upload_url)
             raise OneDriveError(f"upload truncated ({sent}/{size} bytes)")
         if not item or not item.get("id"):
             raise OneDriveError("upload returned no item id")
