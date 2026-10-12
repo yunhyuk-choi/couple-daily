@@ -591,3 +591,146 @@ def test_review_detail_renders_the_gif_card_without_touching_onedrive(
     assert 'id="rv-gif"' in html
     assert "clip.mp4" in html
     assert "/static/gif.js" in html
+
+
+# --------------------------------------------------------------------------- #
+# 10. ⛔ 침묵 금지 — "고르면 아무 안내 없이 조용함" 회귀 방어
+#
+# 실측된 증상(2026-10-12): 동영상 올리기 → 파일 선택 → **아무 일도 안 일어남.**
+# 올라가는 중인지, 크기 때문인지, 어디서 터졌는지 사람이 전혀 알 수 없었다.
+# 원인은 둘이 겹친 것이었다:
+#   (1) 진행·경고·진단·상태 네 줄이 모두 ``.rv-gif-panel`` **안**에 있었는데,
+#       그 패널은 영상이 하나도 없으면 ``hidden`` 이다 — 즉 **첫 업로드**의 모든
+#       안내가 보이지 않는 곳에 쓰였다. 화면은 말하고 있었지만 아무도 못 봤다.
+#   (2) 업로더가 ``fetch(...).then(r => r.json().catch(() => null))`` 라 HTTP
+#       상태를 통째로 버렸고, 413 이 돌려준 HTML 에러 **페이지**는 JSON 파싱에
+#       실패해 "영상을 올리지 못했어." 한 줄로 뭉개졌다(그마저 (1) 때문에 안 보임).
+# 아래 테스트는 그 둘을 각각 못질한다.
+# --------------------------------------------------------------------------- #
+def _panel_markup(html):
+    """렌더된 HTML 에서 ``.rv-gif-panel`` 요소 하나를 깊이 세기로 잘라 낸다."""
+    start = html.index('<div class="rv-gif-panel"')
+    depth, i = 0, start
+    tag = re.compile(r"<(/?)div\b", re.I)
+    while i < len(html):
+        m = tag.search(html, i)
+        if not m:
+            break
+        depth += 1 if not m.group(1) else -1
+        i = m.end()
+        if depth == 0:
+            break
+    return html[start:i]
+
+
+def test_feedback_lines_live_outside_the_panel_that_hides_without_videos(
+        client, flask_app, couple_user, make_review, monkeypatch):
+    """영상이 0개여도 진행·경고·진단·상태는 **보이는 자리**에 있어야 한다.
+
+    이게 깨지면 첫 업로드가 통째로 무음이 된다(실측된 증상 그 자체).
+    """
+    monkeypatch.setattr(onedrive, "onedrive_enabled", lambda: True)
+    review = make_review(ai_json=json.dumps(_READY_AI, ensure_ascii=False),
+                         status="ready")
+    html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
+
+    panel = _panel_markup(html)
+    # 영상이 없으므로 패널은 실제로 숨겨져 있다 — 전제를 먼저 못질한다.
+    assert "hidden" in panel.split(">", 1)[0]
+    for cls in ("rv-gif-status", "rv-gif-bar", "rv-gif-warn", "rv-gif-diag"):
+        assert cls in html, f"{cls} 가 화면에서 사라졌다"
+        assert cls not in panel, (
+            f"{cls} 가 숨은 패널 안에 있다 — 첫 업로드가 조용히 죽는다")
+
+
+def test_the_card_explains_why_a_size_cap_exists_on_a_browser_side_feature(
+        client, flask_app, couple_user, make_review, monkeypatch):
+    """"브라우저가 만드는데 왜 크기 제한?" 에 화면이 직접 답해야 한다.
+
+    답: GIF 는 브라우저가 굽지만 **원본 보관 업로드는 서버를 거친다.**
+    """
+    monkeypatch.setattr(onedrive, "onedrive_enabled", lambda: True)
+    review = make_review(ai_json=json.dumps(_READY_AI, ensure_ascii=False),
+                         status="ready")
+    html = client.get(f"/reviews/{review.id}").get_data(as_text=True)
+    assert "rv-gif-why" in html
+    assert "OneDrive" in html and "보관" in html
+    # 두 한도가 **다른 것**임을 화면이 구별해 말한다.
+    assert str(gifmaker.MAX_VIDEO_BYTES // 1048576) in html
+    assert str(gifmaker.MAX_GIF_BYTES // 1048576) in html
+
+
+def test_oversized_request_answers_the_uploader_in_json_not_an_html_page(
+        client, flask_app, monkeypatch):
+    """요청이 MAX_CONTENT_LENGTH 를 넘으면 업로더는 **읽을 수 있는 이유**를 받아야 한다.
+
+    업로더가 ``X-Requested-With: fetch`` 를 보내므로 413 은 JSON 으로 와야 한다 —
+    HTML 에러 페이지가 오면 클라이언트가 파싱에 실패해 이유가 사라진다.
+    """
+    monkeypatch.setattr(onedrive, "onedrive_enabled", lambda: True)
+    cap = flask_app.config["MAX_CONTENT_LENGTH"]
+    monkeypatch.setitem(flask_app.config, "MAX_CONTENT_LENGTH", 2048)
+    r = client.post("/videos/upload",
+                    data={"video": (io.BytesIO(b"x" * 8192), "big.mp4")},
+                    content_type="multipart/form-data",
+                    headers={"X-Requested-With": "fetch"})
+    assert r.status_code == 413
+    assert r.is_json, "413 이 HTML 페이지로 오면 업로더가 이유를 읽지 못한다"
+    assert r.get_json()["error"] == "too_large"
+    assert cap > 0  # 원래 설정이 테스트 사이에 새지 않게 읽어만 둔다
+
+
+def test_uploader_reports_progress_and_never_swallows_the_http_status():
+    """gif.js 업로더가 (1) 진행률을 말하고 (2) 상태별로 다른 문장을 낸다."""
+    src = io.open(os.path.join(_ROOT, "static", "gif.js"), encoding="utf-8").read()
+    # (1) fetch 로는 업로드 진행률을 알 수 없다 — XHR 의 upload.onprogress 여야 한다.
+    assert "xhr.upload.onprogress" in src
+    assert "영상 올리는 중…" in src
+    # (2) 상태를 버리지 않는다 — 413/401/502/0 이 각각 다른 말을 한다.
+    assert "function uploadFailureText" in src
+    for needle in ("413", "401", "502"):
+        assert needle in src
+    # (3) 서버가 JSON 으로 답하게 하는 신호를 반드시 보낸다.
+    assert 'setRequestHeader("X-Requested-With", "fetch")' in src
+    # (4) ⛔ 경과 시간 상한으로 업로드를 끊지 않는다 — 멈추는 길은 중단 버튼뿐이다.
+    assert "xhr.timeout = 0" in src
+    assert "function cancelUpload" in src
+
+
+def test_uploader_blocks_an_oversized_file_before_sending_a_single_byte():
+    """한도를 넘는 파일은 **보내기 전에** 막고, 얼마나 넘었는지 말해야 한다."""
+    src = io.open(os.path.join(_ROOT, "static", "gif.js"), encoding="utf-8").read()
+    assert "function uploadPrecheck" in src
+    # 프리체크는 서버가 내려준 스펙(단일 원천)을 본다 — 숫자를 새로 발명하지 않는다.
+    assert "SPEC.max_video_bytes" in src
+    # 넘은 양을 말한다(얼마나 줄여야 하는지 사람이 알 수 있게).
+    assert "file.size - max" in src
+    # 그리고 그 한도가 **GIF 가 아니라 보관 업로드**의 것임을 밝힌다.
+    assert "OneDrive 에 보관하는 업로드" in src
+    # 프리체크 실패는 ``warn`` 으로 화면에 남는다(조용한 return 금지).
+    assert "올리지 않았어" in src
+
+
+def test_select_video_chain_cannot_end_in_an_unhandled_rejection():
+    """영상 선택 체인에 종착 catch 가 있어야 한다 — 없으면 '불러오는 중…' 에 고착된다."""
+    src = io.open(os.path.join(_ROOT, "static", "gif.js"), encoding="utf-8").read()
+    start = src.index("function selectVideo(")
+    body = src[start:src.index("\n  function watchDuration(", start)]
+    assert ".catch(function (e) {" in body, "selectVideo 체인에 종착 catch 가 없다"
+    assert "영상 정보를 읽지 못했어" in body
+    # 단계가 번호로 말한다 — 어디서 멈췄는지가 곧 어디서 죽었나의 답이다.
+    for step in ("(1/3)", "(2/3)", "(3/3)"):
+        assert step in body
+
+
+def test_no_silent_return_paths_left_in_the_buttons():
+    """버튼을 눌렀는데 아무 말도 없는 길이 남아 있으면 안 된다."""
+    src = io.open(os.path.join(_ROOT, "static", "gif.js"), encoding="utf-8").read()
+    # 스펙을 못 읽어도 말하고 죽는다(예전엔 그냥 return 이었다).
+    assert "GIF 설정(rv-gif-spec)을 읽지 못해서" in src
+    # 만들기/내려받기/미리보기의 '조건 불충족' 이 각각 문장을 낸다.
+    assert "먼저 영상을 골라줘" in src
+    assert "아직 내려받을 GIF 가 없어" in src
+    assert "이미 만드는 중이야" in src
+    # 클릭 직후 어느 디코더로 가는지 즉시 밝힌다.
+    assert "GIF 만들기 시작" in src

@@ -518,10 +518,21 @@
     <button type="button" class="btn ghost sm rv-gif-upload-btn">＋ 영상 올리기</button>
     <input type="file" class="rv-gif-upload" accept="video/*"
            style="display:none;" />
+    <button type="button" class="btn ghost sm rv-gif-upload-cancel" hidden>✕ 올리기 중단</button>
     <span class="muted small">
       {{ (gif_spec.max_video_bytes // 1048576) }}MB 이하 · 아이폰 .MOV 도 그대로 올리면 돼
     </span>
   </div>
+
+  {# 한도가 **왜** 있는지 — "브라우저가 만드는데 왜 크기 제한이?" 라는 물음에
+     화면이 직접 답한다. GIF 굽기는 브라우저가 하지만 **원본 보관은 서버를 거친다.** #}
+  <p class="muted small rv-gif-why" style="margin:6px 0 0;">
+    GIF 로 굽는 건 네 브라우저가 해. 다만 <strong>원본 영상은 먼저 OneDrive 에 보관</strong>돼
+    (구간을 다시 고르거나 다른 후기에 또 쓰려면 남아 있어야 하니까). 그 보관 업로드만
+    서버를 거치기 때문에 <strong>{{ (gif_spec.max_video_bytes // 1048576) }}MB 한도는 그
+    업로드에 걸리는 것</strong>이고, GIF 를 만드는 데 걸리는 한도가 아니야.
+    (만든 GIF 자체의 한도는 따로 {{ (gif_spec.max_bytes // 1048576) }}MB.)
+  </p>
 
   <label class="rv-gif-field" {% if not gif_videos %}hidden{% endif %}>
     <span class="muted small">영상 고르기 <span style="opacity:.7;">· OneDrive 에 보관된 우리 영상</span></span>
@@ -581,10 +592,6 @@
     </div>
 
     <p class="rv-gif-estimate muted small" style="margin:8px 0 0;"></p>
-    <p class="rv-gif-diag small" hidden></p>
-    <progress class="rv-gif-bar" max="1" value="0" hidden></progress>
-    <p class="rv-gif-warn" hidden></p>
-    <p class="rv-gif-status muted small"></p>
     <p class="rv-gif-result muted small" style="margin:4px 0 0;"></p>
     <img class="rv-gif-preview" alt="만든 GIF 미리보기" hidden />
 
@@ -592,6 +599,18 @@
       <button type="button" class="btn primary sm rv-gif-make" disabled>🎞 GIF 만들기</button>
       <button type="button" class="btn sm rv-gif-download" disabled>⬇ GIF 내려받기</button>
     </div>
+  </div>
+
+  {# ⛔ 진행·경고·진단은 **패널 밖**에 둔다 — 패널은 영상이 하나도 없으면 ``hidden``
+     이라, 이 네 줄이 그 안에 있으면 **첫 업로드의 진행도 실패도 보이지 않는 곳에**
+     쓰인다. 실측된 증상이 정확히 그것이었다: 영상을 고르면 "아무 안내 없이 조용함".
+     ``say()``·``warn()``·``progress()``·``showDiag()`` 가 모두 여기에 쓰므로 이 블록은
+     **어떤 상태에서도 숨기지 않는다.** 패널 바로 아래라 패널이 보일 때의 자리는 그대로다. #}
+  <div class="rv-gif-feedback">
+    <p class="rv-gif-diag small" hidden></p>
+    <progress class="rv-gif-bar" max="1" value="0" hidden></progress>
+    <p class="rv-gif-warn" hidden></p>
+    <p class="rv-gif-status muted small"></p>
   </div>
 
   {% if gif and gif.result %}
@@ -642,6 +661,9 @@
   }
   .rv-gif-card .rv-gif-estimate.over { color: #a4303f; }
   .rv-gif-card .rv-gif-diag.bad { color: #a4303f; }
+  .rv-gif-card .rv-gif-feedback { margin-top: 10px; }
+  .rv-gif-card .rv-gif-feedback > p { margin: 4px 0 0; }
+  .rv-gif-card .rv-gif-status.error { color: #a4303f; }
   .rv-gif-card .rv-gif-download[disabled],
   .rv-gif-card .rv-gif-make[disabled] { opacity: .5; cursor: not-allowed; }
 </style>

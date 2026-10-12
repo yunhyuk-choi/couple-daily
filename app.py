@@ -9136,14 +9136,17 @@ def _register_routes(app: Flask):
         # 요청이 MAX_CONTENT_LENGTH를 넘었을 때. AJAX 업로더면 그 파일만 "too_large"로
         # 알려 나머지는 계속 올리게 하고, 일반 페이지 로드면 친절한 에러 화면을 보여준다.
         # 사진뿐 아니라 동영상(Step 5)도 이 핸들러를 타므로 문구는 '파일'로 둔다.
+        # ⚠️ 숫자를 손으로 박아 두지 않는다 — 한도를 바꿨는데 문구만 옛 숫자로
+        #    남으면 화면이 거짓말을 한다(사람은 그 숫자를 믿고 파일을 자른다).
+        cap = max(_MAX_PHOTO_BYTES, gifmaker.MAX_VIDEO_BYTES) // (1024 * 1024)
+        msg = f"파일 1개는 {cap}MB 이하만 올릴 수 있어."
         if _wants_json():
-            return jsonify(ok=False, error="too_large",
-                           reason="파일 1개는 50MB 이하만 올릴 수 있어."), 413
+            return jsonify(ok=False, error="too_large", reason=msg), 413
         return (
             render_template(
                 "error.html",
                 heading="파일이 너무 커",
-                message="파일 1개는 50MB 이하만 올릴 수 있어. 조금 작은 파일로 다시 시도해줘.",
+                message=msg + " 조금 작은 파일로 다시 시도해줘.",
             ),
             413,
         )
