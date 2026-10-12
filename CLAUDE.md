@@ -106,7 +106,7 @@ Render 의 ephemeral 저장소는 tmpfs 가 아니라 **disk** 다(캡션 임시
 
 | 경로 | 실측 |
 |---|---|
-| `/videos/upload` 50MB (GIF 기능) | Δpeak **+7.0MB** — werkzeug 스풀 → 3.2MiB 청크 PUT |
+| ~~`/videos/upload` 50MB (GIF 기능)~~ | Δpeak **+7.0MB** — werkzeug 스풀 → 3.2MiB 청크 PUT. **2026-10-12 이 경로는 없어졌다** (아래) |
 | `/videos/<id>/stream` 50MB 중계 | Δpeak **+6.7MB** — 제너레이터, 소켓에 흘릴 뿐 |
 | `keyword_research.research` (claude 제외) | Δpeak **+0.1MB**, 저장 JSON 6.9KB |
 | 신규 기능 전체를 돌린 뒤 서버 RSS | 95MB → **97MB** (상주 증가 없음) |
@@ -525,7 +525,15 @@ import 만 하자(HTTP 요청 0회) 0.3초 만에 되살려 처리했다. 그러
   Render 무료티어(512MB·0.1 CPU, `python:3.12-slim`)에 ffmpeg 가 없고 올리지도 않는다.
   넘치면 화질을 몰래 깎지 않고 **내려받기를 막고 길이를 줄이라고 말한다**.
   영상 원본은 사진과 같은 OneDrive 폴더에 보관하되 **`videos` 테이블**로 분리한다
-  (vision 캡셔너·EXIF·블로그 서명 URL 경로에 50MB 영상이 들어가지 않게).
+  (vision 캡셔너·EXIF·블로그 서명 URL 경로에 영상이 들어가지 않게).
+  ⛔ **영상 바이트는 서버를 지나지 않는다** (2026-10-12) — 브라우저가 Graph 업로드
+  세션의 사전 인증 URL 로 **직접 PUT** 하고, 서버는 세션 발급과 사후 확인만 한다.
+  그래서 `MAX_VIDEO_BYTES`(50MB)는 근거가 사라져 **지웠고 새 숫자로 바꾸지 않았다**
+  — 남는 한도는 OneDrive 계정 용량뿐이고 Graph 가 직접 거절한다(gifmaker.py 주석).
+  근거는 실측이다: 업로드 세션 호스트(`api.onedrive.com` ·
+  `my.microsoftpersonalcontent.com`) 둘 다 preflight 와 실제 PUT 응답에 ACAO 를
+  주고 `Content-Range` 를 허용하며, **ACAC 는 주지 않는다**(→ `withCredentials=false`,
+  Content-Range 외 헤더 금지 — `static/gif.js` 머리말이 그 목록의 단일 원천).
   자세한 건 `docs/blog-review-spec.md` §13.
 - **`static/gif.js`** — 그 브라우저 변환기. **네이티브 우선**(`<video>` + Canvas),
   실패가 확인되면 **그때 비로소** WASM 디코더(ffmpeg 코어 ESM, 약 32MB)를 lazy 로드한다.
@@ -563,7 +571,8 @@ import 만 하자(HTTP 요청 0회) 0.3초 만에 되살려 처리했다. 그러
 | `GET /history` | 지난 질문+양쪽 답 (공개된 것만) |
 | `GET /insight` | `?year=&month=` 월간 정량(실시간)+정성(DB 캐시본). claude는 요청 경로에서 호출 안 함; 없으면 백그라운드 생성 트리거 후 플레이스홀더 |
 | `GET,POST /settings` | 앱 이름(Setting)·내 표시이름 수정 · 네이버 업로더 키 재발급 · **네이버 API HUB 키(사용자별) 저장/연결확인/삭제** — 값은 다시 렌더하지 않고 설정됨/미설정만 |
-| `POST /videos/upload` | (Step 5) 동영상 1개를 **청크 스트림**으로 OneDrive 에 보관 — 바이트를 통째로 메모리에 올리지 않는다 |
+| `POST /videos/upload-session` | (Step 5) OneDrive **업로드 세션만 발급** — 바이트를 한 개도 받지 않는다. 돌려주는 `upload_url` 은 capability URL 이라 로그·DB 에 남기지 않는다 |
+| `POST /videos/complete` | (Step 5) 브라우저의 "다 올렸다"를 **Graph 에 직접 물어 확인**하고 행을 남긴다 — 이름은 그 브라우저에 발급한 것만, 크기·id·타입은 Graph 가 말한 값 |
 | `GET /videos/<id>/stream` | (Step 5) **Range(206) 중계.** `<video>` seek 의 전제이자 same-origin 이라 Canvas taint 없음 |
 | `GET /videos/<id>/source` | (Step 5) 바이트 경로 (a)OneDrive 직접 / (b)앱 프록시 를 **실측(ACAO·206)으로** 가르고 행에 캐시 |
 | `GET /memories/<id>/thumb` | 그리드 썸네일 — **우리 자산**(grid 티어, DB 읽기). 서명·만료 없음 · immutable + ETag |

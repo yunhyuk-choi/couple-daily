@@ -6824,11 +6824,12 @@ def _register_routes(app: Flask):
 
     # ---- 동영상 (노선 2 Step 5) — 보관은 OneDrive, 변환은 브라우저 -----------
     # 사진 경로와 **일부러 갈라 둔다**: 영상은 자동 캡션(vision)·EXIF·블로그 서명
-    # URL·썸네일 프록시 중 어느 것도 타지 않는다. 0.1 CPU 워커에 50MB 영상을
-    # 먹이는 길을 아예 만들지 않는 게 요점이다(models.Video 머리말).
+    # URL·썸네일 프록시 중 어느 것도 타지 않는다. 0.1 CPU 워커에 영상을 먹이는
+    # 길을 아예 만들지 않는 게 요점이다(models.Video 머리말).
     #
-    # ⛔ 서버는 **영상 바이트를 변수에 담지 않는다.** 업로드는 청크 PUT
-    #    (onedrive.upload_stream), 다운로드는 Range 스트리밍(아래 video_stream)이다.
+    # ⛔ 서버는 **영상 바이트를 한 개도 받지 않는다.** 업로드는 브라우저가 OneDrive 로
+    #    직접 보내고(아래 `video_upload_session` → Graph 업로드 세션 → 브라우저 청크
+    #    PUT → `video_upload_complete`), 다운로드만 Range 스트리밍(video_stream)이다.
     def _video_or_404(video_id):
         u = current_user()
         video = db.session.get(Video, video_id)
@@ -6836,57 +6837,151 @@ def _register_routes(app: Flask):
             abort(404)
         return video
 
-    @app.route("/videos/upload", methods=["POST"])
-    @active_couple_required
-    def video_upload():
-        """동영상 1개를 OneDrive로 **스트리밍 업로드**하고 행을 남긴다 (AJAX 전용).
+    # 브라우저가 연 업로드 세션의 **저장 이름**을 이 사람 세션에 적어 둔다.
+    # 왜 필요한가: 완료 보고(`video_upload_complete`)가 "이 이름의 아이템을 내
+    # 것으로 등록해줘" 라고 말하는데, 그 이름을 *우리가 이 사람에게 발급했다*는
+    # 증거가 없으면 남이 올린 영상을 자기 것으로 등록할 수 있다. 이름 자체는
+    # 랜덤(timestamp+uuid8)이라 추측이 어렵지만, **추측 난이도를 보안으로 쓰지
+    # 않는다** — 서명 쿠키에 적힌 발급 기록과 대조한다.
+    _PENDING_VIDEO_KEY = "pending_video_names"
+    _PENDING_VIDEO_MAX = 8  # 쿠키가 불지 않게 — 최근 것만 남긴다
 
-        사진 업로더와 달리 ``file.read()`` 를 하지 않는다 — werkzeug 가 큰 업로드를
-        디스크로 스풀해 두므로 그 스트림을 3.2MiB 청크로 그대로 OneDrive 업로드
-        세션에 흘린다. 워커 메모리는 영상 크기와 무관하게 평평하다.
+    def _remember_pending_video(name):
+        names = [n for n in (session.get(_PENDING_VIDEO_KEY) or []) if n != name]
+        names.append(name)
+        session[_PENDING_VIDEO_KEY] = names[-_PENDING_VIDEO_MAX:]
+
+    def _is_pending_video(name):
+        return name in (session.get(_PENDING_VIDEO_KEY) or [])
+
+    def _drop_pending_video(name):
+        """다 쓴(또는 되살릴 수 없는) 발급 기록을 지운다 — 한 번만 쓰이게.
+
+        ⚠️ **판정과 분리해 둔다.** 둘을 합쳐 '확인과 동시에 소비'하면, OneDrive
+        조회가 일시적으로 실패(502)했을 때 바이트는 이미 올라가 있는데 그 영상을
+        **영원히 등록할 수 없게** 된다. 그래서 되살릴 수 있는 실패에서는 기록을
+        남겨 둔다.
         """
-        u = current_user()
+        names = [n for n in (session.get(_PENDING_VIDEO_KEY) or []) if n != name]
+        session[_PENDING_VIDEO_KEY] = names
+
+    @app.route("/videos/upload-session", methods=["POST"])
+    @active_couple_required
+    def video_upload_session():
+        """업로드 **세션만** 발급한다 — 바이트는 한 개도 받지 않는다.
+
+        예전엔 브라우저가 파일을 이 서버로 POST 하고 워커가 그걸 다시 OneDrive 로
+        청크 PUT 했다. 바이트가 우리를 지나기 때문에 ``MAX_CONTENT_LENGTH`` 55MB 와
+        영상 한도 50MB 가 걸렸고, 올리는 내내 Render 워커 하나가 묶였다 — 아이폰
+        4K 10초 클립 한 개가 이미 그 한도를 넘는다.
+
+        지금은 **브라우저가 OneDrive 에 직접 PUT** 한다. 이 엔드포인트가 돌려주는
+        ``upload_url`` 은 Graph 가 발급한 **사전 인증 URL**(capability URL)이고,
+        브라우저는 거기에 ``Content-Range`` 를 붙여 조각조각 올린다.
+
+        실측 근거 (2026-10-12, 이 오리진에서 직접 OPTIONS/PUT 을 쏴서 받아적음):
+          * ``api.onedrive.com`` → ``ACAO: <우리 오리진>`` ·
+            ``ACAM: GET, POST, DELETE, PATCH, PUT, HEAD, MOVE, COPY`` ·
+            ``ACAH: … Content-Range …``
+          * ``my.microsoftpersonalcontent.com`` → ``ACAO: *`` ·
+            ``ACAM: GET, POST, PUT, DELETE, …`` · ``ACAH: content-range``
+          * 두 호스트 모두 **실제 PUT 응답에도** ACAO 가 실려 온다.
+          * 두 호스트 모두 ``Access-Control-Allow-Credentials`` 를 **주지 않는다**
+            → 브라우저는 이 PUT 을 ``withCredentials=false`` 로 보내야 한다.
+
+        ⚠️ ``upload_url`` 은 자격증명이다 — **로그·DB·에러 메시지에 남기지 않는다.**
+        로그인한 본인에게만, 아이템 하나 범위로, 응답 본문으로만 건넨다.
+        """
         if not onedrive.onedrive_enabled():
             return jsonify(ok=False, error="onedrive_disabled",
                            reason="OneDrive 연결이 필요해."), 400
-        file = request.files.get("video")
-        if not file or not file.filename:
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        ctype = str(body.get("type") or "").strip()
+        try:
+            size = int(body.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not name:
             return jsonify(ok=False, error="empty", reason="영상을 선택해줘."), 400
-        if not gifmaker.is_allowed_video(file.filename, file.mimetype or ""):
+        if not gifmaker.is_allowed_video(name, ctype):
             return jsonify(ok=False, error="bad_type",
                            reason="동영상 파일만 올릴 수 있어."), 400
-
-        # 총 바이트를 먼저 잰다 — Content-Range 의 분모라 **정확해야** 한다.
-        stream = file.stream
-        stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        stream.seek(0)
         if size <= 0:
             return jsonify(ok=False, error="empty", reason="빈 파일이야."), 400
-        if size > gifmaker.MAX_VIDEO_BYTES:
-            mb = gifmaker.MAX_VIDEO_BYTES // (1024 * 1024)
-            return jsonify(ok=False, error="too_large",
-                           reason=f"영상 1개는 {mb}MB 이하만 올릴 수 있어."), 400
+        # ⛔ 여기에 바이트 상한을 새로 **발명하지 않는다.** 바이트가 우리를 지나지
+        #    않으므로 옛 50MB 를 정당화하던 근거(워커 메모리·요청 시간)가 통째로
+        #    사라졌다. 남는 한도는 우리가 정하는 것이 아니라 OneDrive 계정의 남은
+        #    용량이고, 그건 Graph 가 세션을 열거나 청크를 받을 때 직접 거절한다
+        #    (브라우저가 그 상태코드를 사람 문장으로 바꿔 말한다 — gif.js).
 
         try:
-            item_id, stored_name = onedrive.upload_stream(stream, size, file.filename)
+            upload_url, stored_name = onedrive.create_upload_session(name)
         except onedrive.OneDriveError:
-            log.exception("OneDrive video upload failed for couple %s", u.couple_id)
-            return jsonify(ok=False, error="upload_failed",
-                           reason="OneDrive 업로드에 실패했어."), 502
+            # ⚠️ 예외 문자열에 URL 이 들어갈 일이 없도록 모듈이 지키고 있지만,
+            #    여기서도 메시지를 통째로 내보내지 않는다.
+            log.exception("OneDrive upload session failed for couple %s",
+                          current_user().couple_id)
+            return jsonify(ok=False, error="session_failed",
+                           reason="OneDrive 업로드 세션을 열지 못했어."), 502
+
+        _remember_pending_video(stored_name)
+        return jsonify(ok=True, upload_url=upload_url, name=stored_name,
+                       chunk_size=onedrive.UPLOAD_CHUNK_BYTES)
+
+    @app.route("/videos/complete", methods=["POST"])
+    @active_couple_required
+    def video_upload_complete():
+        """브라우저가 "다 올렸다"고 보고한 것을 **Graph 에 직접 물어 확인**하고 기록한다.
+
+        클라이언트 보고는 *주장이지 증거가 아니다*. 그래서 여기서 믿는 것은
+        ``name`` 하나뿐이고(그나마 **우리가 이 세션에 발급한 이름인지** 대조한다),
+        아이템 id·크기·content-type 은 전부 OneDrive 에서 다시 읽는다. 아이템이
+        우리 ``couple-daily`` 폴더에 실제로 없으면 행을 만들지 않는다.
+        """
+        u = current_user()
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        original = str(body.get("original_name") or "").strip() or name
+        if not name:
+            return jsonify(ok=False, error="empty",
+                           reason="어떤 영상인지 알 수 없어."), 400
+        if not _is_pending_video(name):
+            # 이 브라우저가 연 세션이 아니다 — 남의 아이템을 자기 것으로 등록하는 길.
+            return jsonify(ok=False, error="unknown_session",
+                           reason="이 브라우저가 연 업로드가 아니야. 다시 올려줘."), 403
+        try:
+            item = onedrive.find_in_folder(name)
+        except onedrive.OneDriveError:
+            # ⚠️ 발급 기록을 **남겨 둔다** — 바이트는 이미 OneDrive 에 있을 수 있고,
+            #    이건 다시 물어보면 되는 실패다.
+            log.exception("OneDrive item verify failed for couple %s", u.couple_id)
+            return jsonify(ok=False, error="verify_failed",
+                           reason="OneDrive 에서 확인하지 못했어. 잠시 뒤 다시 해줘."), 502
+        if not item or item["size"] <= 0:
+            _drop_pending_video(name)
+            return jsonify(ok=False, error="not_found",
+                           reason="OneDrive 에 그 영상이 없어 — 업로드가 끝까지 가지 "
+                                  "못한 것 같아. 다시 올려줘."), 409
+        if Video.query.filter_by(onedrive_item_id=item["id"]).first():
+            _drop_pending_video(name)
+            return jsonify(ok=False, error="already_claimed",
+                           reason="이미 등록된 영상이야."), 409
 
         video = Video(
             couple_id=u.couple_id,
-            onedrive_item_id=item_id,
-            filename=stored_name[:255],
-            original_name=file.filename[:255],
+            onedrive_item_id=item["id"],
+            filename=item["name"][:255],
+            original_name=original[:255],
             uploaded_by=u.id,
-            size_bytes=size,
-            content_type=(file.mimetype
-                          or gifmaker.content_type_for(file.filename))[:100],
+            # ⛔ 크기도 **Graph 가 말한 값**을 쓴다 — 클라이언트가 보낸 숫자가 아니다.
+            size_bytes=item["size"],
+            content_type=(item["ctype"]
+                          or gifmaker.content_type_for(original))[:100],
         )
         db.session.add(video)
         db.session.commit()
+        _drop_pending_video(name)
         return jsonify(ok=True, video={
             "id": video.id,
             "name": video.original_name or video.filename,
@@ -9135,10 +9230,12 @@ def _register_routes(app: Flask):
     def _too_large(e):
         # 요청이 MAX_CONTENT_LENGTH를 넘었을 때. AJAX 업로더면 그 파일만 "too_large"로
         # 알려 나머지는 계속 올리게 하고, 일반 페이지 로드면 친절한 에러 화면을 보여준다.
-        # 사진뿐 아니라 동영상(Step 5)도 이 핸들러를 타므로 문구는 '파일'로 둔다.
         # ⚠️ 숫자를 손으로 박아 두지 않는다 — 한도를 바꿨는데 문구만 옛 숫자로
         #    남으면 화면이 거짓말을 한다(사람은 그 숫자를 믿고 파일을 자른다).
-        cap = max(_MAX_PHOTO_BYTES, gifmaker.MAX_VIDEO_BYTES) // (1024 * 1024)
+        # ⛔ 이제 이 핸들러를 타는 건 **사진뿐이다.** 영상은 브라우저가 OneDrive 로
+        #    직접 올리므로 요청 본문으로 들어오지 않는다 — 그래서 예전처럼
+        #    ``max(사진, 영상)`` 으로 부풀리지 않는다(영상 한도는 없어졌다).
+        cap = _MAX_PHOTO_BYTES // (1024 * 1024)
         msg = f"파일 1개는 {cap}MB 이하만 올릴 수 있어."
         if _wants_json():
             return jsonify(ok=False, error="too_large", reason=msg), 413

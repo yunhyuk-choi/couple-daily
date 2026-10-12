@@ -56,7 +56,11 @@
   }
 
   var STATE_URL = root.getAttribute("data-state-url");
-  var UPLOAD_URL = root.getAttribute("data-upload-url");
+  // 업로드는 두 엔드포인트로 갈렸다 — 서버는 **세션만 발급**하고(바이트를 받지
+  // 않는다), 다 올린 뒤 브라우저가 완료를 알리면 서버가 OneDrive 에 직접 물어
+  // 확인하고 기록한다. 옛 ``data-upload-url``(바이트를 받던 자리)은 없다.
+  var SESSION_URL = root.getAttribute("data-session-url");
+  var COMPLETE_URL = root.getAttribute("data-complete-url");
   var TOPIC = root.getAttribute("data-topic") || "후기";
   var GIFENC_URL = root.getAttribute("data-gifenc-url");
 
@@ -924,9 +928,31 @@
   // ----------------------------------------------------------------- //
   // 9. 업로드 — 사진과 같은 자리(OneDrive)에 올리고 목록에 더한다
   // ----------------------------------------------------------------- //
-  // 올리기 전에 **여기서** 막고 말한다. 50MB 를 몇 분 동안 올린 끝에 413 을 받는
-  // 것은 사람 입장에서 '조용히 죽은 것'과 구별되지 않는다 — 서버에 1바이트도
-  // 보내기 전에 판정이 가능한 두 가지(형식·크기)는 여기서 끝낸다.
+  // ⛔ 바이트는 **우리 서버를 지나지 않는다.** 서버는 OneDrive 업로드 세션만 열어
+  //    주고(`data-session-url`), 이 브라우저가 그 사전 인증 URL 로 조각조각 PUT 한
+  //    뒤, 끝났다고 서버에 알린다(`data-complete-url` — 서버는 그 말을 믿지 않고
+  //    OneDrive 에 직접 물어 확인한다).
+  //
+  //    실측 근거 (2026-10-12, 이 오리진으로 직접 OPTIONS/PUT 을 쏴서 받아적음):
+  //      api.onedrive.com                 → ACAO: <우리 오리진> · ACAM 에 PUT/DELETE ·
+  //                                         ACAH 에 Content-Range
+  //      my.microsoftpersonalcontent.com  → ACAO: * · ACAM 에 PUT/DELETE ·
+  //                                         ACAH: content-range
+  //      두 호스트 모두 실제 PUT 응답에도 ACAO 가 실려 오고,
+  //      **Access-Control-Allow-Credentials 는 주지 않는다.**
+  //
+  //    그래서 이 PUT 은 두 가지를 반드시 지킨다:
+  //      (1) ``withCredentials = false`` — ACAC 가 없으므로 자격 요청은 거부된다.
+  //      (2) **Content-Range 말고는 어떤 헤더도 붙이지 않는다** — 위 ACAH 목록에
+  //          없는 헤더(Authorization·Content-Type·X-Requested-With…)를 하나라도
+  //          붙이면 preflight 가 그 자리에서 막는다. uploadUrl 은 이미 인증된
+  //          URL이라 Bearer 도 필요 없다(붙이면 오히려 거부된다).
+
+  // 올리기 전에 **여기서** 막고 말한다 — 형식이 틀린 파일을 네트워크에 태우지 않는다.
+  // ⛔ 크기 검사는 **없다**(있던 50MB 한도를 지웠다). 바이트가 서버를 지나지 않게
+  //    되면서 그 숫자를 정당화하던 근거가 사라졌고, 근거 없는 숫자를 새로 발명하는
+  //    대신 지웠다 — 남는 한도는 OneDrive 계정 용량이고 그건 Graph 가 직접 거절한다
+  //    (gifmaker.py 의 긴 주석이 이 결정의 단일 원천이다).
   function uploadPrecheck(file) {
     var exts = SPEC.video_exts || [];
     var m = (file.name || "").match(/\.[A-Za-z0-9]+$/);
@@ -937,33 +963,33 @@
       return "동영상 파일만 올릴 수 있어 — 고른 건 \"" + (file.name || "이름 없는 파일") +
              "\" 야" + (exts.length ? " (" + exts.join(", ") + " 중 하나로 골라줘)" : "") + ".";
     }
-    var max = SPEC.max_video_bytes || 0;
-    if (max && file.size > max) {
-      return "이 영상은 " + mb(file.size) + " 라 보관 한도 " + mb(max) + " 를 " +
-             mb(file.size - max) + " 넘었어 — 서버에 보내기 전에 막았어(헛되이 " +
-             "올리고 있지 않아). 폰에서 필요한 구간만 먼저 잘라 짧게 만든 뒤 올려줘. " +
-             "이 한도는 GIF 를 굽는 쪽이 아니라, 원본을 OneDrive 에 보관하는 업로드에 걸리는 거야.";
+    if (!file.size) {
+      return "고른 파일이 비어 있어(0바이트) — 다른 파일을 골라줘.";
     }
     return "";
   }
 
   // 실패는 전부 사람이 읽는 문장으로 바꾼다. HTTP 상태를 통째로 버리던 자리
   // (``r.json().catch(() => null)``)가 "영상을 올리지 못했어." 한 줄로 모든 원인을
-  // 뭉개고 있었다 — 413(너무 큼)·401(로그인 풀림)·502(OneDrive)가 구별되지 않았다.
+  // 뭉개고 있었다 — 401(로그인 풀림)·502(OneDrive)가 구별되지 않았다.
+  //
+  // 이제 실패가 날 수 있는 자리가 **셋**이라 번역기도 둘이다:
+  //   (1) 세션 발급 / (3) 완료 기록 — *우리 서버* → ``uploadFailureText``
+  //   (2) 청크 PUT — *OneDrive* → ``putFailureText``
+  // 어느 쪽에서 죽었는지가 사람에게 가장 중요한 정보라 문장이 그걸 먼저 말한다.
   function uploadFailureText(status, text) {
     var j = null;
     try { j = JSON.parse(text); } catch (e) { j = null; }
     if (j && j.reason) return j.reason + " (HTTP " + status + ")";
     if (status === 0) {
-      return "요청이 서버에 닿지 못했어 — 네트워크가 끊겼거나, 서버가 받다가 연결을 " +
-             "끊었어(파일이 너무 크면 이렇게 보이기도 해). 와이파이를 확인하고 다시 해줘.";
-    }
-    if (status === 413) {
-      return "서버가 받을 수 있는 요청 크기를 넘었어 (HTTP 413). 한도 " +
-             mb(SPEC.max_video_bytes || 0) + " 안으로 잘라서 올려줘.";
+      return "요청이 우리 서버에 닿지 못했어 — 네트워크가 끊겼거나 서버가 자고 있어. " +
+             "와이파이를 확인하고 다시 해줘.";
     }
     if (status === 401 || status === 403) {
       return "로그인이 풀린 것 같아 (HTTP " + status + "). 새로고침해서 다시 로그인한 뒤 올려줘.";
+    }
+    if (status === 409) {
+      return "업로드가 끝까지 가지 못했거나 이미 등록된 영상이야 (HTTP 409). 다시 올려줘.";
     }
     if (status === 502 || status === 503 || status === 504) {
       return "OneDrive 쪽이 응답하지 않았어 (HTTP " + status + "). 잠시 뒤 다시 해줘.";
@@ -975,14 +1001,167 @@
            (plain ? " · " + plain.slice(0, 140) : "") + ". 다시 시도해보고, 계속 이러면 알려줘.";
   }
 
-  var uploadXhr = null;
+  // OneDrive 가 직접 돌려준 상태코드. **분기마다 다른 문장**이어야 한다 — 여기서
+  // 뭉개면 "왜 안 올라가지"를 사람이 영원히 알 수 없다.
+  function putFailureText(status) {
+    if (status === 0) {
+      return "OneDrive 로 보내던 중 연결이 끊겼어 — 와이파이/셀룰러를 확인하고 다시 올려줘. " +
+             "(바이트는 우리 서버가 아니라 네 브라우저에서 OneDrive 로 바로 가는 중이었어.)";
+    }
+    if (status === 401 || status === 403) {
+      return "OneDrive 업로드 자리의 유효기간이 지났어 (HTTP " + status + "). " +
+             "다시 올리면 새 자리를 받아서 처음부터 보낼게.";
+    }
+    if (status === 404 || status === 410) {
+      return "OneDrive 가 그 업로드 자리를 더 이상 모른대 (HTTP " + status + ") — " +
+             "중간에 취소됐거나 만료된 거야. 다시 올려줘.";
+    }
+    if (status === 409) {
+      return "OneDrive 에 같은 이름이 이미 있대 (HTTP 409). 다시 올리면 다른 이름으로 받을게.";
+    }
+    if (status === 416) {
+      return "보낸 구간이 OneDrive 가 기다리던 구간과 어긋났어 (HTTP 416) — " +
+             "이어보내기가 꼬인 거라 처음부터 다시 올리는 게 확실해.";
+    }
+    if (status === 423) {
+      return "OneDrive 가 그 파일을 잠가 뒀대 (HTTP 423). 잠시 뒤 다시 올려줘.";
+    }
+    if (status === 429) {
+      return "OneDrive 가 \"너무 빠르다\"며 잠깐 막았어 (HTTP 429). 조금 있다 다시 올려줘.";
+    }
+    if (status === 507) {
+      return "OneDrive 에 남은 용량이 모자라 (HTTP 507). 보관함을 정리하고 다시 올려줘. " +
+             "— 참고로 이제 영상 크기 한도는 우리 쪽엔 없어. 남은 한도는 이 용량뿐이야.";
+    }
+    if (status >= 500) {
+      return "OneDrive 쪽이 잠깐 넘어졌어 (HTTP " + status + "). 잠시 뒤 다시 올려줘.";
+    }
+    return "OneDrive 가 이 조각을 받지 않았어 — HTTP " + status +
+           ". 다시 시도해보고, 계속 이러면 알려줘.";
+  }
+
+  var uploadXhr = null;      // 지금 날아가는 중인 요청 (중단 버튼이 끊을 대상)
+  var uploadAborted = false; // 사람이 중단을 눌렀나 — 실패와 **구별해서** 말한다
+  var uploadSession = null;  // {upload_url, name, chunk_size}
   function setUploading(on) {
     if (el.uploadBtn) el.uploadBtn.disabled = on;
     if (el.uploadCancel) el.uploadCancel.hidden = !on;
   }
 
+  // 우리 서버와 주고받는 작은 JSON 요청. XHR 을 쓰는 이유는 아래 청크 PUT 과
+  // 같은 중단 배선(``uploadXhr``)을 공유하기 위해서다.
+  function postJson(url, body) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      uploadXhr = xhr;
+      xhr.open("POST", url, true);
+      xhr.withCredentials = true;   // 우리 서버 — 로그인 쿠키가 필요하다
+      xhr.timeout = 0;              // ⛔ 경과 시간으로 끊지 않는다
+      // 이 헤더가 있어야 서버가 HTML 에러 **페이지** 대신 JSON 을 준다
+      // (app._wants_json). 없으면 받은 건 HTML 이고, 그걸 파싱하다 실패해
+      // 이유가 통째로 사라졌다.
+      xhr.setRequestHeader("X-Requested-With", "fetch");
+      xhr.setRequestHeader("Accept", "application/json");
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.onerror = function () { reject({ kind: "server", status: 0, text: "" }); };
+      xhr.onabort = function () { reject({ kind: "abort" }); };
+      xhr.onload = function () {
+        var j = null;
+        try { j = JSON.parse(xhr.responseText); } catch (e) { j = null; }
+        if (xhr.status < 200 || xhr.status >= 300 || !j || !j.ok) {
+          reject({ kind: "server", status: xhr.status, text: xhr.responseText || "" });
+          return;
+        }
+        resolve(j);
+      };
+      xhr.send(JSON.stringify(body || {}));
+    });
+  }
+
+  // 조각 하나를 OneDrive 에 직접 PUT 한다. 성공하면 202(더 받을게) 또는
+  // 200/201(다 받았다 + driveItem JSON).
+  function putChunk(session, blob, first, last, total, onFrac) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      uploadXhr = xhr;
+      xhr.open("PUT", session.upload_url, true);
+      // ⛔ **자격을 함께 보내지 않는다** — 두 업로드 호스트 모두
+      //    ``Access-Control-Allow-Credentials`` 를 주지 않아(실측) 자격 요청은
+      //    브라우저가 그 자리에서 버린다. uploadUrl 자체가 이미 인증이다.
+      xhr.withCredentials = false;
+      xhr.timeout = 0;  // ⛔ 경과 시간으로 끊지 않는다 — 멈추는 길은 중단 버튼뿐
+      // ⛔ 여기 붙는 헤더는 **Content-Range 하나뿐이다.** 다른 헤더를 하나라도
+      //    더 붙이면 preflight 의 허용 목록(실측: content-range)에 없어서 막힌다.
+      xhr.setRequestHeader("Content-Range",
+                           "bytes " + first + "-" + last + "/" + total);
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) onFrac(e.loaded);
+      };
+      xhr.onerror = function () { reject({ kind: "put", status: 0 }); };
+      xhr.onabort = function () { reject({ kind: "abort" }); };
+      xhr.onload = function () {
+        if (xhr.status === 202) { resolve(null); return; }
+        if (xhr.status === 200 || xhr.status === 201) {
+          var j = null;
+          try { j = JSON.parse(xhr.responseText); } catch (e) { j = null; }
+          resolve(j || {});
+          return;
+        }
+        reject({ kind: "put", status: xhr.status });
+      };
+      xhr.send(blob);
+    });
+  }
+
+  // 세션 하나를 끝까지 보낸다. ``file.slice`` 는 바이트를 복사하지 않으므로 몇 GB
+  // 짜리여도 브라우저 메모리는 조각 하나 크기에서 평평하다.
+  function putAllChunks(file, session) {
+    var total = file.size;
+    var chunk = session.chunk_size || 3276800;
+    var sent = 0;
+    var done = null;
+    function step() {
+      if (uploadAborted) return Promise.reject({ kind: "abort" });
+      if (sent >= total) return Promise.resolve(done);
+      var last = Math.min(sent + chunk, total) - 1;
+      // ⛔ ``slice`` 에 타입 인자를 주지 않는다 — 타입이 붙으면 브라우저가
+      //    Content-Type 헤더를 달고, 그 헤더는 preflight 허용 목록에 없다.
+      var blob = file.slice(sent, last + 1);
+      var base = sent;
+      return putChunk(session, blob, sent, last, total, function (loaded) {
+        var f = Math.min(1, (base + loaded) / total);
+        progress(f, "영상 올리는 중… " + Math.round(f * 100) + "% (" +
+                    mb(base + loaded) + " / " + mb(total) + ") · OneDrive 로 직접");
+      }).then(function (item) {
+        sent = last + 1;
+        if (item) done = item;
+        return step();
+      });
+    }
+    return step();
+  }
+
+  // 중단·실패한 세션은 **지운다** — 반쪽 파일을 OneDrive 에 남기지 않는다.
+  // (실측: 두 업로드 호스트 모두 preflight 에서 DELETE 를 허용한다.)
+  function dropSession(session) {
+    if (!session || !session.upload_url) return;
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open("DELETE", session.upload_url, true);
+      xhr.withCredentials = false;
+      xhr.send();
+    } catch (e) { /* 정리는 실패해도 사람에게 더 말할 게 없다 */ }
+  }
+
+  function uploadDone() {
+    progress(null);
+    setUploading(false);
+    uploadXhr = null;
+    uploadSession = null;
+  }
+
   function upload(file) {
-    if (!UPLOAD_URL || !file) return;
+    if (!SESSION_URL || !COMPLETE_URL || !file) return;
     warn("");
     var bad = uploadPrecheck(file);
     if (bad) {
@@ -991,75 +1170,64 @@
       say("올리지 않았어 — 위 설명을 봐줘.", "error");
       return;
     }
-    var fd = new FormData();
-    fd.append("video", file);
-    say("영상 올리는 중… 0% (0KB / " + mb(file.size) + ")");
-    progress(0);
+    uploadAborted = false;
+    uploadSession = null;
     setUploading(true);
+    progress(0, "올릴 자리를 OneDrive 에 여는 중… (1/3)");
 
-    // ⚠️ ``fetch`` 로는 **업로드 진행률을 알 수 없다**(upload progress 이벤트가 없다).
-    //    50MB 를 올리는 몇 분 동안 화면이 아무 말도 못 하던 이유가 이것이다. XHR 은
-    //    ``upload.onprogress`` 를 주므로 "올라가는 중인가"에 화면이 답할 수 있다.
-    // ⛔ ``xhr.timeout`` 은 쓰지 않는다 — 경과 시간으로 일하는 업로드를 끊지 않는다.
-    //    멈추는 길은 사람이 누르는 '올리기 중단' 버튼뿐이다.
-    var xhr = new XMLHttpRequest();
-    uploadXhr = xhr;
-    xhr.open("POST", UPLOAD_URL, true);
-    xhr.withCredentials = true;
-    xhr.timeout = 0;
-    // 이 헤더가 있어야 서버의 413 핸들러가 HTML 에러 **페이지** 대신 JSON 을 준다
-    // (app._wants_json). 없으면 우리가 받은 건 HTML 이고, 그걸 JSON 으로 파싱하다
-    // 실패해 이유가 통째로 사라졌다.
-    xhr.setRequestHeader("X-Requested-With", "fetch");
-    xhr.setRequestHeader("Accept", "application/json");
-
-    xhr.upload.onprogress = function (e) {
-      if (!e.lengthComputable) {
-        say("영상 올리는 중… (" + mb(file.size) + " · 진행률을 알 수 없어)");
-        return;
+    postJson(SESSION_URL, {
+      name: file.name || "video",
+      size: file.size,
+      type: file.type || ""
+    }).then(function (s) {
+      uploadSession = s;
+      say("영상 올리는 중… 0% (0KB / " + mb(file.size) + ") · OneDrive 로 직접 (2/3)");
+      progress(0);
+      // ⚠️ ``fetch`` 로는 **업로드 진행률을 알 수 없다**(upload progress 이벤트가
+      //    없다). XHR 은 ``upload.onprogress`` 를 주므로 "올라가는 중인가"에 화면이
+      //    답할 수 있다 — 바이트가 우리 서버를 지나지 않게 된 뒤에도 그대로다.
+      return putAllChunks(file, s);
+    }).then(function (item) {
+      if (!item) {
+        // 마지막 조각까지 보냈는데 driveItem 이 안 왔다 — 조용히 넘기지 않는다.
+        throw { kind: "put", status: 999 };
       }
-      var f = e.loaded / e.total;
-      progress(f, "영상 올리는 중… " + Math.round(f * 100) + "% (" +
-                  mb(e.loaded) + " / " + mb(e.total) + ")");
-    };
-    // 브라우저가 다 보낸 뒤 서버가 OneDrive 로 옮기는 시간이 또 있다 — 그 구간도
-    // 말해 준다(여기서 조용해지면 사람은 멈춘 줄 안다).
-    xhr.upload.onload = function () {
-      progress(1, "다 보냈어 — 서버가 OneDrive 에 보관하는 중… (조금 걸려)");
-    };
-    xhr.onerror = function () {
-      progress(null);
-      setUploading(false);
-      uploadXhr = null;
-      warn(uploadFailureText(0, ""));
-      say("영상을 올리지 못했어.", "error");
-    };
-    xhr.onabort = function () {
-      progress(null);
-      setUploading(false);
-      uploadXhr = null;
-      say("올리기를 중단했어.", "error");
-    };
-    xhr.onload = function () {
-      progress(null);
-      setUploading(false);
-      uploadXhr = null;
-      var j = null;
-      try { j = JSON.parse(xhr.responseText); } catch (e) { j = null; }
-      if (xhr.status < 200 || xhr.status >= 300 || !j || !j.ok) {
-        warn(uploadFailureText(xhr.status, xhr.responseText || ""));
-        say("영상을 올리지 못했어.", "error");
-        return;
-      }
+      progress(1, "다 보냈어 — 우리 서버가 OneDrive 에 실제로 있는지 확인하는 중… (3/3)");
+      return postJson(COMPLETE_URL, {
+        name: uploadSession.name,
+        original_name: file.name || ""
+      });
+    }).then(function (j) {
+      uploadDone();
       onUploaded(j);
-    };
-    xhr.send(fd);
+    }).catch(function (e) {
+      var kind = (e && e.kind) || "server";
+      if (kind === "abort" || uploadAborted) {
+        dropSession(uploadSession);
+        uploadDone();
+        say("올리기를 중단했어 — OneDrive 에 올라가던 자리도 지웠어.", "error");
+        return;
+      }
+      if (kind === "put") {
+        dropSession(uploadSession);
+        uploadDone();
+        warn(putFailureText(e.status));
+        say("영상을 올리지 못했어 (OneDrive 로 보내는 중).", "error");
+        return;
+      }
+      // 우리 서버 쪽(세션 발급 또는 완료 기록). 완료 기록에서 깨졌다면 바이트는
+      // 이미 OneDrive 에 있다 — 세션을 지우지 않는다(지울 세션도 이미 없다).
+      uploadDone();
+      warn(uploadFailureText(e.status || 0, e.text || ""));
+      say("영상을 올리지 못했어.", "error");
+    });
   }
 
   function cancelUpload() {
-    if (uploadXhr) {
+    if (uploadXhr || uploadSession) {
+      uploadAborted = true;
       say("올리기를 중단하는 중…");
-      uploadXhr.abort();
+      if (uploadXhr) uploadXhr.abort();
     }
   }
 

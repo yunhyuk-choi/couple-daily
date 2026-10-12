@@ -638,7 +638,8 @@ GIF 는 프레임마다 256색이라 480p 3초가 수 MB까지 간다. 썸네일
 | 테이블 | `videos` (brand-new — `db.create_all()`). OneDrive item id + 이름 · 바이트 수 · MIME · `cors_probe`(실측 기록) |
 | 컬럼 | `blog_reviews.gif_json` (TEXT, nullable — `run_startup_migrations()` 가 ADD COLUMN) |
 | 내용 | `settings`(video_id·start·duration·width·fps) · `result`(bytes·width·height·frames·fps·duration·path·ok·over_by) · `diag` · `status` |
-| `POST /videos/upload` | 영상 1개를 **청크 스트림**으로 OneDrive 에 올리고 행 생성 (AJAX) |
+| `POST /videos/upload-session` | OneDrive **업로드 세션만** 발급 (AJAX). 바이트는 받지 않는다 — 브라우저가 그 사전 인증 URL 로 직접 청크 PUT 한다 (2026-10-12 CORS 실측 근거) |
+| `POST /videos/complete` | 브라우저의 완료 보고를 **Graph 에 직접 조회해 확인**하고 행 생성 — 이름은 그 브라우저에 발급한 것만, 숫자는 Graph 가 말한 값 |
 | `GET /videos/<id>/stream` | **Range(206)** 중계. same-origin 이라 Canvas taint 없음 |
 | `GET /videos/<id>/source` | 바이트 경로 (a)/(b) 판정 — 실측 후 행에 캐시 |
 | `POST /videos/<id>/delete` | OneDrive 에서 삭제 + 행 삭제 |

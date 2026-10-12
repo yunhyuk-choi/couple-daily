@@ -494,11 +494,13 @@
    썸네일과 **같은 자리에 같은 방식으로** 얹는다. 서버(Render 무료티어 512MB·0.1 CPU,
    python:3.12-slim)엔 ffmpeg 가 없다 — 그래서 디코딩·프레임 추출·GIF 인코딩을 전부
    **이 페이지를 보고 있는 브라우저**가 한다(static/gif.js). 영상 원본은 사진과 같은
-   OneDrive 폴더에 보관하고, 서버는 Range(206)로 바이트만 흘린다.
+   OneDrive 폴더에 보관하되 **올리는 바이트도 서버를 지나지 않는다** — 브라우저가
+   OneDrive 에 직접 PUT 하고, 서버는 업로드 세션만 발급한다. 내려받기만 Range(206) 중계.
    ⛔ 용량이 한도를 넘으면 화질을 몰래 깎지 않는다 — 내려받기를 막고 길이를 줄이라고 말한다. #}
 <div class="card rv-gif-card" id="rv-gif"
      data-state-url="{{ url_for('review_gif_state', rid=review.id) }}"
-     data-upload-url="{{ url_for('video_upload') }}"
+     data-session-url="{{ url_for('video_upload_session') }}"
+     data-complete-url="{{ url_for('video_upload_complete') }}"
      data-topic="{{ review.topic }}-GIF"
      data-gifenc-url="{{ url_for('static', filename='vendor/gifenc.esm.js') }}">
   <div class="rv-copy-head">
@@ -520,18 +522,19 @@
            style="display:none;" />
     <button type="button" class="btn ghost sm rv-gif-upload-cancel" hidden>✕ 올리기 중단</button>
     <span class="muted small">
-      {{ (gif_spec.max_video_bytes // 1048576) }}MB 이하 · 아이폰 .MOV 도 그대로 올리면 돼
+      크기 제한 없음 · 아이폰 .MOV 도 그대로 올리면 돼
     </span>
   </div>
 
-  {# 한도가 **왜** 있는지 — "브라우저가 만드는데 왜 크기 제한이?" 라는 물음에
-     화면이 직접 답한다. GIF 굽기는 브라우저가 하지만 **원본 보관은 서버를 거친다.** #}
+  {# 예전엔 여기서 "왜 크기 제한이 있는지"를 설명했다 — 그 한도(50MB)는 바이트가
+     서버를 지나기 때문에 있던 것이고, 이제 지나지 않으므로 **한도 자체가 없어졌다.**
+     화면도 같이 바뀌어야 한다(없는 한도를 말하면 사람이 멀쩡한 파일을 자른다). #}
   <p class="muted small rv-gif-why" style="margin:6px 0 0;">
-    GIF 로 굽는 건 네 브라우저가 해. 다만 <strong>원본 영상은 먼저 OneDrive 에 보관</strong>돼
-    (구간을 다시 고르거나 다른 후기에 또 쓰려면 남아 있어야 하니까). 그 보관 업로드만
-    서버를 거치기 때문에 <strong>{{ (gif_spec.max_video_bytes // 1048576) }}MB 한도는 그
-    업로드에 걸리는 것</strong>이고, GIF 를 만드는 데 걸리는 한도가 아니야.
-    (만든 GIF 자체의 한도는 따로 {{ (gif_spec.max_bytes // 1048576) }}MB.)
+    GIF 로 굽는 건 네 브라우저가 해. <strong>원본 영상은 먼저 OneDrive 에 보관</strong>되는데
+    (구간을 다시 고르거나 다른 후기에 또 쓰려면 남아 있어야 하니까),
+    그 바이트는 <strong>우리 서버를 거치지 않고 네 브라우저에서 OneDrive 로 바로</strong> 가.
+    그래서 <strong>영상 크기 한도는 없어</strong> — 남는 한도는 OneDrive 계정의 남은 용량뿐이고,
+    모자라면 OneDrive 가 직접 알려줘. (만든 GIF 자체의 한도는 따로 {{ (gif_spec.max_bytes // 1048576) }}MB.)
   </p>
 
   <label class="rv-gif-field" {% if not gif_videos %}hidden{% endif %}>
