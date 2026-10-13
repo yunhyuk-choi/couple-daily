@@ -12,11 +12,9 @@
 """
 import json
 
-import pytest
-
 import app as app_module
 import userscripts
-from models import BlogReview, User, db
+from models import db
 
 UP = userscripts.SOURCE
 WANT = userscripts.expected_version()
@@ -104,12 +102,6 @@ def test_no_warning_when_we_cannot_read_the_expected_version(monkeypatch):
 # --------------------------------------------------------------------------- #
 # 3. 엔드포인트 — 모든 응답 경로에 실린다
 # --------------------------------------------------------------------------- #
-def _key(user):
-    with app_module.app.app_context():
-        pass
-    return app_module._ensure_export_key(user)
-
-
 def test_pending_carries_the_warning_even_when_there_is_nothing_pending(
     client, couple_user, flask_app
 ):
