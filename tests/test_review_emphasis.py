@@ -29,7 +29,9 @@ import ai
 import app as app_module
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_BOOKMARKLET = os.path.join(_ROOT, "tools", "naver-bookmarklet.js")
+# 네이버 네이티브 경로의 정본 — 옛 북마클릿(`naver-bookmarklet.js`)은 폐기했고
+# 유저스크립트 하나만 남았다(그쪽이 URL+크롭 페이로드를 받을 수 있는 유일한 사본).
+_UPLOADER = os.path.join(_ROOT, "tools", "naver-uploader.user.js")
 
 PINK = "#e64980"      # 색 1 — '무엇'(상호·메뉴)
 BLUE = "#1c7ed6"      # 색 2 — '어디·언제·얼마'(위치·시간·가격)
@@ -207,7 +209,7 @@ def test_export_doc_keeps_raw_tokens_for_native_publish(flask_app, make_review):
 # --------------------------------------------------------------------------- #
 def test_bookmarklet_source_maps_tokens_to_nodestyle():
     """node 없이도 도는 소스 계약 — 팔레트가 서버와 **같은 값**이어야 한다."""
-    with open(_BOOKMARKLET, encoding="utf-8") as f:
+    with open(_UPLOADER, encoding="utf-8") as f:
         src = f.read()
     assert "function emphNodes" in src
     assert "EMPH_RE" in src
@@ -225,7 +227,7 @@ _NODE = shutil.which("node")
 @pytest.mark.skipif(not _NODE, reason="node 없음 — 소스 계약 테스트가 대신 지킨다")
 def test_bookmarklet_emphnodes_runs_and_styles_nodes(tmp_path):
     """북마클릿의 실제 `emphNodes` 를 node 로 돌려 nodeStyle 을 확인한다."""
-    with open(_BOOKMARKLET, encoding="utf-8") as f:
+    with open(_UPLOADER, encoding="utf-8") as f:
         src = f.read()
     start = src.index("  function tn(value, style) {")
     end = src.index("  function quotationComp(")
