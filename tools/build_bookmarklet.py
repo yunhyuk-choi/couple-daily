@@ -61,6 +61,13 @@ from urllib.parse import quote
 TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parent
 
+# 스크립트로 직접 돌면 sys.path[0] 이 `tools/` 라 루트 모듈을 못 찾는다. 버전을 읽는
+# 정규식은 **앱과 공용**이어야 하므로(둘이 따로 적으면 반드시 어긋난다) 루트를 얹고
+# `userscripts` 에서 가져온다.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import userscripts  # noqa: E402  (위 sys.path 조정 뒤에 와야 한다)
+
 SOURCE = TOOLS / "naver-uploader.user.js"
 BOOKMARKLET = TOOLS / "naver-uploader.bookmarklet.txt"
 
@@ -74,7 +81,6 @@ VERSION_TAG = "cd-up-version"
 # (영숫자는 `quote` 가 언제나 살린다 — 여기 적지 않아도 된다.)
 URL_SAFE = "!$&'()*+,-./:;=?@_~[]{}|^"
 
-_VERSION_META_RE = re.compile(r"^//\s*@version\s+(\S+)\s*$", re.M)
 _VERSION_LITERAL_RE = re.compile(
     r"(var\s+VERSION\s*=\s*)(['\"][^'\"]*['\"])(\s*;\s*/\*\s*" + re.escape(VERSION_TAG) + r"\s*\*/)"
 )
@@ -86,11 +92,15 @@ def normalize(text: str) -> str:
 
 
 def parse_version(src: str) -> str:
-    """유저스크립트 메타의 `@version` — 버전의 **단일 원천**."""
-    m = _VERSION_META_RE.search(src)
-    if not m:
+    """유저스크립트 메타의 `@version` — 버전의 **단일 원천**.
+
+    읽는 정규식은 `userscripts` 가 들고 있다(앱의 `expected_version()` 과 **같은**
+    한 줄을 봐야 한다). 여기서는 못 찾았을 때 생성을 멈추는 것만 자기 말로 한다.
+    """
+    v = userscripts.parse_version(src)
+    if not v:
         raise SystemExit(f"`@version` 줄을 찾지 못했다: {SOURCE}")
-    return m.group(1)
+    return v
 
 
 def stamp_version(src: str) -> str:

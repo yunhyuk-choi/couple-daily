@@ -133,6 +133,15 @@
     <button class="btn ghost" type="button" id="export-key-copy">복사</button>
   </div>
   <p class="muted small" id="export-key-msg" aria-live="polite"></p>
+  {# 설치된 사본이 뒤처졌다는 사실은 **앱이 말한다** — 그 사본은 스스로 말할 줄
+     모른다(버전을 보내는 기능 자체가 나중에 생겼다). 한 번도 소식이 없으면
+     uploader 가 None 이라 아무 말도 하지 않는다(안 쓰는 사람에게 소음 금지). #}
+  {% if uploader %}
+  <p class="small" style="margin:6px 0 0;padding:8px 10px;border-radius:8px;
+            background:#fff3bf;color:#5f3f00;border:1px solid #f0c000;">
+    ⚠ {{ uploader.warning }}
+  </p>
+  {% endif %}
   <form method="post" class="stack-sm"
         onsubmit="return confirm('키를 재발급하면 기존 유저스크립트는 새 키로 다시 붙여넣어야 해. 계속할까?');">
     <input type="hidden" name="rotate_export_key" value="1" />

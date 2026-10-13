@@ -64,6 +64,7 @@ import naver_api
 import onedrive
 import previews
 import thumbnail
+import userscripts
 from models import (
     Answer,
     Bet,
@@ -4388,6 +4389,52 @@ def _gen_export_key():
     return secrets.token_urlsafe(18)
 
 
+def _record_uploader_version(user, sent_version):
+    """업로더가 말한 버전을 사용자 행에 적는다. **절대 raise 하지 않는다.**
+
+    값이 그대로면 쓰지 않는다 — 네이버 글 하나 올리는 동안 이 엔드포인트가 여러 번
+    불릴 수 있는데 매번 UPDATE 를 날릴 이유가 없다. ``uploader_seen_at`` 은
+    '마지막 소식'이지 '마지막 호출'이 아니다.
+
+    ⚠️ **버전을 안 보낸 것도 소식이다.** 그 경우 ``uploader_version`` 은 계속 NULL
+    이지만 ``uploader_seen_at`` 은 반드시 찍혀야 한다 — 화면이 "말할 게 있나"를
+    그 시각 하나로 판정하기 때문에(``uploader_status``), 안 찍으면 **버전을 안
+    보내는 옛 사본에 대해서만 영원히 침묵**한다. 정확히 말해야 할 사람들이다.
+    """
+    try:
+        if (user.uploader_version or "") == (sent_version or "") and (
+            user.uploader_seen_at is not None
+        ):
+            return
+        user.uploader_version = sent_version or None
+        user.uploader_seen_at = datetime.utcnow()
+        db.session.commit()
+    except Exception:  # noqa: BLE001 — 기록 실패가 발행을 막지 않는다
+        db.session.rollback()
+        log.exception("업로더 버전 기록 실패 (user=%s)", getattr(user, "id", None))
+
+
+def uploader_status(user):
+    """앱 화면이 "네 업로더가 뒤처졌다"고 말할 재료. 말할 게 없으면 ``None``.
+
+    ⛔ **한 번도 소식이 없으면 아무 말도 하지 않는다** — 업로더를 안 쓰는 사람에게
+    "업데이트해라"는 소음이다. ``uploader_seen_at`` 이 있다는 건 그 사람이 실제로
+    그 스크립트를 돌렸다는 뜻이고, 그때만 말한다.
+    """
+    if user is None or getattr(user, "uploader_seen_at", None) is None:
+        return None
+    warn = userscripts.version_warning(getattr(user, "uploader_version", None))
+    if not warn:
+        return None
+    return {
+        "warning": warn,
+        "installed": getattr(user, "uploader_version", None)
+        or userscripts.LEGACY_VERSION,
+        "expected": userscripts.expected_version(),
+        "seen_at": user.uploader_seen_at,
+    }
+
+
 def _ensure_export_key(u):
     """사용자에게 export_key가 없으면 생성·저장(유니크 충돌 시 재시도). 값을 반환."""
     if getattr(u, "export_key", None):
@@ -7794,6 +7841,8 @@ def _register_routes(app: Flask):
             # 값이 아니라 **불리언만** 넘긴다 — 템플릿이 키를 다시 그릴 방법 자체를
             # 안 갖게 한다.
             naver_keys_set=u.has_naver_api_keys,
+            # 설치된 업로더가 뒤처졌나 — 말할 게 없으면 None(설치 안 한 사람 무소음).
+            uploader=uploader_status(u),
         )
 
     # ---- in-app notifications ----
@@ -8512,6 +8561,10 @@ def _register_routes(app: Flask):
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
             naver_keys_set=u.has_naver_api_keys,
+            # 📤 가 보낼 상대(네이버 업로더)가 뒤처졌는지 — 여기서 말해야 한다.
+            # 뒤처진 사본은 자기 화면에 경고를 띄울 줄도 모른다(그 기능이 나중에
+            # 생겼다). 앱이 받아 적어 둔 버전으로 **앱이 대신** 말한다.
+            uploader=uploader_status(u),
             # 'pending' 두 건(초안·썸네일)의 생성이 실제로 살아 있는지 — 화면이
             # '작성중'만 반복하지 않고 무슨 일이 났는지 말하게 하는 재료.
             review_state=review_pending_verdict(review),
@@ -8586,6 +8639,18 @@ def _register_routes(app: Flask):
         404가 아니라 **200 ``{"pending": false}``** 로 낸다 — 브라우저가 CORS로 막힌 404를
         읽지 못해 fetch가 NetworkError로 reject되던 문제를 피하고, "할 일 없음"을 깔끔히
         전달한다. 키 유무는 누설하지 않는다(잘못된 키·무대기 모두 pending:false). 쿠키 불필요.
+
+        ⭐ **이 호출이 스크립트가 앱에 거는 유일한 연락이다** — 그래서 여기에 버전을
+        싣는다(``?v=``). 앱은 둘을 한다:
+
+          1. ``version_warning`` 을 **모든 응답 경로**에 실어 돌려준다. 버전을 보낼 줄
+             아는 사본은 그걸 오버레이 맨 위에 띄운다.
+          2. 받은 버전을 **사용자 행에 적어 둔다.** 뒤처진 사본은 (1)을 띄울 줄도
+             모르기 때문이다 — 버전을 보내는 기능 자체가 나중에 생겼다. 적어 두면
+             앱 화면(설정·후기 상세)이 다음에 대신 말해 준다.
+
+        버전이 안 와도 **아무것도 깨지지 않는다** — "어떤 사본인지 모르겠다"로 안내할
+        뿐이고, 페이로드 전달은 예전과 똑같이 진행된다(``userscripts.version_warning``).
         """
         def _cors(resp):
             resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -8601,13 +8666,21 @@ def _register_routes(app: Flask):
             return resp
 
         key = (request.args.get("k") or "").strip()
+        sent_version = userscripts.normalize_sent(request.args.get("v"))
+        # 기대값과 다르면(안 보냈으면 '모르겠다'로) 이 문장이 모든 응답에 실린다.
+        warn = userscripts.version_warning(sent_version)
         if not key:  # 진짜 잘못된 요청만 400 — 단, ACAO는 반드시 붙인다.
-            return _cors(jsonify(pending=False, error="missing_key")), 400
+            return _cors(jsonify(pending=False, error="missing_key",
+                                 version_warning=warn)), 400
 
         try:
+            user = User.query.filter_by(export_key=key).first()
+            # 버전은 **대기 유무와 무관하게** 적어 둔다 — 설치본이 살아 있다는 사실
+            # 자체가 앱 화면이 말해야 할 재료다. 실패해도 본업을 막지 않는다.
+            if user is not None:
+                _record_uploader_version(user, sent_version)
             rid = _naver_export_take(key)  # clear-on-serve
             if rid:
-                user = User.query.filter_by(export_key=key).first()
                 review = db.session.get(BlogReview, rid)
                 if user is not None and review is not None and review.couple_id == user.couple_id:
                     doc_data, images = _build_export_payload(review)
@@ -8616,12 +8689,13 @@ def _register_routes(app: Flask):
                         payload["pending"] = True
                         payload["rid"] = rid
                         payload["images"] = images or []
+                        payload["version_warning"] = warn
                         return _cors(jsonify(payload))
         except Exception:  # noqa: BLE001 — 어떤 실패든 CORS 붙은 응답으로(누설·NetworkError 방지)
             db.session.rollback()
             log.exception("naver-export pending 처리 실패")
         # 무대기 / 잘못된 키 / 만료 / 내부 실패 → 200 {"pending": false} (+ACAO)
-        return _cors(jsonify(pending=False))
+        return _cors(jsonify(pending=False, version_warning=warn))
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
     @active_couple_required

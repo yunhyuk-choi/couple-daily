@@ -104,6 +104,22 @@ def run_startup_migrations():
                             "startup migration: failed dropping NOT NULL on users.%s", col
                         )
 
+        # 1d) 업로더 유저스크립트가 말한 버전(+시각). 없을 때만 추가한다.
+        #     기존 행은 NULL 로 남고, NULL 은 '아직 아무 말도 못 들었다'라서 화면이
+        #     아무 경고도 하지 않는다(설치 안 한 사람을 괴롭히지 않는다).
+        for col, ddl in (
+            ("uploader_version", "VARCHAR(40)"),
+            ("uploader_seen_at", "TIMESTAMP"),
+        ):
+            if col in cols:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
+                log.info("startup migration: added users.%s", col)
+            except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                log.exception("startup migration: failed adding users.%s", col)
+
         # 3) photos: Phase-2 vision captioning columns (tags + caption_status).
         #    The `photos` table pre-exists from Phase 1; add the two new columns
         #    if missing. caption_status is added with a server DEFAULT 'ready' so
@@ -372,6 +388,13 @@ class User(db.Model):
     # 네이버 업로더 유저스크립트(공개 pending API) 인증용 개인 토큰. 없으면 최초
     # 접근 시 생성한다. URL-safe(~24자). 추가는 run_startup_migrations가 ALTER로 반영.
     export_key = db.Column(db.String(32), unique=True, nullable=True, index=True)
+    # 네이버 업로더 유저스크립트가 **마지막으로 자기 입으로 말한** 버전과 그 시각.
+    # 왜 DB 에 적나 — 뒤처진 사본은 그 사실을 **자기 화면에 띄울 줄도 모른다**(버전을
+    # 보내는 기능 자체가 나중에 생겼다). 응답에 경고를 실어 보내는 것만으로는 바로
+    # 그 사람에게 닿지 않는다. 그래서 앱이 받아 적고, **앱 화면**이 대신 말한다.
+    # NULL = 아직 한 번도 안 왔다(= 설치 안 했을 수도) → 아무 말도 하지 않는다.
+    uploader_version = db.Column(db.String(40), nullable=True)
+    uploader_seen_at = db.Column(db.DateTime, nullable=True)
     # --- 네이버 API HUB 자격증명 (키워드 조사용, 선택) ------------------------
     # **사용자별**로 둔다 — 두 사람이 각자 발급받은 키를 쓸 수 있어야 한다.
     #

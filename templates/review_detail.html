@@ -693,6 +693,16 @@
   {# 📤 의 **보이는 결과창**. 성공도 실패도 여기서 말한다 — 토스트는 1.8초 뒤
      사라지므로 "계속 실패"만 남고 이유가 안 남는 자리였다. 실패하면 페이로드를
      이 칸에 띄워 손으로 복사할 길을 준다(모바일 window.prompt 는 긴 값을 못 쓴다). #}
+  {# ⚠ 설치된 네이버 업로더가 뒤처졌다 — **앱이 말한다.** 그 사본은 자기 입으로
+     말할 줄 모른다(버전을 보내는 기능 자체가 나중에 생겼다). 📤 가 보낼 상대가
+     옛 코드면 조용히 이상하게 동작하므로, 누르기 전에 보여 준다. 한 번도 소식이
+     없으면 uploader 가 None 이라 이 칸은 아예 안 그려진다. #}
+  {% if uploader %}
+  <p class="small" style="margin:8px 0 0;padding:8px 10px;border-radius:8px;
+            background:#fff3bf;color:#5f3f00;border:1px solid #f0c000;">
+    ⚠ {{ uploader.warning }}
+  </p>
+  {% endif %}
   <div id="export-result" class="rv-export-result" hidden>
     <p id="export-msg" class="rv-export-msg"></p>
     <textarea id="export-payload" class="rv-export-payload" rows="4" readonly hidden></textarea>
