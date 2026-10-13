@@ -110,3 +110,35 @@ def test_visited_when_is_still_an_input_and_still_reaches_the_prompt():
         "문래갈매기", "문래동", "맛있었어요", 8, {"visited_when": "일요일 저녁"}
     )
     assert "일요일 저녁" in block
+
+
+# --------------------------------------------------------------------------- #
+# 3. 디바이더 — 이모지 장식 대신 네이버 기본 구분선
+# --------------------------------------------------------------------------- #
+EMOJI_DIVIDER_BITS = ("· · ·", "☕️", "🍰", "📷", "🌿", "🍽️", "🤍", "✱")
+
+
+def test_copy_html_has_no_emoji_divider(flask_app, make_review):
+    html = app_module._review_copy_html(_ready(make_review))
+    for bad in EMOJI_DIVIDER_BITS:
+        assert bad not in html, f"이모지 디바이더 조각이 남았다: {bad}"
+
+
+def test_copy_html_separates_headings_with_the_naver_default_rule(flask_app, make_review):
+    """소제목 앞 장식은 네이버 기본 구분선 하나다 — 이 레포가 이미 쓰던 `<hr>` 모양."""
+    html = app_module._review_copy_html(_ready(make_review))
+    hr = '<hr style="border:0;border-top:1px solid #e5e5e5;margin:26px 0;">'
+    assert hr in html
+    lines = html.split("\n")
+    h3_at = [i for i, ln in enumerate(lines) if ln.startswith("<h3")]
+    assert len(h3_at) == 2, "소제목 두 개가 <h3> 로 나와야 한다"
+    for i in h3_at:
+        # 소제목 **바로 앞**이 구분선이어야 한다 — 사이에 장식 문단이 끼면 안 된다.
+        assert lines[i - 1] == hr, f"소제목 앞 줄이 구분선이 아니다: {lines[i - 1]!r}"
+
+
+def test_userscript_keeps_the_naver_default_horizontal_line():
+    src = USERSCRIPT.read_text(encoding="utf-8")
+    assert "'@ctype': 'horizontalLine', id: sid(), layout: 'line1'" in src
+    for bad in EMOJI_DIVIDER_BITS:
+        assert bad not in src, f"유저스크립트에 이모지 디바이더 조각이 남았다: {bad}"

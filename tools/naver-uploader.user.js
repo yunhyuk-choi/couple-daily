@@ -1128,6 +1128,11 @@
     return o;
   }
   function textComp(paras) { return { '@ctype': 'text', id: sid(), layout: 'default', value: paras }; }
+  // ⭐ **네이버 기본 구분선.** 스마트에디터 ONE 이 기본으로 주는 구분선 컴포넌트이고,
+  //    자매 레포 naver-ent-autopost 의 `hrComp()` 도 **글자까지 같은 값**이라 운영에서
+  //    검증된 모양이다(스타일 값을 추측해 박지 않는다). 소제목·매듭 앞 장식은 이것
+  //    하나뿐이고 이모지 디바이더는 쓰지 않는다 — app.py `_review_copy_html` 의 `HR`
+  //    이 HTML(클립보드 폴백) 쪽 짝이다.
   function hrComp() { return { '@ctype': 'horizontalLine', id: sid(), layout: 'line1' }; }
   function imageComp(meta) {
     return {

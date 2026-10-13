@@ -4535,12 +4535,17 @@ def _review_copy_html(review):
         return str(escape(str(v or "").strip()))
 
     # --- 감성 후기 v2 팔레트/스타일(빌더가 고정 — AI는 색을 못 낸다) ---------
+    # ⭐ **구분선은 네이버 기본 구분선 하나뿐이다.** 이 `<hr>` 는 스마트에디터 ONE 이
+    #    `horizontalLine`(= 유저스크립트 `hrComp()`, `layout:'line1'`)으로 받는 모양이고,
+    #    자매 레포 naver-ent-autopost 의 `publish._HR` 도 **글자까지 같은 값**이라 둘 다
+    #    운영에서 검증된 모양이다. 새로 만들거나 스타일 값을 추측해 박지 않는다.
     HR = '<hr style="border:0;border-top:1px solid #e5e5e5;margin:26px 0;">'
     CENTER = 'style="text-align:center;margin:0 0 6px;"'          # 본문 한 줄
     H3 = ('style="text-align:center;font-size:17px;font-weight:800;'
           'color:#222;margin:6px 0 14px;"')
-    # 소제목 장식 이모지 — 빌더가 heading 순서로 순환(AI가 못 고른다).
-    MOTIFS = ["☕️", "🍰", "📷", "🌿", "🍽️", "🤍"]
+    # ⛔ 소제목 장식 이모지(`· · · 🌿 · · ·`)는 없앴다 — 사용자 지시: "이모지로 넣어지는
+    #    디바이더들도 제거해. 디바이더 넣고 싶으면 네이버 (기본) 디바이더 사용하도록해".
+    #    자리는 바로 위 `HR` 이 이미 채우고 있었다(장식은 그 **덤**이었다).
 
     photos = review.photos_ordered
     score = max(0, min(10, int(review.overall_score or 0)))
@@ -4665,7 +4670,6 @@ def _review_copy_html(review):
         )
 
     # 3) 블록을 순서대로 렌더.
-    motif_i = 0
     has_quote = False
     for blk in data.get("blocks") or []:
         if not isinstance(blk, dict):
@@ -4675,13 +4679,8 @@ def _review_copy_html(review):
             heading = (blk.get("text") or "").strip()
             if not heading:
                 continue
+            # 소제목 앞 장식은 네이버 기본 구분선 하나다(이모지 줄 없이 바로 소제목).
             add_hr()
-            motif = MOTIFS[motif_i % len(MOTIFS)]
-            motif_i += 1
-            out.append(
-                '<p style="text-align:center;color:#c4c4c4;letter-spacing:3px;'
-                f'margin:22px 0 8px;">· · · {motif} · · ·</p>'
-            )
             out.append(f'<h3 {H3}>{esc(heading)}</h3>')
         elif t == "para":
             center_lines(blk.get("text"))
