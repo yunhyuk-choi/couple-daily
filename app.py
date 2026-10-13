@@ -3371,6 +3371,16 @@ def generate_review(app, review_id):
                 # 메모에 남는다). 아무도 안 넣었으면 조사는 그냥 꺼진다.
                 creds, key_owner = _naver_credentials_for(review)
 
+                # ⭐ **사람이 고친 키워드가 있으면 조사를 다시 돌리지 않는다.**
+                # 조사가 내놓는 것의 본체는 메인·보조 키워드인데 그건 어차피
+                # override 에 밀려 버려진다 — 버려질 답을 받으려고 claude 를 두 번
+                # 더 부르고 네이버 API 를 왕복하는 것은 낭비다. 근거(후보별 검색
+                # 결과·트렌드)는 지난 조사 메모에 그대로 살아 있고, 화면도 그걸
+                # 보여 준다. 다시 조사하고 싶으면 화면에서 '조사 결과로 되돌리기'로
+                # override 를 지우면 된다(그 다음 생성부터 조사가 다시 돈다).
+                prior_research = review.research
+                keyword_override = keyword_research.read_override(prior_research)
+
                 # ---- 진척 계획 — 화면이 "4/8단계"를 말할 수 있게 ----------
                 # 이 파이프라인의 단계는 **claude 를 부르는 횟수**가 아니라 사람이
                 # 기다리는 구간이다: 조사 3(키가 있을 때만) + 본문 1 + 사진당 1.
@@ -3378,7 +3388,7 @@ def generate_review(app, review_id):
                 # 쓰기 전엔 모른다) — 실제 수가 나오면 분모를 고친다.
                 research_on = bool(
                     (creds[0] or "").strip() and (creds[1] or "").strip()
-                )
+                ) and keyword_override is None
                 prog = _JobProgress(
                     f"review:{review_id}",
                     (len(keyword_research.STEPS) if research_on else 0)
@@ -3412,19 +3422,31 @@ def generate_review(app, review_id):
                         # (1) 키워드 조사 → (2) 본문 생성. 조사는 **절대 생성을 막지
                         # 않는다** — 키가 없으면 skipped, 실패하면 failed를 메모로
                         # 남기고 지금까지와 똑같이 쓴다.
-                        try:
-                            research = keyword_research.research(
-                                topic, location, prose, overall, details,
-                                client_id=creds[0], client_secret=creds[1],
-                                key_owner=key_owner, on_step=prog.step,
+                        if keyword_override is not None:
+                            # 사람이 고른 키워드가 이긴다 — 지난 메모를 그대로 들고
+                            # 간다(조사 근거는 거기 살아 있고, override 도 거기 있다).
+                            research = prior_research
+                        else:
+                            try:
+                                research = keyword_research.research(
+                                    topic, location, prose, overall, details,
+                                    client_id=creds[0], client_secret=creds[1],
+                                    key_owner=key_owner, on_step=prog.step,
+                                )
+                            except ai.Cancelled:
+                                raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
+                            except Exception:  # noqa: BLE001 — 조사는 best-effort
+                                log.exception(
+                                    "keyword research raised (review=%s)", review_id
+                                )
+                                research = {"status": "failed", "reason": "exception"}
+                            # ⚠️ 새 조사 결과에도 사람의 선택을 **다시 얹는다.**
+                            # 지금은 override 가 없을 때만 여기 오지만, 이 한 줄이
+                            # 없으면 나중에 누가 위 분기를 건드리는 순간 사람이 고친
+                            # 것이 조용히 사라진다(이 기능이 무의미해지는 자리다).
+                            research = keyword_research.apply_override(
+                                research, keyword_override
                             )
-                        except ai.Cancelled:
-                            raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
-                        except Exception:  # noqa: BLE001 — 조사는 best-effort
-                            log.exception(
-                                "keyword research raised (review=%s)", review_id
-                            )
-                            research = {"status": "failed", "reason": "exception"}
                         prog.step("본문 쓰는 중")
                         try:
                             result = ai.write_review(
@@ -8560,6 +8582,10 @@ def _register_routes(app: Flask):
             # 조사 메모 카드 재료. research는 dict(없으면 None)이고, 키 보유 여부는
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
+            # 글에 실제로 먹는 키워드(사람이 고쳤으면 그것) — 화면과 프롬프트가
+            # **같은 함수**를 본다. 안 그러면 "화면엔 내가 고친 게 보이는데 글은
+            # 딴 말"이 생긴다.
+            keywords=keyword_research.effective_keywords(review.research),
             naver_keys_set=u.has_naver_api_keys,
             # 📤 가 보낼 상대(네이버 업로더)가 뒤처졌는지 — 여기서 말해야 한다.
             # 뒤처진 사본은 자기 화면에 경고를 띄울 줄도 모른다(그 기능이 나중에
@@ -8781,6 +8807,53 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("후기를 삭제했어.", "success")
         return redirect(url_for("reviews"))
+
+    @app.route("/reviews/<int:rid>/keywords", methods=["POST"])
+    @active_couple_required
+    def review_keywords(rid):
+        """사람이 고친 키워드를 저장한다 — **다음 생성부터** 쓰인다.
+
+        왜 이 라우트가 있나 — 키워드는 지금까지 **추천만 되고 사람이 조율할 수
+        없었다.** 방향이 틀렸을 때 고칠 창구가 없으면 그 뒤 글 전체가 틀린 방향으로
+        간다. 여기서 받은 것은 조사 메모의 ``override`` 자리에 들어가고,
+        ``ai.format_keyword_block`` 이 **AI 조사보다 먼저** 본다.
+
+        입력은 ``keywords`` 한 칸이다 — **한 줄에 하나, 첫 줄이 메인.** 화면의 배지
+        편집기는 이 textarea 를 보기 좋게 감싼 것일 뿐이라, JS 가 없어도 같은 폼이
+        그대로 동작한다(서버가 파싱하는 모양이 하나뿐이라 둘이 갈라질 자리가 없다).
+
+        ⛔ **여기서 재생성을 걸지 않는다.** 이미 선 초안을 자동으로 다시 쓰는 것은
+        사람이 누르지 않은 claude 호출이다. 다시 쓰려면 화면의 「이 키워드로 다시
+        쓰기」를 사람이 누른다(그게 ``review_regenerate`` 다).
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+
+        if request.form.get("reset"):
+            override = None
+        else:
+            raw = request.form.get("keywords") or ""
+            override = keyword_research.normalize_override(raw.splitlines())
+
+        merged = keyword_research.apply_override(review.research, override)
+        try:
+            review.research_json = json.dumps(merged, ensure_ascii=False)
+            review.updated_at = datetime.utcnow()
+            db.session.commit()
+        except Exception:  # noqa: BLE001
+            db.session.rollback()
+            log.exception("키워드 저장 실패 (review=%s)", rid)
+            flash("키워드를 저장하지 못했어 🙏", "deny")
+            return redirect(url_for("review_detail", rid=rid))
+
+        if override is None:
+            flash("키워드를 조사 결과로 되돌렸어. 다음 생성부터 적용돼.", "success")
+        else:
+            flash("키워드를 저장했어. **다음 생성부터** 적용돼 — 지금 초안에 "
+                  "반영하려면 '이 키워드로 다시 쓰기'를 눌러줘.", "success")
+        return redirect(url_for("review_detail", rid=rid))
 
     @app.route("/reviews/<int:rid>/regenerate", methods=["POST"])
     @active_couple_required

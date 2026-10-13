@@ -2382,19 +2382,40 @@ NO_KEYWORD_BLOCK = (
 def format_keyword_block(research):
     """``keyword_research`` 산출 dict → blog-review 프롬프트에 넣을 텍스트 블록.
 
-    조사가 없거나 선정에 실패했으면 ``NO_KEYWORD_BLOCK``. 순수 함수라 테스트가 쉽다.
+    ⭐ **사람이 고친 키워드(``override``)가 AI 조사(``selection``)를 이긴다.** 이
+    우선순위의 단일 원천은 ``keyword_research.effective_keywords`` 이고 여기서는
+    그걸 부르기만 한다 — 화면도 같은 함수를 보므로 "화면엔 내가 고친 게 보이는데
+    글은 딴 말"이 생길 자리가 없다.
+
+    ⚠️ 사람이 **메인을 바꿨으면** 조사 쪽 설명(선정 이유·독자가 읽어야 할 것)은
+    붙이지 않는다 — 그건 *다른 키워드*에 대한 설명이라 그대로 두면 모델에게 서로
+    어긋나는 지시를 주게 된다. 반면 '조사의 한계'는 데이터 품질 이야기라 메인이
+    바뀌어도 여전히 참이므로 남긴다.
+
+    조사도 없고 사람이 고친 것도 없으면 ``NO_KEYWORD_BLOCK``. 순수 함수다.
     """
-    if not isinstance(research, dict):
+    # 지연 import — ``keyword_research`` 가 이 모듈을 import 한다(순환 회피).
+    # 규율(사람 > AI)의 단일 원천이 거기 있고, 여기선 부르기만 한다.
+    import keyword_research
+
+    eff = keyword_research.effective_keywords(research)
+    if not eff:
         return NO_KEYWORD_BLOCK
-    sel = research.get("selection")
-    if not isinstance(sel, dict) or not sel.get("main"):
-        return NO_KEYWORD_BLOCK
-    lines = [f"메인 키워드: {sel['main']}"]
-    if sel.get("supporting"):
-        lines.append("보조 키워드: " + ", ".join(sel["supporting"]))
-    if sel.get("angle"):
+    sel = research.get("selection") if isinstance(research, dict) else None
+    sel = sel if isinstance(sel, dict) else {}
+    same_main = (sel.get("main") or "") == eff["main"]
+
+    lines = [f"메인 키워드: {eff['main']}"]
+    if eff["supporting"]:
+        lines.append("보조 키워드: " + ", ".join(eff["supporting"]))
+    if eff["by_human"]:
+        lines.append(
+            "⭐ 위 키워드는 **사람이 직접 고르거나 고친 것**이다. 그대로 따르고, "
+            "더 나은 표현으로 바꾸거나 다른 키워드로 갈아타지 마라."
+        )
+    if same_main and sel.get("angle"):
         lines.append(f"이 키워드로 들어온 독자가 읽어야 할 것: {sel['angle']}")
-    if sel.get("main_reason"):
+    if same_main and sel.get("main_reason"):
         lines.append(f"선정 이유: {sel['main_reason']}")
     if sel.get("limits"):
         lines.append(f"조사의 한계: {sel['limits']}")
