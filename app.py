@@ -4582,18 +4582,19 @@ def _review_copy_html(review):
             f'line-height:1.5;color:#222;margin:6px 0 22px;">{title_html}</h2>'
         )
 
-    # 2) 시스템 헤더 — 실제 방문 날짜 + 핑크 내돈내산 라인(항상, 위치 고정).
+    # 2) 시스템 헤더 — 실제 방문 날짜 한 줄(항상, 위치 고정).
+    #    ⛔ 핑크 '✱ 내돈내산 데이트 후기 ✱' 배지는 뺐다 — 사용자가 명시적으로 싫다고 한
+    #    상투적 자랑 문구다. 이 앱의 후기는 전부 커플이 자기 돈으로 다녀온 사적 기록이라
+    #    협찬·대가성이 애초에 없고, 따라서 **고지해야 할 법적 사실도 없다**. 즉 이건
+    #    고지가 아니라 장식이었다(표시광고법상 '경제적 이해관계 공개'는 대가를 받았을
+    #    때의 의무지, 받지 않았음을 자랑할 의무가 아니다).
     if visit_ymd:
         out.append(
             # 시스템 헤더는 평문이다 — 강조는 본문(AI 토큰)에서만 나온다(§5.3).
             f'<p style="text-align:center;margin:2px 0;line-height:2;">'
             f'방문 날짜 : {esc(visit_ymd)}</p>'
         )
-    out.append(
-        '<p style="text-align:center;color:#e64980;font-weight:700;'
-        'letter-spacing:1px;margin:12px 0 2px;">✱ 내돈내산 데이트 후기 ✱</p>'
-    )
-    out.append(HR)
+        out.append(HR)
 
     def render_info(items):
         rows = []
@@ -4669,12 +4670,16 @@ def _review_copy_html(review):
             _emph_html(ln.strip())
             for ln in str(text or "").replace("\r\n", "\n").split("\n") if ln.strip()
         )
-        foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
+        # 꼬리표는 방문월뿐이다 — 비면 <span> 자체를 내지 않는다(빈 줄 방지).
+        foot = f"{esc(visit_foot)} 방문" if visit_foot else ""
+        foot_html = (
+            '<span style="display:block;color:#aaa;font-size:13px;'
+            f'margin-top:8px;">{foot}</span>' if foot else ""
+        )
         out.append(
             '<blockquote style="border:0;text-align:center;font-size:16px;'
             f'color:#444;margin:8px 0;line-height:1.9;">{body}'
-            '<span style="display:block;color:#aaa;font-size:13px;'
-            f'margin-top:8px;">{foot}</span></blockquote>'
+            f'{foot_html}</blockquote>'
         )
 
     # 3) 블록을 순서대로 렌더.
@@ -4733,12 +4738,15 @@ def _review_copy_html(review):
         else:
             closing = f"다녀온 후기였어요.<br>{tail}"
         add_hr()
-        foot = f"{esc(visit_foot)} 방문 · 내돈내산" if visit_foot else "내돈내산"
+        foot = f"{esc(visit_foot)} 방문" if visit_foot else ""
+        foot_html = (
+            '<span style="display:block;color:#aaa;font-size:13px;'
+            f'margin-top:8px;">{foot}</span>' if foot else ""
+        )
         out.append(
             '<blockquote style="border:0;text-align:center;font-size:16px;'
             f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
-            '<span style="display:block;color:#aaa;font-size:13px;'
-            f'margin-top:8px;">{foot}</span></blockquote>'
+            f'{foot_html}</blockquote>'
         )
 
     # 5) 해시태그(가운데, 핑크).

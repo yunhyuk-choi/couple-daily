@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         커플데일리 → 네이버 사진 업로더
 // @namespace    couple-daily
-// @version      1.2.0
+// @version      1.3.0
 // @description  후기 사진을 네이버 블로그에 정식(내부) 이미지로 업로드 + 본문 조립
 // @match        *://blog.naver.com/*
 // @match        *://m.blog.naver.com/*
@@ -22,7 +22,7 @@
   // `tools/build_bookmarklet.py` 가 그 값을 여기에 심는다(생성물에서는 `@version`
   // 메타 블록이 떨어져 나가므로, 런타임이 자기 버전을 알려면 본문에도 있어야 한다).
   // 꼬리 주석 표식(`cd-up-version`)이 빌더가 이 줄을 찾는 열쇠다.
-  var VERSION = '1.2.0';   /* cd-up-version */
+  var VERSION = '1.3.0';   /* cd-up-version */
 
   // ======================= CONFIG (라이브에서 조정) =========================
   var DISPLAY_HOST_PREFIX = 'https://blogfiles.pstatic.net';
@@ -1183,12 +1183,15 @@
     return nodes;
   }
   function quotationComp(text, foot) {
-    return {
+    // 출처(source) 줄은 방문월 꼬리표 하나뿐이다. 비면 **키 자체를 뺀다** — 빈 줄이 안
+    // 생기게 한다(자매 레포 naver-ent-autopost 의 quotationComp 와 같은 모양).
+    var o = {
       '@ctype': 'quotation', id: sid(), layout: 'default',
       value: [para(emphNodes(('' + (text || '')).replace(/\n/g, ' ')), null)],
-      source: [para([tn(foot || '내돈내산', null)], null)],
       align: 'justify'
     };
+    if (foot) o.source = [para([tn(foot, null)], null)];
+    return o;
   }
   // copy_html의 이미지 src ↔ 블록 __src 매칭 키(토큰 e/t는 뷰마다 달라지므로 무시하고
   // photo id + 크롭으로만 매칭).
@@ -1212,8 +1215,10 @@
     });
     var headerParas = [];
     if (doc.visitDate) headerParas.push(para([tn('방문 날짜 : ' + doc.visitDate, null)], 'center'));
-    headerParas.push(para([tn('✱ 내돈내산 데이트 후기 ✱', { fontColor: '#e64980', bold: true })], 'center'));
-    comps.push(textComp(headerParas));
+    // ⛔ 핑크 상투구 배지 줄은 뮤다 — 사용자가 명시적으로 싫다고 한 문구이고,
+    //    협찬이 없는 사적 후기라 고지할 법적 사실 자체가 없다(app.py `_review_copy_html`
+    //    같은 자리와 한 쌍으로 움직인다).
+    if (headerParas.length) comps.push(textComp(headerParas));
     var blocks = doc.blocks || [];
     for (var b = 0; b < blocks.length; b++) {
       var blk = blocks[b];
@@ -1265,7 +1270,7 @@
         if (fp.length) comps.push(textComp(fp));
       } else if (t === 'quote') {
         pushHr(comps);
-        comps.push(quotationComp(blk.text || '', doc.visitFoot ? (doc.visitFoot + ' 방문 · 내돈내산') : '내돈내산'));
+        comps.push(quotationComp(blk.text || '', doc.visitFoot ? (doc.visitFoot + ' 방문') : ''));
       }
     }
     var tags = (doc.hashtags || []).map(function (x) { return ('' + x).trim(); }).filter(Boolean);
