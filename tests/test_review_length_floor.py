@@ -181,7 +181,8 @@ def test_the_prompt_asks_for_a_floor_not_a_cap():
     assert "글자 수를 고정하지 마라" not in src, (
         "상한(=고정 금지) 문구가 남아 있다 — 모델에게 짧게 써도 된다는 허가다"
     )
-    assert "최소\n   1,200자" in src or "최소 1,200자" in src
+    assert "분량은 상한이 아니라 하한이다" in src
+    assert "1,200자**를 쓴다" in src and "위는 열려 있다" in src
     assert "짧으면 짧은 대로 둔다" not in src
     # 지어내기 금지는 하한보다 **세다**.
     assert "지어내면 그건 실패다" in src
