@@ -185,3 +185,29 @@ def test_the_prompt_asks_for_a_floor_not_a_cap():
     assert "짧으면 짧은 대로 둔다" not in src
     # 지어내기 금지는 하한보다 **세다**.
     assert "지어내면 그건 실패다" in src
+
+
+# --------------------------------------------------------------------------- #
+# 5. 블록 개수 — 긴 글의 끝을 조용히 자르지 않는다
+# --------------------------------------------------------------------------- #
+def test_the_block_cap_sits_well_above_the_longest_reference_post():
+    """레퍼런스 최대 글 = 단락 41 + 소제목 5 + 이미지 24 = 70블록(익선동 청수당).
+
+    옛 값 60 은 **그보다 낮아서** 사진 많은 긴 글의 끝을 말없이 잘랐다.
+    """
+    assert ai.MAX_REVIEW_BLOCKS >= 70 * 2
+
+
+def test_a_long_photo_heavy_post_is_not_truncated():
+    photos = [{"index": i, "caption": f"사진 {i}"} for i in range(24)]
+    blocks = []
+    for i in range(24):
+        blocks.append({"type": "para", "text": "본문 단락이야. " * 5})
+        blocks.append({"type": "para", "text": "두 번째 단락이야. " * 5})
+        blocks.append({"type": "image", "photo_index": i})
+    data = {"title": "익선동 청수당 카페 후기", "blocks": blocks, "hashtags": []}
+    out = ai._normalize_review(data, photos, 8)
+    # ratings 블록 하나가 끝에 붙는다.
+    assert len(out["blocks"]) == len(blocks) + 1, "긴 글의 끝이 잘렸다"
+    used = {b["photo_index"] for b in out["blocks"] if b["type"] == "image"}
+    assert used == set(range(24)), "사진이 잘려 나갔다"

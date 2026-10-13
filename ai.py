@@ -1964,6 +1964,14 @@ def _normalize_block(b, n_photos, _s):
     return None
 
 
+# 블록 개수 폭주 방지 — **설계 제약이 아니라 안전장치**다. 예전 값 60 은 실측
+# 최댓값보다 낮아서 **긴 글의 끝을 조용히 잘랐다**: 레퍼런스 최대 글(익선동 청수당,
+# 2,273자)이 단락 41 + 소제목 5 + 이미지 24 = **70블록**이다(REFERENCE-STYLE §4·§5).
+# 본문 하한(REVIEW_MIN_BODY_CHARS)을 걸어 글이 길어지는 쪽으로 밀기 시작했으니,
+# 실측 최댓값의 두 배쯤으로 올려 **실제 글은 절대 닿지 않게** 한다.
+MAX_REVIEW_BLOCKS = 140
+
+
 def _normalize_review(data, photos, overall_score=0):
     """claude가 준 자유형 블록 dict를 렌더 가능한 일관 스키마로 정규화(순수/오프라인).
 
@@ -1977,7 +1985,7 @@ def _normalize_review(data, photos, overall_score=0):
       * title_candidates: {title, structure, reason} 최대 3개. 최종 title이 후보에
         없으면 맨 앞에 끼워 넣는다(상세 화면이 '지금 쓰는 제목'도 고를 수 있게).
       * blocks: 타입별 검증(_normalize_block — para/heading/image/quote만 통과).
-        최대 60개.
+        최대 ``MAX_REVIEW_BLOCKS``개(폭주 방지 안전장치 — 실측 최대 70블록).
       * summary: 비어 있는 게 기본이다(v2 계약 — answer-first 고정 폐기). 값이 있으면
         맨 앞 para로 끼워 넣어 하류(렌더·복사본)는 blocks만 보면 되게 한다.
       * ratings: AI 값은 버리고 **사용자 총점 하나**로 항상 끝에 붙인다(지어낸
@@ -2032,7 +2040,7 @@ def _normalize_review(data, photos, overall_score=0):
             nb = _normalize_block(b, n_photos, _s)
             if nb:
                 blocks.append(nb)
-            if len(blocks) >= 60:
+            if len(blocks) >= MAX_REVIEW_BLOCKS:
                 break
 
     # summary는 '정보형 글'에서만 채워지는 선택 필드다(기본 빈 문자열). 있으면 맨 앞
