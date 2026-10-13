@@ -3808,13 +3808,13 @@ def _emph_html(v):
 
 
 def _strip_emph(v):
-    """강조 토큰을 벗겨 순수 텍스트로(text/plain 폴백용)."""
-    s = str(v or "")
-    s = _EMPH_BOLD_RE.sub(lambda m: m.group(1), s)
-    s = _EMPH_PINK_RE.sub(lambda m: m.group(1), s)
-    s = _EMPH_BLUE_RE.sub(lambda m: m.group(1), s)
-    s = _EMPH_MARK_RE.sub(lambda m: m.group(1), s)
-    return s
+    """강조 토큰을 벗겨 순수 텍스트로(text/plain 폴백용).
+
+    ``ai.strip_emphasis`` 에 위임한다 — 같은 규칙이 **본문 길이 하한**을 재는 데도
+    쓰이므로(``ai.review_body_chars``), 벗기는 법이 두 군데서 갈라지면 "발행본에
+    남는 글자"의 정의가 갈라진다.
+    """
+    return ai.strip_emphasis(v)
 
 
 def _ensure_blocks(ai_data):

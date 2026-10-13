@@ -61,7 +61,9 @@ def test_the_photo_rule_does_not_force_mechanical_counts(monkeypatch):
     ai.write_review("문래갈매기", "문래동", "맛있었어", 8, photos)
     p = seen["prompt"]
     assert "글을 사진 수에 맞추지는 마라" in p
-    assert "글자 수를 고정하지 마라" in p, "분량 고정 금지 규율이 사라졌다"
+    # 분량은 하한만 있다 — "사진이 많으니 글자 수를 늘린다"는 여전히 금지다.
+    assert "글자 수를 고정하지 마라" not in p, "짧아도 된다는 허가가 돌아왔다"
+    assert "글자 수를 늘린다" in p, "사진 수에 분량을 맞추지 말라는 규율이 사라졌다"
     # 빠질 수 있는 사진의 여지는 남아 있어야 한다(중복·흐림·무관).
     assert "중복" not in p or "겹쳐 올라왔거나" in p
 

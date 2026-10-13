@@ -538,12 +538,15 @@ import 만 하자(HTTP 요청 0회) 0.3초 만에 되살려 처리했다. 그러
 - **`static/gif.js`** — 그 브라우저 변환기. **네이티브 우선**(`<video>` + Canvas),
   실패가 확인되면 **그때 비로소** WASM 디코더(ffmpeg 코어 ESM, 약 32MB)를 lazy 로드한다.
   실패에는 전부 이름이 있다(`gifmaker.DIAG_CODES`) — **조용한 빈 프레임 금지**.
-- **`static/imagecrop.js`** — **발행용 크롭을 브라우저가 굽는다**(서버는 픽셀을 안 만진다).
-  `v=orig` 로 받은 **원본**을 Canvas 로 잘라 JPEG(q0.95)로 낸다 — 다운스케일본에서
-  자르는 것보다 화질이 좋다. ⛔ **표시용 크롭에 쓰지 말 것**(그건 CSS 가 한다);
-  Canvas 인코딩은 **발행 버튼 1회**뿐이고, 12MP 캔버스가 48MB라 **한 장씩 순차**로
-  돌리며 진행률을 보고한다. 네이버 유저스크립트에는 CSP 때문에 같은 함수의 사본이
-  있다(`tools/naver-uploader.user.js` — 고칠 땐 양쪽 같이).
+- **발행용 크롭은 *받는 쪽* 브라우저(네이버 유저스크립트)가 굽는다** — 서버도 앱
+  페이지도 픽셀을 만지지 않는다. 규율의 단일 원천은 이제
+  `tools/naver-uploader.user.js`(`cropToBlob`) 하나다: `v=orig` 로 받은 **원본**을
+  Canvas 로 잘라 JPEG(q0.95)로 내고(다운스케일본에서 자르는 것보다 화질이 좋다),
+  12MP 캔버스가 48MB라 **한 장씩 순차**로 돌리며 진행률을 보고한다.
+  ⛔ **표시용 크롭에 쓰지 말 것**(그건 CSS 가 한다).
+  앱 쪽 사본이던 `static/imagecrop.js` 는 **지웠다** — 📤 가 사진 바이트를 더 이상
+  클립보드에 담지 않게 되면서(`review_detail.html` exportBtn 머리말 — 실측
+  2.8~3.9MB/장이 모바일 클립보드 상한을 넘겼다) 호출자가 사라졌다.
 - **`tools/probe_graph_renditions.py`** — Graph 커스텀 렌디션(`c{W}x{H}`)의 **실제 한도**를
   재는 도구. 문서에 상한이 없어서 운영에서 한 번 재서 안다(출력에 URL 을 담지 않는다).
 - **`static/vendor/gifenc.esm.js`** — GIF 인코더 사본(MIT). *주 경로*라 CDN 에 매달지

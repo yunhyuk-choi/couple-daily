@@ -1964,6 +1964,14 @@ def _normalize_block(b, n_photos, _s):
     return None
 
 
+# 블록 개수 폭주 방지 — **설계 제약이 아니라 안전장치**다. 예전 값 60 은 실측
+# 최댓값보다 낮아서 **긴 글의 끝을 조용히 잘랐다**: 레퍼런스 최대 글(익선동 청수당,
+# 2,273자)이 단락 41 + 소제목 5 + 이미지 24 = **70블록**이다(REFERENCE-STYLE §4·§5).
+# 본문 하한(REVIEW_MIN_BODY_CHARS)을 걸어 글이 길어지는 쪽으로 밀기 시작했으니,
+# 실측 최댓값의 두 배쯤으로 올려 **실제 글은 절대 닿지 않게** 한다.
+MAX_REVIEW_BLOCKS = 140
+
+
 def _normalize_review(data, photos, overall_score=0):
     """claude가 준 자유형 블록 dict를 렌더 가능한 일관 스키마로 정규화(순수/오프라인).
 
@@ -1977,7 +1985,7 @@ def _normalize_review(data, photos, overall_score=0):
       * title_candidates: {title, structure, reason} 최대 3개. 최종 title이 후보에
         없으면 맨 앞에 끼워 넣는다(상세 화면이 '지금 쓰는 제목'도 고를 수 있게).
       * blocks: 타입별 검증(_normalize_block — para/heading/image/quote만 통과).
-        최대 60개.
+        최대 ``MAX_REVIEW_BLOCKS``개(폭주 방지 안전장치 — 실측 최대 70블록).
       * summary: 비어 있는 게 기본이다(v2 계약 — answer-first 고정 폐기). 값이 있으면
         맨 앞 para로 끼워 넣어 하류(렌더·복사본)는 blocks만 보면 되게 한다.
       * ratings: AI 값은 버리고 **사용자 총점 하나**로 항상 끝에 붙인다(지어낸
@@ -2032,7 +2040,7 @@ def _normalize_review(data, photos, overall_score=0):
             nb = _normalize_block(b, n_photos, _s)
             if nb:
                 blocks.append(nb)
-            if len(blocks) >= 60:
+            if len(blocks) >= MAX_REVIEW_BLOCKS:
                 break
 
     # summary는 '정보형 글'에서만 채워지는 선택 필드다(기본 빈 문자열). 있으면 맨 앞
@@ -2080,6 +2088,91 @@ def _normalize_review(data, photos, overall_score=0):
     if title_pick_reason:
         out["title_pick_reason"] = title_pick_reason
     return out
+
+
+# --- 본문 길이: **상한이 아니라 하한** -------------------------------------
+#
+# 사용자 지적(2026-10-13): "게시글 길이가 너무 짧아. 상한을 걸 게 아니라 하한을
+# 걸어두고 그 이상을 쓰게 해야지."
+#
+# 숫자의 근거는 **레퍼런스 실측**이다 — `naver-ent-autopost/docs/REFERENCE-STYLE.md`
+# §4 가 같은 작성자 블로그 32편을 센 결과이고, 우리가 따라 쓰는 A 코호트(2026-09-13~
+# 10-03, `~했어요` + 소제목 3~6개)는 이렇다:
+#
+#     A 코호트 7편   최소 1,289 · p25 1,504 · **중앙 1,570** · 최대 3,350
+#     2026 전체 23편 최소   630 · p25 1,148 · **중앙 1,548** · 최대 3,350
+#     그 문서의 결론  "목표를 1,500자로 고정하지 말고 **1,200~2,000자를 기대 범위**로"
+#
+# 그래서 하한은 **1,200자**다 — 기대 범위의 아래 끝이고, A 코호트의 **최소값
+# (1,289)보다도 낮다.** 즉 레퍼런스 글 중 어느 것도 이 하한에 걸리지 않는다.
+# 상한은 두지 않는다(최대 3,350자가 실재한다).
+#
+# 세는 단위는 레퍼런스와 **같게** 맞췄다:
+#   * `collect_reference_blog.py` 의 `n_chars = sum(len(p) for p in paragraphs)` —
+#     **소제목 제외, 본문 단락만.** 그래서 우리도 para·quote 만 센다.
+#   * **강조 토큰은 벗기고 센다.** `**` `==` `*` 백틱은 발행본에서 서식으로 바뀌어
+#     사라지는 표시다 — 세면 모델이 마크업을 뿌려 하한을 '채울' 수 있다.
+#
+# ⚠️ 하한은 **재료 안에서 충실히 쓰라**는 뜻이지 살을 붙이라는 뜻이 아니다. 되먹임
+#    재생성 프롬프트가 "없는 사실을 지어내느니 짧은 채로 두라"고 못 박고, 재시도는
+#    **딱 한 번**이다(루프 금지). 두 번째도 짧으면 **긴 쪽을 쓰고 그대로 둔다** —
+#    재료가 그만큼이었다는 뜻이다.
+REVIEW_MIN_BODY_CHARS = int(os.environ.get("REVIEW_MIN_BODY_CHARS", "1200"))
+
+_EMPH_TOKEN_RES = (
+    re.compile(r"\*\*(.+?)\*\*", re.DOTALL),   # 굵게
+    re.compile(r"==(.+?)==", re.DOTALL),       # 형광펜
+    re.compile(r"\*(.+?)\*", re.DOTALL),       # 분홍
+    re.compile(r"`(.+?)`", re.DOTALL),         # 파랑
+)
+
+
+def strip_emphasis(v):
+    """강조 토큰을 벗겨 **발행본에 실제로 남는 글자**만 돌려준다.
+
+    토큰 문법의 단일 원천은 ``prompts/blog-review.md`` [출력 형식] 2 이고, 서식으로의
+    변환은 ``app._emph_html``·북마클릿 ``emphNodes`` 다. ``app._strip_emph`` 가 이
+    함수를 쓴다 — 벗기는 규칙이 두 군데서 갈라지지 않게.
+    """
+    s = str(v or "")
+    for rx in _EMPH_TOKEN_RES:
+        s = rx.sub(lambda m: m.group(1), s)
+    return s
+
+
+def review_body_chars(result):
+    """정규화된 후기 dict → **본문 글자 수**(소제목 제외 · 강조 토큰 제외).
+
+    레퍼런스 집계(`collect_reference_blog.py` `n_chars`)와 같은 정의라 숫자를 바로
+    비교할 수 있다. 공백도 레퍼런스와 같게 **센다**(거기도 `len(p)` 그대로다).
+    """
+    if not isinstance(result, dict):
+        return 0
+    total = 0
+    for b in result.get("blocks") or []:
+        if isinstance(b, dict) and b.get("type") in ("para", "quote"):
+            total += len(strip_emphasis(b.get("text") or ""))
+    return total
+
+
+def _too_short_followup(prompt, body_chars):
+    """하한 미달 시 **한 번만** 보내는 되먹임 지시. 원 프롬프트 뒤에 붙인다."""
+    return (
+        prompt
+        + "\n\n---\n\n[다시 쓰기 — 분량 하한]\n\n"
+        f"방금 쓴 글의 본문이 **{body_chars}자**였다. 이 블로그의 본문 하한은 "
+        f"**{REVIEW_MIN_BODY_CHARS}자**다(레퍼런스 맛집 글 실측 중앙 1,570자 · "
+        "기대 범위 1,200~2,000자). 너무 짧다.\n\n"
+        "위 [재료]를 처음부터 다시 훑어라. **아직 글에 들어가지 않은 재료**가 있을 "
+        "것이다 — 웨이팅·입장 방식, 찾아가는 길과 자리, 주문한 것 하나하나와 가격, "
+        "아쉬운 점, 검색해서 확인한 공개 정보. 그것들을 그 정보가 필요한 문단에서 "
+        "제대로 풀어라. 숫자는 문장 안에 살려라. 한 단락은 2~3문장(70~110자)이다.\n\n"
+        "⛔ **없는 사실을 지어내서 늘리지 마라.** 재료에 없는 경험·감정·대화·직원 "
+        "발언·가격·영업시간·메뉴를 만들어 내느니 짧은 채로 두는 편이 낫다. 일반론"
+        "(`분위기가 좋은 곳이었어요` 류)·같은 말 반복·독자 호명·면책 문구로 자리를 "
+        "채우는 것도 금지다. 늘릴 재료가 정말 없으면 **늘리지 말고 그대로 내라.**\n\n"
+        "위 [출력] 형식 그대로 JSON 객체 하나만 다시 출력해라."
+    )
 
 
 # 후기 '재료' 칸 — DB 컬럼 ↔ 프롬프트에 보일 라벨. 이 **순서가 곧 글의 흐름**이다
@@ -2315,9 +2408,13 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
     dict를 돌려주거나, 어떤 실패에도 ``None``을 돌려준다(절대 raise 안 함). 느린
     서브프로세스라 호출부가 반드시 백그라운드에서 돌린다.
 
-    v2 기준: 글의 내용 규율은 gf-blog 프롬프트가 정본이다. 표 금지, 글자 수·
-    키워드 반복·소제목 개수 고정 금지, 경험/조사 어미 구분, 요약표·FAQ 고정 섹션
-    폐기. 본문 규율 전체는 ``prompts/blog-review.md``에 있고 여기선 재료만 채운다.
+    v2 기준: 글의 내용 규율은 gf-blog 프롬프트가 정본이다. 표 금지, 키워드 반복·
+    소제목 개수 고정 금지, 경험/조사 어미 구분, 요약표·FAQ 고정 섹션 폐기. 본문
+    규율 전체는 ``prompts/blog-review.md``에 있고 여기선 재료만 채운다.
+
+    **분량은 상한이 아니라 하한이다** — 본문이 ``REVIEW_MIN_BODY_CHARS``(1,200자)에
+    못 미치면 **딱 한 번** 되먹임 재생성을 한다(그 상수 머리말이 근거·규율의 단일
+    원천). claude 호출은 그때만 2회이고, 평소엔 1회 그대로다.
 
     ⭐ **인라인 강조(`**굵게**` `==형광펜==` `*분홍*` `` `파랑` ``)는 쓴다** — gf-blog 는
     금지하지만 그쪽은 사람이 네이버 에디터에서 직접 꾸미는 수동 운전이고, 우리는 발행까지
@@ -2387,6 +2484,31 @@ def write_review(topic, location, prose, overall_score, photos, details=None,
         result = _normalize_review(data, photos, overall_score)
         if not result:
             raise ValueError("empty review")
+
+        # 하한 미달이면 **딱 한 번** 더 쓰게 한다(루프 금지 — REVIEW_MIN_BODY_CHARS
+        # 머리말). 재시도가 실패하거나 더 짧으면 첫 결과를 그대로 쓴다 — 하한은
+        # '늘려라'가 아니라 '재료 안에서 충실히 써라'이고, 재료가 모자라면 짧은 게 맞다.
+        chars = review_body_chars(result)
+        if chars < REVIEW_MIN_BODY_CHARS:
+            print(f"[ai] review body {chars}자 < 하한 {REVIEW_MIN_BODY_CHARS}자 "
+                  "— 재료 안에서 더 쓰게 한 번 되먹임", file=sys.stderr)
+            try:
+                again = _normalize_review(
+                    _extract_json(_run_claude(_too_short_followup(prompt, chars))),
+                    photos, overall_score,
+                )
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 — 되먹임 실패는 생성 실패가 아니다
+                print(f"[ai] review length retry failed: {e}", file=sys.stderr)
+                again = None
+            again_chars = review_body_chars(again)
+            if again and again_chars > chars:
+                print(f"[ai] review body {chars}자 → {again_chars}자", file=sys.stderr)
+                result = again
+            else:
+                print(f"[ai] 되먹임이 더 길지 않았다({again_chars}자) — 첫 결과 유지 "
+                      "(재료가 그만큼이었다는 뜻)", file=sys.stderr)
         return result
     except Cancelled:
         raise  # 사람이 멈춘 것은 '생성 실패'가 아니다 — 호출부가 구분해야 한다

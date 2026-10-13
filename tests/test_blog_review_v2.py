@@ -36,9 +36,13 @@ def test_prompt_encodes_the_v2_rules():
     # 볼드·형광펜·색 강조는 **되살아났다**(사용자 요구) — 금지가 아니라 토큰 지시다.
     # 그 계약의 정본은 tests/test_review_emphasis.py.
     assert "강조는 아래 네 가지 표시로만 한다" in body
-    assert "글자 수를 고정하지 마라" in body
+    # 분량은 **상한이 아니라 하한**이다(2026-10-13 사용자 지적). 정본·근거는
+    # tests/test_review_length_floor.py — 여기선 프롬프트에 박혀 있는지만 본다.
+    assert "분량은 상한이 아니라 하한이다" in body
+    assert "1,200자**를 쓴다" in body and "위는 열려 있다" in body
+    assert "글자 수를 고정하지 마라" not in body   # 짧아도 된다는 허가였다
     assert "것으로 안내돼 있어요" in body      # 경험/조사 어미 구분
-    assert "900~1400" not in body             # v1의 고정 분량은 사라졌다
+    assert "900~1400" not in body             # v1의 고정 **상한**은 돌아오지 않는다
     # 요약표·고정 Q&A·AI 별점은 '만들지 마라'로 명시돼 있다.
     assert "만들지 마라" in body and "요약표" in body
 

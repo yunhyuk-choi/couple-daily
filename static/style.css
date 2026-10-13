@@ -1929,6 +1929,18 @@ a.event-item:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,
 .rv-editable blockquote footer { margin-top: 6px; font-size: 0.84rem; color: var(--muted); }
 .rv-copy-note { font-size: 0.8rem; margin: 8px 0 0; }
 .rv-copy-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+/* 📤 결과창 — 토스트와 달리 **사라지지 않는다**(실패 이유가 화면에 남아야 한다). */
+.rv-export-result { margin-top: 10px; }
+.rv-export-msg {
+  margin: 0; padding: 9px 11px; border-radius: 9px; font-size: 0.86rem; line-height: 1.55;
+  background: #f1f6f1; color: #2f6b3a;
+}
+.rv-export-msg.error { background: #fff3f3; color: #a4303f; }
+.rv-export-payload {
+  width: 100%; margin-top: 8px; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.74rem; border: 1px solid #ddd; border-radius: 8px; padding: 8px;
+  word-break: break-all;
+}
 /* 복사됨! 토스트 — 화면 하단 중앙 */
 .copy-toast {
   position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%) translateY(8px);

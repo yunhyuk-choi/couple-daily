@@ -390,6 +390,59 @@
     for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
     return new Blob([bytes], { type: mime });
   }
+  function blobToDataUri(blob) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(fr.error || new Error('read fail')); };
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  /**
+   * 페이로드의 images[] → [{src, blob}] (입력 순서 보존, **한 장씩 순차**).
+   *
+   * 두 모양을 다 받는다 — 어느 경로로 왔든 여기서 하나로 합친다:
+   *   * `{src, url, crop}`  **지금의 모양.** 앱이 클립보드/pending 에 URL 만 싣고
+   *     바이트는 여기서 받는다. 모바일 클립보드가 사진 바이트를 못 나르기 때문이다
+   *     (실측 2.8~3.9MB/장 · 안드로이드 바인더 ~1MB · iOS 는 제스처 만료로 거절).
+   *   * `{src, dataUri}`    **옛 모양.** 구버전 앱에서 복사해 둔 페이로드를 그대로
+   *     붙여넣어도 동작하게 남겨 둔다.
+   * 크롭은 받은 뒤 **여기서** 굽는다(`cropToBlob`) — 소스가 원본이라 화질 손해가 없다.
+   */
+  function resolveImageBlobs(imgs, onProgress) {
+    var out = [];
+    var total = (imgs || []).length;
+    function step(i) {
+      if (i >= total) return Promise.resolve(out);
+      var im = imgs[i] || {};
+      if (!im.src) return step(i + 1);
+      var got;
+      if (im.dataUri) {
+        got = Promise.resolve(dataUriToBlob(im.dataUri));
+      } else if (im.url) {
+        if (onProgress) onProgress(i, total, 'fetch');
+        got = fetch(im.url, { cache: 'no-store' }).then(function (r) {
+          if (!r.ok) throw new Error('사진 ' + (i + 1) + ' 받기 실패 (HTTP ' + r.status + ')');
+          return r.blob();
+        }).then(function (blob) {
+          if (!im.crop) return blob;          // 자를 게 없으면 원본 그대로(재인코딩 0회)
+          if (onProgress) onProgress(i, total, 'crop');
+          return cropToBlob(blob, im.crop);
+        });
+      } else {
+        diag('이미지[' + i + '] 건너뜀 — url·dataUri 둘 다 없음');
+        return step(i + 1);
+      }
+      return got.then(function (blob) {
+        out.push({ src: im.src, blob: blob });
+        if (onProgress) onProgress(i + 1, total, 'done');
+        return step(i + 1);
+      });
+    }
+    return step(0);
+  }
+
   function parseUploadedUrl(xmlText) {
     var el = null;
     try {
@@ -957,13 +1010,19 @@
       L('세션키', key);
       var blogId = guessBlogId();
       L('blogId', blogId);
+      // 바이트부터 확보한다 — 지금 페이로드는 URL+크롭만 싣고 오므로 여기서 받아 자른다.
+      return resolveImageBlobs(imgs, function (i, total, phase) {
+        setStatus(u, (phase === 'crop' ? '자르는 중' : '사진 받는 중') +
+                     '… (' + Math.min(i + 1, total) + '/' + total + ')');
+      }).then(function (ready) { return { key: key, blogId: blogId, ready: ready }; });
+    }).then(function (ctx) {
+      var key = ctx.key, blogId = ctx.blogId, ready = ctx.ready;
       var chain = Promise.resolve();
       var done = 0;
-      imgs.forEach(function (img, i) {
+      ready.forEach(function (img, i) {
         chain = chain.then(function () {
-          setStatus(u, '사진 업로드 중… (' + (i + 1) + '/' + imgs.length + ')');
-          var blob = dataUriToBlob(img.dataUri);
-          return uploadOne(key, blogId, blob, i).then(function (meta) {
+          setStatus(u, '사진 업로드 중… (' + (i + 1) + '/' + ready.length + ')');
+          return uploadOne(key, blogId, img.blob, i).then(function (meta) {
             html = replaceSrc(html, img.src, meta.displayUrl);
             done++;
           }).catch(function (e) {
@@ -997,28 +1056,39 @@
     }
     var html = p.copy_html;
     var imgs = Array.isArray(p.images) ? p.images : [];
-    var done = 0;
-    imgs.forEach(function (img, i) {
-      if (!img || !img.dataUri || !img.src) return;
-      var b64 = img.dataUri.slice(img.dataUri.indexOf(',') + 1);
-      var kb = Math.round(b64.length * 3 / 4 / 1024);
-      diag('dataURI 심기[' + i + '] (크기 ~' + kb + 'kb)');
-      html = replaceSrc(html, img.src, img.dataUri);   // 업로드 없이 데이터 자체를 심는다
-      done++;
-    });
-    diag('데이터URI 심기 완료 ' + done + '/' + imgs.length);
-    setStatus(u, '데이터URI로 심음 — 네이버 본문에 붙여넣어 (네이버가 알아서 업로드/등록하는지 확인)');
-    u.resultTa.value = html;
-    u.resultWrap.style.display = 'block';
-    u.copyBtn.onclick = function () {
-      writeHtmlToClipboard(html, '').then(function () {
-        setStatus(u, '복사됨 ✓ — 네이버 본문에 Ctrl+V로 붙여넣어');
-      }, function (err) {
-        L('clipboard write 실패', err);
-        setStatus(u, '자동복사 실패 — 아래 칸 전체선택 후 복사해줘', true);
-        try { u.resultTa.focus(); u.resultTa.select(); } catch (e) {}
+    resolveImageBlobs(imgs, function (i, total, phase) {
+      setStatus(u, (phase === 'crop' ? '자르는 중' : '사진 받는 중') +
+                   '… (' + Math.min(i + 1, total) + '/' + total + ')');
+    }).then(function (ready) {
+      return Promise.all(ready.map(function (r) {
+        return blobToDataUri(r.blob).then(function (d) { return { src: r.src, dataUri: d }; });
+      }));
+    }).then(function (ready) {
+      var done = 0;
+      ready.forEach(function (img, i) {
+        var b64 = img.dataUri.slice(img.dataUri.indexOf(',') + 1);
+        var kb = Math.round(b64.length * 3 / 4 / 1024);
+        diag('dataURI 심기[' + i + '] (크기 ~' + kb + 'kb)');
+        html = replaceSrc(html, img.src, img.dataUri);  // 업로드 없이 데이터 자체를 심는다
+        done++;
       });
-    };
+      diag('데이터URI 심기 완료 ' + done + '/' + imgs.length);
+      setStatus(u, '데이터URI로 심음 — 네이버 본문에 붙여넣어 (네이버가 알아서 업로드/등록하는지 확인)');
+      u.resultTa.value = html;
+      u.resultWrap.style.display = 'block';
+      u.copyBtn.onclick = function () {
+        writeHtmlToClipboard(html, '').then(function () {
+          setStatus(u, '복사됨 ✓ — 네이버 본문에 Ctrl+V로 붙여넣어');
+        }, function (err) {
+          L('clipboard write 실패', err);
+          setStatus(u, '자동복사 실패 — 아래 칸 전체선택 후 복사해줘', true);
+          try { u.resultTa.focus(); u.resultTa.select(); } catch (e) {}
+        });
+      };
+    }).catch(function (e) {
+      diag('데이터URI 모드 실패: ' + (e && e.message ? e.message : e));
+      setStatus(u, '사진을 못 받았어 — ' + (e && e.message ? e.message : e), true);
+    });
   }
 
   // ============ 정식(네이버 내부이미지) 문서 빌더 — setDocumentData용 ============
@@ -1242,31 +1312,37 @@
     // iframe 렐름 uploader가 instanceof/속성으로 읽으면 undefined→.toString 크래시.
     var RB = (win && win.Blob) || Blob;
     var RF = (win && win.File) || File;
-    var RU8 = (win && win.Uint8Array) || Uint8Array;
-    function dataUriToBlobIn(d) {
-      var c = d.indexOf(','), head = d.slice(0, c), b64 = d.slice(c + 1);
-      var mime = (head.match(/data:([^;]+)/) || [])[1] || 'image/jpeg';
-      var bin = atob(b64), n = bin.length, arr = new RU8(n);
-      for (var j = 0; j < n; j++) arr[j] = bin.charCodeAt(j);
-      return new RB([arr], { type: mime });
-    }
 
     var imgs = Array.isArray(p.images) ? p.images : [];
-    // dataUri → File(업로더 렐름), 순서 보존 + 각 파일이 대응하는 블록 __src를 병렬 배열로.
-    var files = [], fileSrcs = [];
-    for (var i = 0; i < imgs.length; i++) {
-      var im = imgs[i];
-      if (!im || !im.dataUri || !im.src) continue;
-      var blob = dataUriToBlobIn(im.dataUri);
-      var name = 'image' + i + '.jpg';
-      var f;
-      try { f = new RF([blob], name, { type: blob.type || 'image/jpeg' }); }
-      catch (e) { f = blob; try { f.name = name; } catch (e2) {} }
-      files.push(f); fileSrcs.push(im.src);
-    }
-    diag('업로드 대상 파일 ' + files.length + '장 (렐름=' + (win === W ? 'self' : 'iframe') + ')');
-
-    runCore(u, win, Sm, ed, p.doc, files, fileSrcs);
+    u.go.disabled = true;
+    // 바이트 확보(URL 이면 받아서 자르고, 옛 dataUri 면 그대로) → 업로더 렐름 File 로.
+    resolveImageBlobs(imgs, function (i, total, phase) {
+      setStatus(u, (phase === 'crop' ? '자르는 중' : '사진 받는 중') +
+                   '… (' + Math.min(i + 1, total) + '/' + total + ')');
+    }).then(function (ready) {
+      var files = [], fileSrcs = [];
+      function wrap(i) {
+        if (i >= ready.length) return Promise.resolve();
+        return ready[i].blob.arrayBuffer().then(function (buf) {
+          var rb = new RB([buf], { type: 'image/jpeg' });
+          var name = 'image' + i + '.jpg';
+          var f;
+          try { f = new RF([rb], name, { type: 'image/jpeg' }); }
+          catch (e) { f = rb; try { f.name = name; } catch (e2) {} }
+          files.push(f); fileSrcs.push(ready[i].src);
+          return wrap(i + 1);
+        });
+      }
+      return wrap(0).then(function () {
+        diag('업로드 대상 파일 ' + files.length + '장 (렐름=' + (win === W ? 'self' : 'iframe') + ')');
+        u.go.disabled = false;   // runCore 가 자기 몫으로 다시 잠근다
+        runCore(u, win, Sm, ed, p.doc, files, fileSrcs);
+      });
+    }).catch(function (e) {
+      diag('정식 삽입 이미지 준비 실패: ' + (e && e.message ? e.message : e));
+      setStatus(u, '사진을 못 받았어 — ' + (e && e.message ? e.message : e), true);
+      u.go.disabled = false;
+    });
   }
 
   // v1(붙여넣기)·v2(자동)가 공유하는 코어: 준비된 doc/files로 네이티브 업로드+setDocumentData.
@@ -1526,32 +1602,26 @@
           var RF = (win && win.File) || File;
           if (!images.length) { runCore(u, win, Sm, ed, doc, [], []); return; }
           // ⚠️ 한 장씩 순차로 — 12MP 캔버스 한 장이 48MB라, 여러 장을 동시에 올리면
-          //    폰 탭이 죽는다. 그래서 Promise.all 이 아니라 체인이다(진행률도 정직해진다).
+          //    폰 탭이 죽는다(resolveImageBlobs 가 그 규율의 단일 원천이고, 붙여넣기
+          //    경로도 같은 함수를 쓴다). 여기선 결과를 에디터 렐름 File 로만 감싼다.
           var files = [], fileSrcs = [];
-          function step(i) {
-            if (i >= images.length) return Promise.resolve();
-            var im = images[i];
-            setStatus(u, '자동 업로드 중… (사진 받는 중 ' + (i + 1) + '/' + images.length + ')');
-            return fetch(im.url, { cache: 'no-store' })
-              .then(function (r) { if (!r.ok) throw new Error('img ' + r.status); return r.blob(); })
-              .then(function (blob) {
-                if (!im.crop) return blob;   // 자를 게 없으면 원본 그대로(재인코딩 0회)
-                setStatus(u, '자동 업로드 중… (자르는 중 ' + (i + 1) + '/' + images.length + ')');
-                return cropToBlob(blob, im.crop);
-              })
-              .then(function (blob) {
-                // 에디터 렐름의 Blob/File 로 다시 감싼다.
-                return blob.arrayBuffer().then(function (buf) {
-                  var rb = new RB([buf], { type: 'image/jpeg' });
-                  var f;
-                  try { f = new RF([rb], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
-                  catch (e) { f = rb; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
-                  files.push(f); fileSrcs.push(im.src);
-                  return step(i + 1);
-                });
+          resolveImageBlobs(images, function (i, total, phase) {
+            setStatus(u, '자동 업로드 중… (' + (phase === 'crop' ? '자르는 중' : '사진 받는 중') +
+                         ' ' + Math.min(i + 1, total) + '/' + total + ')');
+          }).then(function (ready) {
+            function wrap(i) {
+              if (i >= ready.length) return Promise.resolve();
+              return ready[i].blob.arrayBuffer().then(function (buf) {
+                var rb = new RB([buf], { type: 'image/jpeg' });
+                var f;
+                try { f = new RF([rb], 'image' + i + '.jpg', { type: 'image/jpeg' }); }
+                catch (e) { f = rb; try { f.name = 'image' + i + '.jpg'; } catch (e2) {} }
+                files.push(f); fileSrcs.push(ready[i].src);
+                return wrap(i + 1);
               });
-          }
-          step(0).then(function () {
+            }
+            return wrap(0);
+          }).then(function () {
             diag('자동: 이미지 ' + files.length + '장 준비(브라우저 크롭) → 업로드');
             runCore(u, win, Sm, ed, doc, files, fileSrcs);
           }).catch(function (e) {

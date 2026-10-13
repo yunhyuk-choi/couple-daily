@@ -690,6 +690,13 @@
       <button type="submit" class="btn ghost sm">↻ 다시 생성</button>
     </form>
   </div>
+  {# 📤 의 **보이는 결과창**. 성공도 실패도 여기서 말한다 — 토스트는 1.8초 뒤
+     사라지므로 "계속 실패"만 남고 이유가 안 남는 자리였다. 실패하면 페이로드를
+     이 칸에 띄워 손으로 복사할 길을 준다(모바일 window.prompt 는 긴 값을 못 쓴다). #}
+  <div id="export-result" class="rv-export-result" hidden>
+    <p id="export-msg" class="rv-export-msg"></p>
+    <textarea id="export-payload" class="rv-export-payload" rows="4" readonly hidden></textarea>
+  </div>
 </div>
 {% if doc_data %}
 {# 정식(네이버 내부이미지) 삽입용 구조화 데이터 — 북마클릿의 '정식 삽입' 버튼이
@@ -698,9 +705,10 @@
 {% endif %}
 {% if export_images %}
 {# 발행용 재료 — 사진마다 (매칭 키 src · **자르지 않은 원본** url · 크롭 좌표).
-   📤 를 누르면 브라우저가 원본을 받아 Canvas 로 자른다(서버는 픽셀을 안 만진다). #}
+   📤 는 이 좌표를 **그대로** 클립보드/pending 에 실어 보낸다. 바이트를 받아
+   Canvas 로 자르는 것은 받는 쪽(네이버 유저스크립트)이다 — 이 페이지는 사진
+   바이트를 만지지 않는다(모바일 클립보드 초과 방지 · 아래 exportBtn 머리말). #}
 <script type="application/json" id="cd-export-images">{{ export_images | tojson }}</script>
-<script src="{{ url_for('static', filename='imagecrop.js') }}" defer></script>
 {% endif %}
 <div class="copy-toast" id="copy-toast" hidden>복사됨!</div>
 
@@ -827,41 +835,91 @@
       showToast('저장했어 💾');
     });
   }
-  // 📤 네이버로 보내기 — 미리보기(#review-copy)의 HTML + 각 이미지의 바이트를
-  // base64 data URI로 담은 '자급식' 페이로드(JSON)를 클립보드(text/plain)에 복사한다.
-  // 네이버 글쓰기 페이지에서 '📷 사진 올리기' 즐겨찾기(북마클릿)를 누르면, 이 페이로드를
-  // 읽어 사진을 네이버 이미지 호스팅에 올리고 URL을 치환한 본문을 만든다. 북마클릿은
-  // 우리 앱을 절대 fetch하지 않는다(네이버 페이지 CSP가 우리 오리진 connect를 막을 수
-  // 있어서) — 필요한 재료를 여기서 통째로 넘긴다.
+  // 📤 네이버로 보내기 — 미리보기(#review-copy)의 발행본 HTML + 사진마다
+  // **공개 서명 URL + 크롭 좌표**만 담은 가벼운 페이로드(JSON)를 클립보드에 넣는다.
+  //
+  // ⛔ 클립보드에 **사진 바이트(data URI)를 담지 않는다.** 예전엔 담았고, 그게
+  //    모바일에서 📤 가 "계속 실패"하던 원인이다 — 실측으로 한 장이 2.8~3.9MB,
+  //    8장이면 22~31MB 였다. 두 가지가 동시에 깨진다:
+  //      (a) **안드로이드**: 클립보드는 바인더 IPC 를 타고 트랜잭션 상한이 ~1MB 라
+  //          **한 장만으로도** 넘는다(TransactionTooLarge).
+  //      (b) **iOS 사파리**: 바이트를 받아 캔버스로 굽는 동안 사용자 제스처
+  //          (transient activation)가 풀려서, 그 뒤의 clipboard.writeText 가
+  //          크기와 무관하게 NotAllowedError 로 거절된다.
+  //    그래서 지금은 (1) 페이로드를 **동기로** 만들어 클릭 핸들러 안에서 바로 쓰고
+  //    — 제스처가 살아 있다 — (2) 사진 30장이어도 ~14KB 다.
+  //
+  // 바이트는 누가 나르나: **네이버 쪽 유저스크립트**다. 그쪽이 이 URL 로 원본을 받아
+  // (`/blog-img/...&v=orig` 는 공개 서명 + ACAO:*) Canvas 로 자른 뒤 네이버
+  // 이미지 호스팅에 **올린다**. 그래서 발행된 글의 사진은 여전히 네이버 내부
+  // 이미지다 — 외부 링크로 올려 글이 삭제되던 일은 되풀이되지 않는다.
   var exportBtn = document.getElementById('export-btn');
+  var exResult = document.getElementById('export-result');
+  var exMsg = document.getElementById('export-msg');
+  var exPayload = document.getElementById('export-payload');
+  function exportSay(msg, isError, payloadText) {
+    if (!exResult || !exMsg) return;
+    exResult.hidden = false;
+    exMsg.textContent = msg;
+    exMsg.classList.toggle('error', !!isError);
+    if (exPayload) {
+      if (payloadText) {
+        exPayload.value = payloadText;
+        exPayload.hidden = false;
+        try { exPayload.focus(); exPayload.select(); } catch (e) {}
+      } else {
+        exPayload.hidden = true;
+        exPayload.value = '';
+      }
+    }
+  }
   if (exportBtn) {
     exportBtn.addEventListener('click', function () {
-      exportBtn.disabled = true;
-      showToast('사진 담는 중… 잠깐만');
-      // v2 자동화: 서버에 '이 후기 대기' 슬롯을 세운다(유저스크립트가 네이버에서 꺼내 자동
-      // 삽입). same-origin 인증 POST. 실패해도 아래 클립보드(v1 폴백)는 그대로 동작.
+      var text, kb;
+      try {
+        text = JSON.stringify(buildExportPayload());   // 동기 — 제스처 안이다
+        kb = (text.length / 1024).toFixed(1);
+      } catch (e) {
+        try { console.error('[export] payload build failed', e); } catch (_) {}
+        exportSay('페이로드를 못 만들었어 (' + (e && e.message ? e.message : e) +
+                  ') — 새로고침하고 다시 눌러줘', true);
+        return;
+      }
+      var AUTO = ' 네이버 글쓰기 페이지를 열거나 새로고침하면 자동으로 들어가.';
+      var MANUAL = " 자동이 안 되면 네이버 오버레이 칸에 붙여넣고 '🅢 정식 삽입'을 눌러줘.";
+      function clipFailed(e) {
+        var why = e && (e.name || e.message) ? (e.name || e.message) : '알 수 없는 이유';
+        try { console.error('[export] clipboard write failed', e); } catch (_) {}
+        exportSay('클립보드 복사가 막혔어 (' + why + ', 페이로드 ' + kb + 'KB).' + AUTO +
+                  ' 수동으로 하려면 아래 칸의 값을 전부 복사해줘.', true, text);
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            showToast('복사됨 — 네이버 글쓰기를 열어줘');
+            exportSay('복사됨 (' + kb + 'KB).' + AUTO + MANUAL, false);
+          }, clipFailed);
+        } else {
+          clipFailed(new Error('이 브라우저가 클립보드 API를 안 써'));
+        }
+      } catch (e) { clipFailed(e); }
+
+      // v2 자동화: 서버에 '이 후기 대기' 슬롯을 세운다(유저스크립트가 네이버에서 꺼내
+      // 자동 삽입). 클립보드를 **먼저** 쓴 뒤에 보낸다 — 이 비동기 요청을 기다리면
+      // iOS 에서 제스처가 풀린다. 실패하면 조용히 넘기지 않고 화면에 말한다.
       try {
         fetch(markUrl, {
           method: 'POST', credentials: 'same-origin',
           headers: { 'X-Requested-With': 'XMLHttpRequest' }
-        }).catch(function () {});
-      } catch (e) {}
-      buildExportPayload().then(function (payload) {
-        var text = JSON.stringify(payload);
-        function done() {
-          showToast("복사됨 — 네이버 글쓰기에서 '📷 사진 올리기' 즐겨찾기(북마클릿)를 눌러줘");
-        }
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(done, function () {
-            window.prompt('이 값을 복사해서 북마클릿에 넘겨줘', text);
-          });
-        } else {
-          window.prompt('이 값을 복사해서 북마클릿에 넘겨줘', text);
-        }
-      }).catch(function (e) {
-        showToast('사진 담기 실패 — 잠시 후 다시 시도해줘');
-        try { console.error('[export] payload build failed', e); } catch (_) {}
-      }).then(function () { exportBtn.disabled = false; });
+        }).then(function (r) {
+          if (r.ok) return;
+          exportSay('자동 전달 등록이 안 됐어 (HTTP ' + r.status + ').' +
+                    ' 아래 값을 복사해서 네이버 오버레이에 직접 붙여넣어줘.', true, text);
+        }, function (e) {
+          exportSay('자동 전달 등록이 안 됐어 (' + (e && e.message ? e.message : e) + ').' +
+                    ' 아래 값을 복사해서 네이버 오버레이에 직접 붙여넣어줘.', true, text);
+        });
+      } catch (e) { /* 등록은 보조 경로 — 클립보드는 이미 갔다 */ }
     });
   }
 
@@ -881,23 +939,28 @@
     });
   } catch (e) {}
 
-  // 미리보기 HTML + 각 이미지 바이트(data URI)를 담은 페이로드를 만든다.
+  // 발행본 HTML + 사진마다 (매칭 키 src · **자르지 않은 원본** url · 크롭 좌표).
   //
-  // ⛔ 발행용 크롭은 **여기(브라우저)에서** 굽는다 — 서버는 픽셀을 만지지 않는다.
-  //    `v=orig` 로 **자르지 않은 원본**을 받아 Canvas 로 자르므로 결과 화질은
-  //    원본 픽셀 그대로다(서버가 1280 다운스케일본에서 자르던 것보다 낫다).
-  //    한 장씩 순차로 처리해 폰 메모리를 지키고, 진행률을 토스트로 보여 준다
-  //    (썸네일·GIF 가 쓰는 패턴과 같다). 자세한 규율은 static/imagecrop.js 머리말.
+  // ⛔ **동기 함수다 — 바꾸지 마라.** 클립보드 쓰기는 사용자 제스처 안에서 일어나야
+  //    하고(iOS 사파리는 await 한 번이면 transient activation 을 잃는다), 여기서
+  //    네트워크를 타면 그 조건이 깨진다. 사진 바이트를 담지 않는 이유는 위
+  //    exportBtn 핸들러 머리말에 있다(실측 2.8~3.9MB/장 → 모바일 클립보드 초과).
+  //
+  // 발행용 크롭은 **받는 쪽 브라우저**(네이버 유저스크립트)가 Canvas 로 굽는다 —
+  // 서버는 픽셀을 만지지 않고, 소스가 `v=orig` 원본이라 화질도 그대로다
+  // (규율 단일 원천: tools/naver-uploader.user.js 의 resolveImageBlobs·cropToBlob).
   function buildExportPayload() {
-    var copyHtml = toPublishHtml();   // 북마클릿이 받는 건 **발행본**이다
-    // 정식 삽입용 구조화 데이터(있으면) — 북마클릿이 setDocumentData로 조립할 재료.
+    var copyHtml = toPublishHtml();   // 유저스크립트가 받는 건 **발행본**이다
+    // 정식 삽입용 구조화 데이터(있으면) — 유저스크립트가 setDocumentData로 조립할 재료.
     var doc = null;
     try {
       var docEl = document.getElementById('cd-doc-data');
       if (docEl) doc = JSON.parse(docEl.textContent || 'null');
     } catch (e) { doc = null; }
 
-    // 서버가 내려준 (src, 원본 URL, 크롭) 목록 — 블록 순서 그대로.
+    // 서버가 내려준 (src, 원본 URL, 크롭) 목록 — 블록 순서 그대로. 공개 pending
+    // API(_build_export_payload)가 내는 것과 **같은 모양**이라, 받는 쪽은 자동
+    // 경로든 붙여넣기 경로든 한 가지 코드로 처리한다.
     var specs = [];
     try {
       var exEl = document.getElementById('cd-export-images');
@@ -906,7 +969,7 @@
     if (!specs.length) {
       // 폴백: 구조화 데이터가 없는 옛 후기 — **발행본**의 <img> 를 그대로 쓴다
       // (화면본이 아니다 — 거기 박힌 미리보기 자산 URL 은 로그인이 필요해서
-      // 네이버·북마클릿이 못 연다). 이미 서버가 잘라 준 std 바이트다.
+      // 네이버·유저스크립트가 못 연다). 이미 서버가 잘라 준 std URL 이다.
       var pubDoc = document.createElement('div');
       pubDoc.innerHTML = copyHtml;
       var seen = {};
@@ -917,24 +980,10 @@
         specs.push({ src: src, url: src, crop: null });
       });
     }
-    if (!specs.length) {
-      return Promise.resolve({ copy_html: copyHtml, images: [], doc: doc });
-    }
-
-    var IC = window.cdImageCrop;
-    return IC.prepare(specs, function (done, total, phase) {
-      var label = phase === 'crop' ? '자르는 중' : '사진 받는 중';
-      showToast(label + '… ' + Math.min(done + 1, total) + '/' + total);
-    }).then(function (results) {
-      return Promise.all(results.map(function (r) {
-        return IC.blobToDataUri(r.blob);
-      }));
-    }).then(function (uris) {
-      var images = uris.map(function (dataUri, i) {
-        return { src: specs[i].src, dataUri: dataUri };
-      });
-      return { copy_html: copyHtml, images: images, doc: doc };
+    var images = specs.map(function (s) {
+      return { src: s.src, url: s.url || s.src, crop: s.crop || null };
     });
+    return { copy_html: copyHtml, images: images, doc: doc };
   }
 })();
 </script>
