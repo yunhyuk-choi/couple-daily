@@ -2111,6 +2111,15 @@ _scoring: set[int] = set()
 _SCORE_BATCH_DEFAULT = 24  # 한 패스당 채점 상한(배치 1콜 크기)
 
 
+def _taste_profile_sig(profile_text):
+    """취향 프로필 → 짧은 지문. '같은 질문인가'를 **SQL 에서** 비교하려고 쓴다.
+
+    채점 프롬프트에 들어가는 커플 쪽 입력은 이 문자열 하나뿐이다(``ai.score_events``
+    가 그걸 그대로 박는다). 그래서 이 해시가 같으면 커플 쪽 질문도 글자 하나 같다.
+    """
+    return hashlib.sha256((profile_text or "").encode("utf-8")).hexdigest()[:32]
+
+
 def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
     """백그라운드 워커: 이 커플에 아직 점수 없는 진행 중 행사들을 배치로 채점한다.
 
@@ -2118,12 +2127,32 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
     캡션과 공유하는 _CAPTION_SEM으로 claude 배치 콜을 직렬화하고, 모든 예외를
     삼키며 스레드 밖으로 절대 raise 안 하고, finally에서 가드 키를 해제한다.
 
-    선택: 진행 중(end_date NULL 또는 >= 오늘) 행사 중 이 커플에 'ready' 점수가
-    없는(행 없거나 status!='ready') 것들을 마감 임박 순으로 최대 ``limit``개.
-    없으면 그냥 반환. 선택된 것들에 'pending' 행을 만들어(UI가 "분석 중" 표시)
-    두고, 프로필을 한 번 만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번'
-    호출한다. 돌아온 ref → score/reason/status='ready'; 안 돌아온 ref →
-    status='failed'(이 패스에서 무한 재시도 방지; 이후 패스가 재시도 가능).
+    선택: 진행 중(end_date NULL 또는 >= 오늘) 행사 중 이 커플에 **아직 물어볼
+    것이 남은** 것들을 마감 임박 순으로 최대 ``limit``개. 없으면 그냥 반환.
+    선택된 것들에 'pending' 행을 만들어(UI가 "분석 중" 표시) 두고, 프로필을 한 번
+    만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번' 호출한다.
+
+    ⭐ **같은 실패를 영원히 반복하지 않는다 — 그러나 영구히 포기하지도 않는다.**
+    예전엔 선택 조건이 ``status != 'ready'`` 라 ``'failed'`` 를 매번 다시 골랐다.
+    그래서 항상 실패하는 행사가 몇 건만 있어도 ``/dates`` **페이지 로드마다**,
+    그리고 **매일 밤**, 결과가 바뀔 이유가 하나도 없는 claude 콜이 버려졌다
+    (실측: 실패 3건일 때 페이지 5회 = claude 5콜, 매일 밤 1콜).
+
+    줄인 것은 **낭비**이지 기능이 아니다 — 건수 캡도, 시간 백오프도 넣지 않았다.
+    가른 기준은 *그 재시도가 성공할 수 있는가* 하나이고, 그 답은 호출 결과에 이미
+    들어 있다:
+
+      * ``ai.score_events`` 가 **None** (콜이 답을 못 냈다 — 프로세스·파싱·취소)
+        → 그 배치의 어떤 행사에 대해서도 배운 게 없다 → 전부 ``'failed'``,
+        **다음 패스가 그대로 재시도한다**(일시 장애는 지나간다).
+      * 리스트를 받았는데 **이 ref 만 빠졌다** → 모델이 답은 했고 이 행사를 고르지
+        않았다. 같은 프롬프트면 같은 답이다 → ``'unscorable'`` + 그때의
+        **입력 지문**(프로필 해시 · 본 ``EventItem.updated_at``)을 함께 적는다.
+
+    채점 프롬프트의 입력은 둘뿐이라(커플 프로필 · 행사 내용) 지문이 그대로면 질문이
+    같다 — 다시 묻지 않는다. 프로필이 자라거나 야간 upsert 가 행사 내용을 바꾸면
+    질문이 달라지므로 **그때 다시 묻는다.** 그래서 선택 쿼리가 프로필 해시를 알아야
+    하고, 프로필 조립이 행 선택보다 **앞으로** 왔다(DB 읽기뿐 — claude 안 쓴다).
 
     반환값: 이 패스에서 새로 'ready'가 된 행사 수(int). 채점할 게 없거나
     이미 이 커플 채점 중이거나 에러면 0. 선채점 루프(prewarm_scores)가 이 값이
@@ -2142,8 +2171,14 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     return 0
                 today = date.today()
 
-                # 진행 중 행사 중 이 커플에 'ready' 점수가 없는 것 — 마감 임박 순.
-                # LEFT JOIN으로 EventScore가 없거나 ready가 아닌 행만 고른다.
+                # 프로필을 **먼저** 만든다 — 아래 선택 쿼리가 그 해시로 '이미 같은
+                # 질문을 해서 못 고른 행사'를 걸러낸다. claude 는 안 쓰는 DB 읽기다.
+                profile_text = build_couple_taste_profile(couple)
+                profile_sig = _taste_profile_sig(profile_text)
+
+                # 진행 중 행사 중 이 커플에 **아직 물어볼 것이 남은** 것 — 마감 임박 순.
+                # LEFT JOIN 으로 EventScore 가 없거나, 'ready' 가 아니면서
+                # '이 입력으로는 못 고른다(unscorable)'가 **아직 유효하지 않은** 행만.
                 rows = (
                     db.session.query(EventItem, EventScore)
                     .outerjoin(
@@ -2160,7 +2195,19 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         ),
                         db.or_(
                             EventScore.id.is_(None),
-                            EventScore.status != "ready",
+                            db.and_(
+                                EventScore.status != "ready",
+                                db.or_(
+                                    # 'unscorable' 이 아니면(=pending/failed) 재시도 대상.
+                                    EventScore.status != "unscorable",
+                                    # 지문을 모르는 옛 행 → 한 번은 다시 묻는다.
+                                    EventScore.input_sig.is_(None),
+                                    EventScore.event_seen_at.is_(None),
+                                    # 질문이 달라졌다 → 답도 달라질 수 있다.
+                                    EventScore.input_sig != profile_sig,
+                                    EventItem.updated_at > EventScore.event_seen_at,
+                                ),
+                            ),
                         ),
                     )
                     .order_by(
@@ -2193,8 +2240,7 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     db.session.rollback()
                     return 0
 
-                # 프로필 1회 + 배치 페이로드.
-                profile_text = build_couple_taste_profile(couple)
+                # 배치 페이로드(프로필은 위에서 이미 한 번 만들었다).
                 batch = [
                     {
                         "ref": ev.id,
@@ -2216,17 +2262,25 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         log.exception(
                             "claude event scoring raised (couple=%s)", couple_id
                         )
-                        results = []
+                        # ⛔ ``[]`` 가 아니라 ``None`` — 여기까지 예외가 올라왔다는
+                        # 건 **답을 못 받았다**는 뜻이다. ``[]`` 로 적으면 아래에서
+                        # '모델이 답은 했는데 아무도 안 골랐다'로 읽혀 배치 전체가
+                        # 영구 포기(unscorable)로 찍힌다.
+                        results = None
                 finally:
                     _CAPTION_SEM.release()
 
+                # ⭐ **답을 받았나**가 영구·일시를 가르는 단 하나의 신호다.
+                # None = 콜이 답을 못 냈다(배운 것 없음) / 리스트 = 모델이 답했다.
+                answered = results is not None
                 by_ref = {}
                 for r in results or []:
                     ref = r.get("ref")
                     if ref is not None:
                         by_ref[ref] = r
 
-                # 결과 반영: 받은 ref → ready, 안 받은 ref → failed.
+                # 결과 반영: 받은 ref → ready / 답은 왔는데 빠진 ref → unscorable
+                # (지문과 함께) / 답 자체가 없었으면 전부 failed(그대로 재시도).
                 # scored = 이 패스에서 새로 ready가 된 수(선채점 루프 종료 신호).
                 now = datetime.utcnow()
                 scored = 0
@@ -2236,9 +2290,19 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         sc_row.score = r.get("score")
                         sc_row.reason = (r.get("reason") or "")[:1000]
                         sc_row.status = "ready"
+                        sc_row.input_sig = None
+                        sc_row.event_seen_at = None
                         scored += 1
+                    elif answered:
+                        # 이 질문으로는 못 고른다 — 질문이 바뀌기 전엔 다시 안 묻는다.
+                        sc_row.status = "unscorable"
+                        sc_row.input_sig = profile_sig
+                        sc_row.event_seen_at = ev.updated_at
                     else:
+                        # 일시 장애 — 이 행사에 대해 아무것도 배우지 못했다.
                         sc_row.status = "failed"
+                        sc_row.input_sig = None
+                        sc_row.event_seen_at = None
                     sc_row.updated_at = now
                 try:
                     db.session.commit()

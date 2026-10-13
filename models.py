@@ -277,6 +277,30 @@ def run_startup_migrations():
                     log.info("startup migration: added ai_jobs.%s", col)
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
                     log.exception("startup migration: failed adding ai_jobs.%s", col)
+
+        # 9) event_scores: 'unscorable' 판정의 입력 지문 두 칸. event_scores 는
+        #    프로덕션에 이미 있으므로 create_all 이 ALTER 하지 않는다 — 없는 것만
+        #    붙인다. 둘 다 nullable 이라 **기존 행은 NULL 로 남고**, NULL 은 선택
+        #    쿼리에서 '지문을 모른다 = 다시 묻는다'로 읽힌다(기존 'failed' 행이
+        #    조용히 영원 포기로 바뀌지 않는다).
+        if "event_scores" in insp.get_table_names():
+            ecols = {c["name"] for c in insp.get_columns("event_scores")}
+            for col, ddl in (
+                ("input_sig", "VARCHAR(64)"),
+                ("event_seen_at", "TIMESTAMP"),
+            ):
+                if col in ecols:
+                    continue
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE event_scores ADD COLUMN {col} {ddl}")
+                        )
+                    log.info("startup migration: added event_scores.%s", col)
+                except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                    log.exception(
+                        "startup migration: failed adding event_scores.%s", col
+                    )
     except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
         log.exception("startup migration: unexpected error; continuing boot")
 
@@ -926,9 +950,17 @@ class EventScore(db.Model):
     만들어 ALTER 불필요.
 
     ``status`` 라이프사이클:
-      * 'pending' — 채점 대기/진행 중(UI는 "추천 분석 중").
-      * 'ready'   — score+reason 채워짐(렌더 가능).
-      * 'failed'  — 이번 패스에서 못 받음(무한 재시도 방지; 이후 패스가 재시도 가능).
+      * 'pending'    — 채점 대기/진행 중(UI는 "추천 분석 중").
+      * 'ready'      — score+reason 채워짐(렌더 가능).
+      * 'failed'     — **일시** 실패. claude 콜 자체가 답을 못 냈다(프로세스·파싱·
+        취소). 이 행사에 대해 아무것도 배우지 못했으므로 다음 패스가 그대로 재시도한다.
+      * 'unscorable' — **이 입력에 한해 영구** 실패. 모델이 답은 했는데 이 ref 만
+        빼놓았다. 같은 프롬프트를 다시 보내면 같은 답이 오므로 재시도하지 않는다 —
+        단 **입력이 바뀌면 다시 시도한다**(아래 두 칸이 그 판정의 재료다).
+
+    ⛔ 왜 이 구분이 있나 — 예전엔 선택 쿼리가 ``status != 'ready'`` 라 ``'failed'``
+    를 영원히 다시 골랐다. 항상 실패하는 행사가 몇 건만 있어도 ``/dates`` 를 열
+    때마다, 그리고 매일 밤, **결과가 바뀔 이유가 하나도 없는 claude 콜**이 버려졌다.
     """
     __tablename__ = "event_scores"
     __table_args__ = (
@@ -947,6 +979,18 @@ class EventScore(db.Model):
     score = db.Column(db.Integer, nullable=True)   # 0~100
     reason = db.Column(db.Text, nullable=True)     # 한 문장 사유
     status = db.Column(db.String(16), default="pending", nullable=False)
+    # --- 'unscorable' 판정의 입력 지문 (그 상태일 때만 의미가 있다) ----------
+    # 채점 프롬프트에 들어가는 것은 둘뿐이다 — **커플 취향 프로필**과 **행사 내용**.
+    # 둘 다 그대로면 프롬프트가 글자 하나 같으니 결과도 같다(= 다시 묻지 않는다).
+    # 하나라도 바뀌면 다른 질문이 되므로 **다시 묻는다**(영구 포기가 아니다).
+    #   input_sig     — 그때의 프로필 해시(sha256 앞 32자).
+    #   event_seen_at — 그때 본 ``EventItem.updated_at``. 야간 upsert 가 내용을
+    #                   실제로 바꿨을 때만 밀리므로(값이 같으면 SQLAlchemy 가
+    #                   UPDATE 를 내지 않는다) '행사가 바뀌었나'의 신호가 된다.
+    # 둘 다 **SQL 로 비교 가능**해야 선택 쿼리 한 방에 걸러진다 — 그래서 행사 내용
+    # 해시가 아니라 시각이다(해시는 행마다 달라 WHERE 에 못 넣는다).
+    input_sig = db.Column(db.String(64), nullable=True)
+    event_seen_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(
         db.DateTime,

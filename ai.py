@@ -1710,8 +1710,13 @@ def score_events(profile_text, events):
     반환: 받은 ref에 대해서만 ``{"ref", "score", "reason"}`` 리스트.
       * score → int 강제, 0..100 클램프(없으면 60),
       * reason → .strip()(없으면 ""),
-      * ref로 다시 매칭. 출력에 없는 ref는 생략(호출부가 실패 처리/재시도).
-    실패 시 ``[]``(또는 부분) 반환, 절대 raise 안 함(다른 ai.py 함수와 동일).
+      * ref로 다시 매칭. 출력에 없는 ref는 생략(호출부가 그 행사만 판정한다).
+
+    ⭐ **'답을 못 받았다'와 '답은 받았는데 이 행사를 안 골랐다'는 다른 사실이다.**
+    그래서 반환형이 둘이다 — 콜 자체가 실패하면(프로세스·파싱·취소) ``None``,
+    모델이 답을 했으면 **리스트**(비어 있을 수도 있다). 예전엔 둘 다 ``[]`` 라
+    호출부가 가를 수 없었고, 그래서 *절대 성공할 수 없는 재채점*을 영원히 반복했다
+    (``app.score_events_for_couple`` 머리말). 절대 raise 안 함은 그대로다.
     """
     if not events:
         return []
@@ -1792,8 +1797,10 @@ def score_events(profile_text, events):
             seen.add(ref)
         return out
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        # ⛔ 여기서 ``[]`` 를 돌려주면 '모델이 아무도 안 골랐다'와 구별이 안 된다.
+        # 콜이 **답을 내지 못했다**는 사실 자체가 호출부의 판정 재료다.
         print(f"[ai] event scoring failed: {e}", file=sys.stderr)
-        return []
+        return None
 
 
 # ---------------------------------------------------------------------------
