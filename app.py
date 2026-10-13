@@ -4506,13 +4506,11 @@ def _build_export_payload(review):
             "url": publish_source_url(p),  # 자르지 않은 원본(짧은 만료·등급 서명)
             "crop": [round(float(v), 6) for v in crop] if crop else None,
         })
-    created = review.created_at
-    visit_ymd = f"{created.year}년 {created.month}월" if created else ""
-    visit_foot = created.strftime("%Y. %m") if created else ""
+    # ⛔ 방문 날짜(visitDate/visitFoot)는 더 이상 내려보내지 않는다 — 본문에 날짜를
+    #    '정보'로 박지 않기로 했다(_review_copy_html 같은 자리의 주석 참조). '언제 갔는지'는
+    #    사용자 칸 ``visited_when``(요일·시간대)이 재료로 들어가 문장 안에서 풀린다.
     doc_data = {
         "title": (data or {}).get("title") or "",
-        "visitDate": visit_ymd,
-        "visitFoot": visit_foot,
         "overallScore": review.overall_score,
         "hashtags": (data or {}).get("hashtags") or [],
         "blocks": blocks,
@@ -4547,11 +4545,6 @@ def _review_copy_html(review):
     photos = review.photos_ordered
     score = max(0, min(10, int(review.overall_score or 0)))
 
-    # 실제 방문 날짜(AI가 아닌 리뷰 날짜에서 계산 — footer와 같은 원천).
-    created = review.created_at
-    visit_ymd = f"{created.year}년 {created.month}월" if created else ""
-    visit_foot = created.strftime("%Y. %m") if created else ""
-
     out = []
 
     def add_hr():
@@ -4582,19 +4575,14 @@ def _review_copy_html(review):
             f'line-height:1.5;color:#222;margin:6px 0 22px;">{title_html}</h2>'
         )
 
-    # 2) 시스템 헤더 — 실제 방문 날짜 한 줄(항상, 위치 고정).
-    #    ⛔ 핑크 '✱ 내돈내산 데이트 후기 ✱' 배지는 뺐다 — 사용자가 명시적으로 싫다고 한
-    #    상투적 자랑 문구다. 이 앱의 후기는 전부 커플이 자기 돈으로 다녀온 사적 기록이라
-    #    협찬·대가성이 애초에 없고, 따라서 **고지해야 할 법적 사실도 없다**. 즉 이건
-    #    고지가 아니라 장식이었다(표시광고법상 '경제적 이해관계 공개'는 대가를 받았을
-    #    때의 의무지, 받지 않았음을 자랑할 의무가 아니다).
-    if visit_ymd:
-        out.append(
-            # 시스템 헤더는 평문이다 — 강조는 본문(AI 토큰)에서만 나온다(§5.3).
-            f'<p style="text-align:center;margin:2px 0;line-height:2;">'
-            f'방문 날짜 : {esc(visit_ymd)}</p>'
-        )
-        out.append(HR)
+    # 2) ⛔ 제목과 본문 사이의 **시스템 헤더는 통째로 없앴다.** 두 줄이었다:
+    #    ① 핑크 상투구 배지 — 사용자가 싫다고 한 자랑 문구. 협찬이 없는 사적 후기라
+    #       공개할 '경제적 이해관계'가 없고, 따라서 고지가 아니라 장식이었다.
+    #    ② `방문 날짜 : 2026년 10월` — 사용자가 "별로 안 중요하다"고 했다. **날짜를
+    #       한 줄짜리 정보로 박는 것**만 뺀 것이고, `지난 주말에 갔는데` 같은 자연스러운
+    #       표현은 그대로다 — 재료 칸 ``visited_when``(요일·시간대)은 손대지 않았고
+    #       지금도 프롬프트로 들어가 본문 문장 안에서 풀린다(ai.REVIEW_DETAIL_FIELDS).
+    #    그래서 제목 다음은 바로 본문이다(앞세울 구분선도 없다).
 
     def render_info(items):
         rows = []
@@ -4670,16 +4658,10 @@ def _review_copy_html(review):
             _emph_html(ln.strip())
             for ln in str(text or "").replace("\r\n", "\n").split("\n") if ln.strip()
         )
-        # 꼬리표는 방문월뿐이다 — 비면 <span> 자체를 내지 않는다(빈 줄 방지).
-        foot = f"{esc(visit_foot)} 방문" if visit_foot else ""
-        foot_html = (
-            '<span style="display:block;color:#aaa;font-size:13px;'
-            f'margin-top:8px;">{foot}</span>' if foot else ""
-        )
+        # 꼬리표(`YYYY. MM 방문`)는 없앴다 — 방문 날짜를 본문에 박지 않는다.
         out.append(
             '<blockquote style="border:0;text-align:center;font-size:16px;'
-            f'color:#444;margin:8px 0;line-height:1.9;">{body}'
-            f'{foot_html}</blockquote>'
+            f'color:#444;margin:8px 0;line-height:1.9;">{body}</blockquote>'
         )
 
     # 3) 블록을 순서대로 렌더.
@@ -4738,15 +4720,9 @@ def _review_copy_html(review):
         else:
             closing = f"다녀온 후기였어요.<br>{tail}"
         add_hr()
-        foot = f"{esc(visit_foot)} 방문" if visit_foot else ""
-        foot_html = (
-            '<span style="display:block;color:#aaa;font-size:13px;'
-            f'margin-top:8px;">{foot}</span>' if foot else ""
-        )
         out.append(
             '<blockquote style="border:0;text-align:center;font-size:16px;'
-            f'color:#444;margin:8px 0;line-height:1.9;">{closing}'
-            f'{foot_html}</blockquote>'
+            f'color:#444;margin:8px 0;line-height:1.9;">{closing}</blockquote>'
         )
 
     # 5) 해시태그(가운데, 핑크).

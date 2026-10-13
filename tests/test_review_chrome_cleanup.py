@@ -67,3 +67,46 @@ def test_prompt_bans_the_cliche_outright():
     assert "내돈내산" in src, "프롬프트가 상투구를 **금지어로** 명시해야 한다"
     # 금지 맥락에서만 등장해야 한다 — 제목 구조 예시로 베껴 쓰게 두면 안 된다.
     assert "`상호 솔직후기 |" not in src
+
+
+# --------------------------------------------------------------------------- #
+# 2. 방문 날짜 — 본문에 '정보'로 박지 않는다 (입력 칸 visited_when 은 그대로 둔다)
+# --------------------------------------------------------------------------- #
+def test_copy_html_has_no_visit_date_header(flask_app, make_review):
+    html = app_module._review_copy_html(_ready(make_review))
+    assert "방문 날짜" not in html
+    assert not re.search(r"\d{4}\.\s*\d{2}", html), "YYYY. MM 방문월 스탬프가 남았다"
+
+
+def test_copy_html_quote_footer_is_gone_entirely(flask_app, make_review):
+    """인용구 꼬리표는 `YYYY. MM 방문 · 내돈내산` 뿐이었다 — 둘 다 빠지면 꼬리표가 없다."""
+    html = app_module._review_copy_html(_ready(make_review))
+    assert "<blockquote" in html          # 매듭 자체는 남는다
+    assert "방문 ·" not in html
+    assert "margin-top:8px" not in html   # 꼬리표 <span> 의 흔적
+
+
+def test_export_payload_carries_no_visit_date(flask_app, make_review):
+    doc, _images = app_module._build_export_payload(_ready(make_review))
+    assert doc is not None
+    assert "visitDate" not in doc
+    assert "visitFoot" not in doc
+
+
+def test_userscript_does_not_read_visit_date():
+    src = USERSCRIPT.read_text(encoding="utf-8")
+    assert "visitDate" not in src
+    assert "visitFoot" not in src
+    # 주석으로 '무엇을 뺐는지' 설명하는 건 괜찮다 — 막는 건 **문자열 리터럴로 찍는 것**.
+    assert "tn('방문 날짜" not in src
+
+
+def test_visited_when_is_still_an_input_and_still_reaches_the_prompt():
+    """사용자가 적는 칸은 살아 있다 — 뺀 것은 *날짜 스탬프*지 '언제 갔는지'가 아니다."""
+    import ai as ai_module
+
+    assert ("visited_when", "언제 갔는지(요일·시간대)") in ai_module.REVIEW_DETAIL_FIELDS
+    block = ai_module.build_review_input_block(
+        "문래갈매기", "문래동", "맛있었어요", 8, {"visited_when": "일요일 저녁"}
+    )
+    assert "일요일 저녁" in block

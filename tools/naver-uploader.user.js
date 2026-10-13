@@ -1098,7 +1098,7 @@
   }
 
   // ============ 정식(네이버 내부이미지) 문서 빌더 — setDocumentData용 ============
-  // 앱이 보낸 doc(blocks/title/visitDate/hashtags/overallScore)을 SmartEditor
+  // 앱이 보낸 doc(blocks/title/hashtags/overallScore)을 SmartEditor
   // 네이티브 문서의 components 배열로 조립한다. 이미지는 upphoto 업로드 메타 +
   // internalResource:true 로 '내부 이미지'가 되어, 붙여넣기가 아니라 정식 삽입이라
   // 발행 후 자동 삭제되지 않는다.
@@ -1182,16 +1182,15 @@
     if (!nodes.length) nodes.push(tn('', null));
     return nodes;
   }
-  function quotationComp(text, foot) {
-    // 출처(source) 줄은 방문월 꼬리표 하나뿐이다. 비면 **키 자체를 뺀다** — 빈 줄이 안
-    // 생기게 한다(자매 레포 naver-ent-autopost 의 quotationComp 와 같은 모양).
-    var o = {
+  function quotationComp(text) {
+    // 출처(source) 줄은 방문월 꼬리표 하나뿐이었는데 그 날짜를 빼기로 했으므로, 이제
+    // **키 자체를 내보내지 않는다**(빈 줄 방지). 자매 레포 naver-ent-autopost 의
+    // quotationComp 가 운영 중인 모양과 같다.
+    return {
       '@ctype': 'quotation', id: sid(), layout: 'default',
       value: [para(emphNodes(('' + (text || '')).replace(/\n/g, ' ')), null)],
       align: 'justify'
     };
-    if (foot) o.source = [para([tn(foot, null)], null)];
-    return o;
   }
   // copy_html의 이미지 src ↔ 블록 __src 매칭 키(토큰 e/t는 뷰마다 달라지므로 무시하고
   // photo id + 크롭으로만 매칭).
@@ -1213,12 +1212,11 @@
       title: [{ '@ctype': 'paragraph', id: sid(), nodes: [{ '@ctype': 'textNode', id: sid(), value: '' + (doc.title || '') }] }],
       subTitle: null, align: 'center'
     });
-    var headerParas = [];
-    if (doc.visitDate) headerParas.push(para([tn('방문 날짜 : ' + doc.visitDate, null)], 'center'));
-    // ⛔ 핑크 상투구 배지 줄은 뮤다 — 사용자가 명시적으로 싫다고 한 문구이고,
-    //    협찬이 없는 사적 후기라 고지할 법적 사실 자체가 없다(app.py `_review_copy_html`
-    //    같은 자리와 한 쌍으로 움직인다).
-    if (headerParas.length) comps.push(textComp(headerParas));
+    // ⛔ 제목 다음의 시스템 헤더는 통째로 없앴다(app.py `_review_copy_html` 과 한 쌍):
+    //    ① 핑크 상투구 배지 — 사용자가 싫다고 한 자랑 문구. 협찬이 없는 사적 후기라
+    //       공개할 '경제적 이해관계'가 없어, 고지가 아니라 장식이었다.
+    //    ② `방문 날짜 : 2026년 10월` — 사용자가 "별로 안 중요하다"고 했다. 날짜를 한
+    //       줄짜리 정보로 박는 것만 뺀 것이고, 본문의 자연스러운 시점 표현은 그대로다.
     var blocks = doc.blocks || [];
     for (var b = 0; b < blocks.length; b++) {
       var blk = blocks[b];
@@ -1270,7 +1268,7 @@
         if (fp.length) comps.push(textComp(fp));
       } else if (t === 'quote') {
         pushHr(comps);
-        comps.push(quotationComp(blk.text || '', doc.visitFoot ? (doc.visitFoot + ' 방문') : ''));
+        comps.push(quotationComp(blk.text || ''));
       }
     }
     var tags = (doc.hashtags || []).map(function (x) { return ('' + x).trim(); }).filter(Boolean);
@@ -1609,7 +1607,7 @@
         W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만(폴이 스택되지 않게)
         // clear-on-serve라 페이로드를 '지금' 캡처해 둔다(에디터 대기 중 슬롯이 비어도 무관).
         var doc = {
-          title: pl.title, visitDate: pl.visitDate, visitFoot: pl.visitFoot,
+          title: pl.title,
           overallScore: pl.overallScore, hashtags: pl.hashtags, blocks: pl.blocks
         };
         var images = Array.isArray(pl.images) ? pl.images : [];
