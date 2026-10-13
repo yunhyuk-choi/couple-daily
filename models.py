@@ -278,6 +278,32 @@ def run_startup_migrations():
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
                     log.exception("startup migration: failed adding ai_jobs.%s", col)
 
+        # 8b) blog_reviews 서술형 네 칸을 VARCHAR(300) → TEXT 로 넓힌다.
+        #     본문 하한(1,200자)을 채울 재료가 들어가야 한다 — 근거는 모델의 컬럼
+        #     주석이 정본. Postgres 는 길이가 **실제 제약**이라 ALTER 가 필요하고,
+        #     SQLite 는 VARCHAR 길이를 아예 강제하지 않으므로 할 일이 없다(선언
+        #     타입만 옛 문자열로 남는데 동작에 영향이 없다). 반복 실행에 멱등하다.
+        if dialect == "postgresql" and "blog_reviews" in insp.get_table_names():
+            wide = {
+                c["name"]: c for c in insp.get_columns("blog_reviews")
+            }
+            for col in ("visit_reason", "access_note", "highlight", "downside"):
+                info = wide.get(col)
+                if info is None or str(info["type"]).upper().startswith("TEXT"):
+                    continue
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE blog_reviews ALTER COLUMN {col} TYPE TEXT"
+                            )
+                        )
+                    log.info("startup migration: widened blog_reviews.%s to TEXT", col)
+                except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
+                    log.exception(
+                        "startup migration: failed widening blog_reviews.%s", col
+                    )
+
         # 9) event_scores: 'unscorable' 판정의 입력 지문 두 칸. event_scores 는
         #    프로덕션에 이미 있으므로 create_all 이 ALTER 하지 않는다 — 없는 것만
         #    붙인다. 둘 다 nullable 이라 **기존 행은 NULL 로 남고**, NULL 은 선택
@@ -1262,13 +1288,21 @@ class BlogReview(db.Model):
     # 산문만으로는 구체적인 수치(대기 분·팀 수·인분·가격)가 안 나와서 AI가 지어내던
     # 자리를, 사람이 아는 만큼만 채우게 한다. **모르면 비워 둔다** — 빈칸이
     # 지어내기보다 낫다. 각 칸의 근거는 prompts/blog-review.md·docs/blog-review-spec.md.
+    #
+    # ⚠️ **서술형 네 칸은 넓다**(계기·가는 길·기억에 남은 것·아쉬운 점). 본문 하한이
+    # 1,200자(``ai.REVIEW_MIN_BODY_CHARS``)인데 이 넷이 300자 한 줄 input 이던 동안은
+    # 넷을 다 채워도 하한을 못 넘겼다 — 재료가 모자라면 AI 가 지어내거나 늘어진다.
+    # 그래서 이미 2,000자이던 ``order_items``·``researched`` 와 **같은 상한**으로
+    # 맞췄다(숫자가 하나면 폼·서버·컬럼이 갈라지지 않는다). 날짜·웨이팅처럼 **짧은
+    # 사실**을 적는 칸(``visited_when``·``waiting``)은 그대로 둔다 — 거기는 좁은
+    # 것이 안내다.
     visited_when = db.Column(db.String(100), nullable=True)   # 언제(요일·시간대)
-    visit_reason = db.Column(db.String(300), nullable=True)   # 왜 갔는지(도입 단락)
-    access_note = db.Column(db.String(300), nullable=True)    # 찾아가는 길·자리·주차
+    visit_reason = db.Column(db.Text, nullable=True)          # 왜 갔는지(도입 단락)
+    access_note = db.Column(db.Text, nullable=True)           # 찾아가는 길·자리·주차
     waiting = db.Column(db.String(200), nullable=True)        # 웨이팅·입장 방식
     order_items = db.Column(db.Text, nullable=True)           # 주문·가격·총액
-    highlight = db.Column(db.String(300), nullable=True)      # 가장 기억에 남은 것
-    downside = db.Column(db.String(300), nullable=True)       # 아쉬운 점
+    highlight = db.Column(db.Text, nullable=True)             # 가장 기억에 남은 것
+    downside = db.Column(db.Text, nullable=True)              # 아쉬운 점
     # 검색해서 확인한 공개 정보(영업시간·휴무·주소·주차). 경험과 **어미가 다르다**
     # (~것으로 안내돼 있어요) — 그래서 자유 서술과 칸을 분리한다.
     researched = db.Column(db.Text, nullable=True)

@@ -8274,14 +8274,18 @@ def _register_routes(app: Flask):
         컬럼 정의에 맞춰 자른다 — 폼이 maxlength를 걸지만 서버에서도 강제한다.
         키 순서는 ``BlogReview.DETAIL_FIELDS``(= 글의 흐름 순서)를 따른다.
         """
+        # ⚠️ 이 숫자는 **컬럼 정의와 폼 maxlength 와 같아야 한다**(세 군데가
+        # 갈라지면 사람이 적은 글이 조용히 잘린다). 서술형 칸은 전부 2,000 —
+        # 본문 하한 1,200자를 채울 재료가 들어가야 한다(모델 컬럼 주석이 정본).
+        # 짧은 사실을 적는 칸(언제·웨이팅)만 좁게 둔다.
         limits = {
             "visited_when": 100,
-            "visit_reason": 300,
-            "access_note": 300,
+            "visit_reason": 2000,
+            "access_note": 2000,
             "waiting": 200,
             "order_items": 2000,
-            "highlight": 300,
-            "downside": 300,
+            "highlight": 2000,
+            "downside": 2000,
             "researched": 2000,
         }
         return {

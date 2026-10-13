@@ -48,13 +48,19 @@ AI가 자동 생성해 주는 기능이다.
 | `location` | String(300), nullable | 위치 |
 | `prose` | Text, not-null | **자유 서술 원문** (v2: '3~4줄' 가이드 폐기 — 길수록 좋다) |
 | `visited_when` | String(100), nullable | (v2) 언제 갔는지 — 요일·시간대 |
-| `visit_reason` | String(300), nullable | (v2) 왜 갔는지 — 방문 계기 |
-| `access_note` | String(300), nullable | (v2) 찾아가는 길·층·역·주차·좌석 |
+| `visit_reason` | Text (폼·서버 2,000자), nullable | (v2) 왜 갔는지 — 방문 계기 |
+| `access_note` | Text (폼·서버 2,000자), nullable | (v2) 찾아가는 길·층·역·주차·좌석 |
 | `waiting` | String(200), nullable | (v2) 웨이팅·입장 — 대기 분·앞 팀 수·줄서기 방식 |
 | `order_items` | Text, nullable | (v2) 주문한 것과 가격·총액 |
-| `highlight` | String(300), nullable | (v2) 가장 기억에 남은 것 하나 |
-| `downside` | String(300), nullable | (v2) 아쉬운 점 |
+| `highlight` | Text (폼·서버 2,000자), nullable | (v2) 가장 기억에 남은 것 하나 |
+| `downside` | Text (폼·서버 2,000자), nullable | (v2) 아쉬운 점 |
 | `researched` | Text, nullable | (v2) **검색해서 확인한** 공개 정보(어미가 달라진다) |
+
+> 서술형 재료 칸(`visit_reason`·`access_note`·`highlight`·`downside`)은 2026-10-13 에
+> 300자 한 줄 input → **2,000자 textarea** 로 넓혔다. 본문 하한이 1,200자
+> (`ai.REVIEW_MIN_BODY_CHARS`)인데 넷을 다 채워도 그 하한에 못 미치던 것이 이유다 —
+> 재료가 모자라면 AI 가 지어낸다. `order_items`·`researched` 가 이미 쓰던 숫자에
+> 맞췄고, 짧은 사실 칸(`visited_when`·`waiting`)은 좁은 것이 안내라 그대로 둔다.
 | `overall_score` | Integer, not-null | 0~10 (반쪽별 드래그 합계) |
 | `photo_ids` | Text, nullable | JSON list[int] — 선택한 Photo id, **순서 유지** |
 | `ai_json` | Text, nullable | P2 결과(구조화 JSON) |
