@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         커플데일리 → 네이버 사진 업로더
 // @namespace    couple-daily
-// @version      1.2.0
+// @version      1.3.0
 // @description  후기 사진을 네이버 블로그에 정식(내부) 이미지로 업로드 + 본문 조립
 // @match        *://blog.naver.com/*
 // @match        *://m.blog.naver.com/*
@@ -22,7 +22,7 @@
   // `tools/build_bookmarklet.py` 가 그 값을 여기에 심는다(생성물에서는 `@version`
   // 메타 블록이 떨어져 나가므로, 런타임이 자기 버전을 알려면 본문에도 있어야 한다).
   // 꼬리 주석 표식(`cd-up-version`)이 빌더가 이 줄을 찾는 열쇠다.
-  var VERSION = '1.2.0';   /* cd-up-version */
+  var VERSION = '1.3.0';   /* cd-up-version */
 
   // ======================= CONFIG (라이브에서 조정) =========================
   var DISPLAY_HOST_PREFIX = 'https://blogfiles.pstatic.net';
@@ -1098,7 +1098,7 @@
   }
 
   // ============ 정식(네이버 내부이미지) 문서 빌더 — setDocumentData용 ============
-  // 앱이 보낸 doc(blocks/title/visitDate/hashtags/overallScore)을 SmartEditor
+  // 앱이 보낸 doc(blocks/title/hashtags/overallScore)을 SmartEditor
   // 네이티브 문서의 components 배열로 조립한다. 이미지는 upphoto 업로드 메타 +
   // internalResource:true 로 '내부 이미지'가 되어, 붙여넣기가 아니라 정식 삽입이라
   // 발행 후 자동 삭제되지 않는다.
@@ -1128,6 +1128,11 @@
     return o;
   }
   function textComp(paras) { return { '@ctype': 'text', id: sid(), layout: 'default', value: paras }; }
+  // ⭐ **네이버 기본 구분선.** 스마트에디터 ONE 이 기본으로 주는 구분선 컴포넌트이고,
+  //    자매 레포 naver-ent-autopost 의 `hrComp()` 도 **글자까지 같은 값**이라 운영에서
+  //    검증된 모양이다(스타일 값을 추측해 박지 않는다). 소제목·매듭 앞 장식은 이것
+  //    하나뿐이고 이모지 디바이더는 쓰지 않는다 — app.py `_review_copy_html` 의 `HR`
+  //    이 HTML(클립보드 폴백) 쪽 짝이다.
   function hrComp() { return { '@ctype': 'horizontalLine', id: sid(), layout: 'line1' }; }
   function imageComp(meta) {
     return {
@@ -1182,11 +1187,13 @@
     if (!nodes.length) nodes.push(tn('', null));
     return nodes;
   }
-  function quotationComp(text, foot) {
+  function quotationComp(text) {
+    // 출처(source) 줄은 방문월 꼬리표 하나뿐이었는데 그 날짜를 빼기로 했으므로, 이제
+    // **키 자체를 내보내지 않는다**(빈 줄 방지). 자매 레포 naver-ent-autopost 의
+    // quotationComp 가 운영 중인 모양과 같다.
     return {
       '@ctype': 'quotation', id: sid(), layout: 'default',
       value: [para(emphNodes(('' + (text || '')).replace(/\n/g, ' ')), null)],
-      source: [para([tn(foot || '내돈내산', null)], null)],
       align: 'justify'
     };
   }
@@ -1210,10 +1217,11 @@
       title: [{ '@ctype': 'paragraph', id: sid(), nodes: [{ '@ctype': 'textNode', id: sid(), value: '' + (doc.title || '') }] }],
       subTitle: null, align: 'center'
     });
-    var headerParas = [];
-    if (doc.visitDate) headerParas.push(para([tn('방문 날짜 : ' + doc.visitDate, null)], 'center'));
-    headerParas.push(para([tn('✱ 내돈내산 데이트 후기 ✱', { fontColor: '#e64980', bold: true })], 'center'));
-    comps.push(textComp(headerParas));
+    // ⛔ 제목 다음의 시스템 헤더는 통째로 없앴다(app.py `_review_copy_html` 과 한 쌍):
+    //    ① 핑크 상투구 배지 — 사용자가 싫다고 한 자랑 문구. 협찬이 없는 사적 후기라
+    //       공개할 '경제적 이해관계'가 없어, 고지가 아니라 장식이었다.
+    //    ② `방문 날짜 : 2026년 10월` — 사용자가 "별로 안 중요하다"고 했다. 날짜를 한
+    //       줄짜리 정보로 박는 것만 뺀 것이고, 본문의 자연스러운 시점 표현은 그대로다.
     var blocks = doc.blocks || [];
     for (var b = 0; b < blocks.length; b++) {
       var blk = blocks[b];
@@ -1265,7 +1273,7 @@
         if (fp.length) comps.push(textComp(fp));
       } else if (t === 'quote') {
         pushHr(comps);
-        comps.push(quotationComp(blk.text || '', doc.visitFoot ? (doc.visitFoot + ' 방문 · 내돈내산') : '내돈내산'));
+        comps.push(quotationComp(blk.text || ''));
       }
     }
     var tags = (doc.hashtags || []).map(function (x) { return ('' + x).trim(); }).filter(Boolean);
@@ -1604,7 +1612,7 @@
         W.__cdAutoRan = true;   // 이 페이지 로드에서 한 번만(폴이 스택되지 않게)
         // clear-on-serve라 페이로드를 '지금' 캡처해 둔다(에디터 대기 중 슬롯이 비어도 무관).
         var doc = {
-          title: pl.title, visitDate: pl.visitDate, visitFoot: pl.visitFoot,
+          title: pl.title,
           overallScore: pl.overallScore, hashtags: pl.hashtags, blocks: pl.blocks
         };
         var images = Array.isArray(pl.images) ? pl.images : [];
