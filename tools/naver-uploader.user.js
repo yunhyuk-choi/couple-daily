@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         커플데일리 → 네이버 사진 업로더
 // @namespace    couple-daily
-// @version      1.0.0
+// @version      1.1.0
 // @description  후기 사진을 네이버 블로그에 정식(내부) 이미지로 업로드 + 본문 조립
 // @match        *://blog.naver.com/*
 // @match        *://m.blog.naver.com/*
@@ -17,6 +17,12 @@
   // 페이지 전역(SmartEditor)·fetch/XHR 후킹은 진짜 페이지 window에서 해야 한다.
   // @grant none이면 대개 unsafeWindow가 없고 window가 곧 페이지지만, 격리 엔진 대비.
   var W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+  // 이 스크립트의 버전. **손으로 고치지 마라** — 위 `@version` 한 줄이 단일 원천이고,
+  // `tools/build_bookmarklet.py` 가 그 값을 여기에 심는다(생성물에서는 `@version`
+  // 메타 블록이 떨어져 나가므로, 런타임이 자기 버전을 알려면 본문에도 있어야 한다).
+  // 꼬리 주석 표식(`cd-up-version`)이 빌더가 이 줄을 찾는 열쇠다.
+  var VERSION = '1.1.0';   /* cd-up-version */
 
   // ======================= CONFIG (라이브에서 조정) =========================
   var DISPLAY_HOST_PREFIX = 'https://blogfiles.pstatic.net';
@@ -868,7 +874,7 @@
     });
 
     ov.appendChild(el('div', 'font-weight:800;font-size:15px;margin-bottom:8px;',
-      '🖼 우리 후기 사진 → 네이버 업로드'));
+      '🖼 우리 후기 사진 → 네이버 업로드  v' + VERSION));
     ov.appendChild(el('div', 'color:#444;margin-bottom:4px;',
       "① (토큰 자동확보 안 되면) 에디터를 한 번 클릭하거나 사진 1장 추가 → '토큰 확보 ✓'"));
     ov.appendChild(el('div', 'color:#444;margin-bottom:4px;',

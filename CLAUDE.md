@@ -547,6 +547,17 @@ import 만 하자(HTTP 요청 0회) 0.3초 만에 되살려 처리했다. 그러
   앱 쪽 사본이던 `static/imagecrop.js` 는 **지웠다** — 📤 가 사진 바이트를 더 이상
   클립보드에 담지 않게 되면서(`review_detail.html` exportBtn 머리말 — 실측
   2.8~3.9MB/장이 모바일 클립보드 상한을 넘겼다) 호출자가 사라졌다.
+- **`tools/naver-uploader.bookmarklet.txt` 는 생성물이다 — 손으로 고치지 마라.**
+  원천은 `tools/naver-uploader.user.js` **하나**이고, 데스크톱용 북마클릿은
+  `python tools/build_bookmarklet.py` 가 거기서 만든다(`--check` 로 일치 확인,
+  `tests/test_bookmarklet_build.py` 가 같은 판정을 본다). ⛔ **두 번째 사본을 만들지
+  마라** — 2026-10-13 까지 있던 `tools/naver-bookmarklet.js` 가 정확히 그 실패다:
+  손으로 유지하던 1,400줄 복제본이 크롭·URL 페이로드를 못 따라가 **사진이 조용히 비어
+  나갔고**, 설치 문서는 "로직은 동일하다"를 *약속으로* 적고 있었다. 버전은 메타의
+  `@version` **한 줄**이 단일 원천이고 본문 `var VERSION`(`/* cd-up-version */`)은
+  빌더가 심는다 — 고쳤으면 **올려라**(설치본이 낡았는지는 오버레이 제목의 `v…` 로
+  사람이 본다. 앱은 불일치를 모른다).
+
 - **`tools/probe_graph_renditions.py`** — Graph 커스텀 렌디션(`c{W}x{H}`)의 **실제 한도**를
   재는 도구. 문서에 상한이 없어서 운영에서 한 번 재서 안다(출력에 URL 을 담지 않는다).
 - **`static/vendor/gifenc.esm.js`** — GIF 인코더 사본(MIT). *주 경로*라 CDN 에 매달지
