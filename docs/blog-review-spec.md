@@ -48,18 +48,24 @@ AI가 자동 생성해 주는 기능이다.
 | `location` | String(300), nullable | 위치 |
 | `prose` | Text, not-null | **자유 서술 원문** (v2: '3~4줄' 가이드 폐기 — 길수록 좋다) |
 | `visited_when` | String(100), nullable | (v2) 언제 갔는지 — 요일·시간대 |
-| `visit_reason` | String(300), nullable | (v2) 왜 갔는지 — 방문 계기 |
-| `access_note` | String(300), nullable | (v2) 찾아가는 길·층·역·주차·좌석 |
+| `visit_reason` | Text (폼·서버 2,000자), nullable | (v2) 왜 갔는지 — 방문 계기 |
+| `access_note` | Text (폼·서버 2,000자), nullable | (v2) 찾아가는 길·층·역·주차·좌석 |
 | `waiting` | String(200), nullable | (v2) 웨이팅·입장 — 대기 분·앞 팀 수·줄서기 방식 |
 | `order_items` | Text, nullable | (v2) 주문한 것과 가격·총액 |
-| `highlight` | String(300), nullable | (v2) 가장 기억에 남은 것 하나 |
-| `downside` | String(300), nullable | (v2) 아쉬운 점 |
+| `highlight` | Text (폼·서버 2,000자), nullable | (v2) 가장 기억에 남은 것 하나 |
+| `downside` | Text (폼·서버 2,000자), nullable | (v2) 아쉬운 점 |
 | `researched` | Text, nullable | (v2) **검색해서 확인한** 공개 정보(어미가 달라진다) |
+
+> 서술형 재료 칸(`visit_reason`·`access_note`·`highlight`·`downside`)은 2026-10-13 에
+> 300자 한 줄 input → **2,000자 textarea** 로 넓혔다. 본문 하한이 1,200자
+> (`ai.REVIEW_MIN_BODY_CHARS`)인데 넷을 다 채워도 그 하한에 못 미치던 것이 이유다 —
+> 재료가 모자라면 AI 가 지어낸다. `order_items`·`researched` 가 이미 쓰던 숫자에
+> 맞췄고, 짧은 사실 칸(`visited_when`·`waiting`)은 좁은 것이 안내라 그대로 둔다.
 | `overall_score` | Integer, not-null | 0~10 (반쪽별 드래그 합계) |
 | `photo_ids` | Text, nullable | JSON list[int] — 선택한 Photo id, **순서 유지** |
 | `ai_json` | Text, nullable | P2 결과(구조화 JSON) |
 | `edited_text` | Text, nullable | P2 사용자가 편집한 복사텍스트 |
-| `research_json` | Text, nullable | (Step 3) 키워드 조사 메모 JSON — 후보·근거·선정 이유·한계 |
+| `research_json` | Text, nullable | (Step 3) 키워드 조사 메모 JSON — 후보·근거·선정 이유·한계 **+ 사람이 고친 키워드(`override`)** |
 | `status` | String(16), not-null, default `'draft'` | 'draft'=생성됨·AI 미실행. P2에서 'pending'/'ready'/'failed' |
 | `created_at` / `updated_at` | DateTime | |
 
@@ -376,6 +382,31 @@ v2에서 바뀐 것:
 | 4 | 조사 결과를 본문 프롬프트에 주입 | `ai.format_keyword_block` → `{{KEYWORD_BLOCK}}` |
 
 조사 결과는 `blog_reviews.research_json`에 저장되고 상세 화면이 **조사 메모 카드**로 보여준다.
+
+### 11.1-a ⭐ 사람이 고친 키워드가 이긴다 (`override`)
+
+조사는 **추천**이다. 방향이 틀렸을 때 사람이 고칠 창구가 없으면 그 뒤 글 전체가 틀린
+방향으로 간다. 그래서 상세 화면에 **배지 편집기**(지우기·고치기·추가·메인 바꾸기)를 두고,
+사람의 선택을 같은 `research_json` 안의 **별도 칸**에 적는다:
+
+```json
+{"status":"ok","selection":{...AI가 고른 것...},
+ "override":{"main":"...","supporting":["..."],"at":"<iso>"}}
+```
+
+| 규칙 | 어디 |
+|---|---|
+| **사람 > AI** — 글에 먹는 키워드의 단일 원천 | `keyword_research.effective_keywords` (화면·프롬프트가 **같은 함수**를 본다) |
+| `selection`을 **덮어쓰지 않는다** — 근거는 증거로 남고, 다음 조사가 그 칸을 다시 쓴다 | `keyword_research.apply_override` |
+| override가 있으면 **다음 생성에서 조사를 다시 돌리지 않는다** (결과가 버려질 claude 2콜 + 네이버 왕복을 아낀다. 근거는 지난 메모에 살아 있다) | `generate_review` |
+| 사람이 **메인을 바꿨으면** 조사 쪽 '선정 이유·독자가 읽어야 할 것'은 따라가지 않는다 (그건 다른 키워드에 대한 설명이다). '조사의 한계'는 데이터 품질이라 남는다 | `ai.format_keyword_block` |
+| 적용은 **다음 생성부터** — 저장이 claude 를 부르지 않는다. 지금 초안에 반영하려면 사람이 「이 키워드로 다시 쓰기」를 누른다 | `POST /reviews/<rid>/keywords` → 재생성 없음 |
+| 되돌리기(`reset=1`)로 override 를 지우면 다음 생성부터 조사가 다시 돈다 — 영구 고정이 아니다 | 같은 라우트 |
+| 조사가 꺼져 있어도(키 없음) **직접 넣을 수 있다** — override 만 든 메모가 만들어진다 | `apply_override(None, …)` |
+
+폼의 정본은 textarea `keywords` **하나**다(한 줄에 하나·첫 줄이 메인). 배지 UI 는 그걸
+감싼 표현이라 JS 가 없어도 같은 폼이 그대로 동작하고, 서버가 파싱하는 모양이 하나뿐이라
+둘이 갈라질 자리가 없다. 회귀 테스트는 `tests/test_keyword_override.py`.
 
 ### 11.2 호출 형태 (gf-blog `{맛집명}/research/collect.py` 실물에서 확인)
 

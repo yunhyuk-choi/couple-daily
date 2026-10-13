@@ -1710,8 +1710,13 @@ def score_events(profile_text, events):
     반환: 받은 ref에 대해서만 ``{"ref", "score", "reason"}`` 리스트.
       * score → int 강제, 0..100 클램프(없으면 60),
       * reason → .strip()(없으면 ""),
-      * ref로 다시 매칭. 출력에 없는 ref는 생략(호출부가 실패 처리/재시도).
-    실패 시 ``[]``(또는 부분) 반환, 절대 raise 안 함(다른 ai.py 함수와 동일).
+      * ref로 다시 매칭. 출력에 없는 ref는 생략(호출부가 그 행사만 판정한다).
+
+    ⭐ **'답을 못 받았다'와 '답은 받았는데 이 행사를 안 골랐다'는 다른 사실이다.**
+    그래서 반환형이 둘이다 — 콜 자체가 실패하면(프로세스·파싱·취소) ``None``,
+    모델이 답을 했으면 **리스트**(비어 있을 수도 있다). 예전엔 둘 다 ``[]`` 라
+    호출부가 가를 수 없었고, 그래서 *절대 성공할 수 없는 재채점*을 영원히 반복했다
+    (``app.score_events_for_couple`` 머리말). 절대 raise 안 함은 그대로다.
     """
     if not events:
         return []
@@ -1792,8 +1797,10 @@ def score_events(profile_text, events):
             seen.add(ref)
         return out
     except Exception as e:  # noqa: BLE001 — degrade gracefully, never raise
+        # ⛔ 여기서 ``[]`` 를 돌려주면 '모델이 아무도 안 골랐다'와 구별이 안 된다.
+        # 콜이 **답을 내지 못했다**는 사실 자체가 호출부의 판정 재료다.
         print(f"[ai] event scoring failed: {e}", file=sys.stderr)
-        return []
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2375,19 +2382,40 @@ NO_KEYWORD_BLOCK = (
 def format_keyword_block(research):
     """``keyword_research`` 산출 dict → blog-review 프롬프트에 넣을 텍스트 블록.
 
-    조사가 없거나 선정에 실패했으면 ``NO_KEYWORD_BLOCK``. 순수 함수라 테스트가 쉽다.
+    ⭐ **사람이 고친 키워드(``override``)가 AI 조사(``selection``)를 이긴다.** 이
+    우선순위의 단일 원천은 ``keyword_research.effective_keywords`` 이고 여기서는
+    그걸 부르기만 한다 — 화면도 같은 함수를 보므로 "화면엔 내가 고친 게 보이는데
+    글은 딴 말"이 생길 자리가 없다.
+
+    ⚠️ 사람이 **메인을 바꿨으면** 조사 쪽 설명(선정 이유·독자가 읽어야 할 것)은
+    붙이지 않는다 — 그건 *다른 키워드*에 대한 설명이라 그대로 두면 모델에게 서로
+    어긋나는 지시를 주게 된다. 반면 '조사의 한계'는 데이터 품질 이야기라 메인이
+    바뀌어도 여전히 참이므로 남긴다.
+
+    조사도 없고 사람이 고친 것도 없으면 ``NO_KEYWORD_BLOCK``. 순수 함수다.
     """
-    if not isinstance(research, dict):
+    # 지연 import — ``keyword_research`` 가 이 모듈을 import 한다(순환 회피).
+    # 규율(사람 > AI)의 단일 원천이 거기 있고, 여기선 부르기만 한다.
+    import keyword_research
+
+    eff = keyword_research.effective_keywords(research)
+    if not eff:
         return NO_KEYWORD_BLOCK
-    sel = research.get("selection")
-    if not isinstance(sel, dict) or not sel.get("main"):
-        return NO_KEYWORD_BLOCK
-    lines = [f"메인 키워드: {sel['main']}"]
-    if sel.get("supporting"):
-        lines.append("보조 키워드: " + ", ".join(sel["supporting"]))
-    if sel.get("angle"):
+    sel = research.get("selection") if isinstance(research, dict) else None
+    sel = sel if isinstance(sel, dict) else {}
+    same_main = (sel.get("main") or "") == eff["main"]
+
+    lines = [f"메인 키워드: {eff['main']}"]
+    if eff["supporting"]:
+        lines.append("보조 키워드: " + ", ".join(eff["supporting"]))
+    if eff["by_human"]:
+        lines.append(
+            "⭐ 위 키워드는 **사람이 직접 고르거나 고친 것**이다. 그대로 따르고, "
+            "더 나은 표현으로 바꾸거나 다른 키워드로 갈아타지 마라."
+        )
+    if same_main and sel.get("angle"):
         lines.append(f"이 키워드로 들어온 독자가 읽어야 할 것: {sel['angle']}")
-    if sel.get("main_reason"):
+    if same_main and sel.get("main_reason"):
         lines.append(f"선정 이유: {sel['main_reason']}")
     if sel.get("limits"):
         lines.append(f"조사의 한계: {sel['limits']}")

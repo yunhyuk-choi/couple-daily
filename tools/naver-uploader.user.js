@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         커플데일리 → 네이버 사진 업로더
 // @namespace    couple-daily
-// @version      1.1.0
+// @version      1.2.0
 // @description  후기 사진을 네이버 블로그에 정식(내부) 이미지로 업로드 + 본문 조립
 // @match        *://blog.naver.com/*
 // @match        *://m.blog.naver.com/*
@@ -22,7 +22,7 @@
   // `tools/build_bookmarklet.py` 가 그 값을 여기에 심는다(생성물에서는 `@version`
   // 메타 블록이 떨어져 나가므로, 런타임이 자기 버전을 알려면 본문에도 있어야 한다).
   // 꼬리 주석 표식(`cd-up-version`)이 빌더가 이 줄을 찾는 열쇠다.
-  var VERSION = '1.1.0';   /* cd-up-version */
+  var VERSION = '1.2.0';   /* cd-up-version */
 
   // ======================= CONFIG (라이브에서 조정) =========================
   var DISPLAY_HOST_PREFIX = 'https://blogfiles.pstatic.net';
@@ -1565,15 +1565,39 @@
     } catch (e) { diag('키 입력칸 실패: ' + e); }
   }
 
+  // 앱이 "네 사본이 뒤처졌다"고 말하면 **오버레이 맨 위에 눈에 띄게** 적는다.
+  // 조용한 diag 줄로는 부족하다 — 이 경고를 놓치는 것이 오늘 겪은 문제의 뿌리였다.
+  function showVersionWarning(u, text) {
+    diag('버전 경고: ' + text);
+    try {
+      if (!u || !u.ov || u.ov.__cdVerWarned) return;
+      u.ov.__cdVerWarned = true;
+      var bar = el('div',
+        'background:#fff3bf;color:#5f3f00;border:1px solid #f0c000;border-radius:8px;' +
+        'padding:8px 10px;margin:0 0 8px;font-size:12px;line-height:1.5;white-space:pre-wrap;',
+        '⚠ ' + text);
+      if (u.ov.firstChild) { u.ov.insertBefore(bar, u.ov.firstChild); }
+      else { u.ov.appendChild(bar); }
+    } catch (e) { diag('버전 경고 표시 실패: ' + e); }
+  }
+
   // 앱에 세워둔 '대기(pending)' 후기를 꺼내 붙여넣기 없이 자동 삽입한다.
   // 키가 인가(공개 API). 대기 없음/에러면 조용히 v1 붙여넣기 오버레이로 남는다.
   function runAuto(u) {
     if (W.__cdAutoRan || !EXPORT_KEY) return;
-    var url = APP_BASE + '/api/naver-export/pending?k=' + encodeURIComponent(EXPORT_KEY);
+    // ⭐ 자기 버전을 **실어 보낸다**. 이 호출이 스크립트가 앱에 거는 유일한 연락이라,
+    // 여기에 안 실으면 앱은 설치된 사본이 몇 버전인지 영영 모른다(그래서 사람이
+    // 오버레이 제목의 v… 를 눈으로 맞춰야 했다). 앱은 기대값과 달라지면
+    // `version_warning` 을 돌려주고, 아래에서 그걸 화면에 띄운다.
+    var url = APP_BASE + '/api/naver-export/pending?k=' + encodeURIComponent(EXPORT_KEY) +
+              '&v=' + encodeURIComponent(VERSION);
     diag('자동: pending 조회 ' + url);
     fetch(url, { credentials: 'omit', cache: 'no-store' })
       .then(function (r) { return r.json().catch(function () { return null; }); })
       .then(function (pl) {
+        // 버전 경고는 **대기 유무와 무관하게** 먼저 띄운다 — 뒤처진 사본이라는
+        // 사실이 '할 일이 없다'보다 중요하고, 그게 뒤따르는 이상 증상의 뿌리다.
+        if (pl && pl.version_warning) { showVersionWarning(u, pl.version_warning); }
         // 앱은 무대기/잘못된 키를 200 {pending:false}로 준다(CORS로 막힌 404 회피).
         // pending:true + blocks 일 때만 자동 진행. 그 외엔 조용히 붙여넣기 모드 유지.
         if (!pl || !pl.pending || !pl.blocks) { diag('자동: 대기 없음 — 붙여넣기 모드 유지'); return; }

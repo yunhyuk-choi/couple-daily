@@ -32,6 +32,7 @@
     <p class="muted small" style="margin:4px 0 10px;">
       전부 선택이야 — 아는 것만 적고 <b>모르면 그냥 비워 둬.</b>
       빈칸이 AI가 지어낸 문장보다 나아. 숫자(대기 분·팀 수·인분·가격)가 글의 힘이야.
+      <b>길게 써도 돼</b> — 재료가 많을수록 AI가 지어낼 일이 줄어.
     </p>
 
     <label>언제 갔어? <span class="muted small">(요일·시간대)</span>
@@ -41,15 +42,13 @@
     </label>
 
     <label>왜 갔어? <span class="muted small">(방문 계기 — 글의 도입이 돼)</span>
-      <input type="text" name="visit_reason" maxlength="300"
-             placeholder="예: 평이 좋다는 얘기를 들어서 / 예전부터 궁금했던 곳이라"
-             value="{{ form.visit_reason if form else '' }}" />
+      <textarea name="visit_reason" rows="2" maxlength="2000"
+                placeholder="예: 평이 좋다는 얘기를 들어서 / 예전부터 궁금했던 곳이라">{{ form.visit_reason if form else '' }}</textarea>
     </label>
 
     <label>찾아가는 길 · 자리 <span class="muted small">(층·골목·역·주차·좌석)</span>
-      <input type="text" name="access_note" maxlength="300"
-             placeholder="예: 롯데월드몰 6층 안쪽 / 철공소 골목 안쪽, 좌식 / 전용 주차장 없음"
-             value="{{ form.access_note if form else '' }}" />
+      <textarea name="access_note" rows="2" maxlength="2000"
+                placeholder="예: 롯데월드몰 6층 안쪽 / 철공소 골목 안쪽, 좌식 / 전용 주차장 없음">{{ form.access_note if form else '' }}</textarea>
     </label>
 
     <label>웨이팅 · 입장 <span class="muted small">(대기 분·앞 팀 수·줄서기 방식)</span>
@@ -64,15 +63,13 @@
     </label>
 
     <label>가장 기억에 남은 것 <span class="muted small">(하나만)</span>
-      <input type="text" name="highlight" maxlength="300"
-             placeholder="예: 구운 새우젓에 백김치 올려 먹은 조합 / 직원분이 직접 구워주신 것"
-             value="{{ form.highlight if form else '' }}" />
+      <textarea name="highlight" rows="2" maxlength="2000"
+                placeholder="예: 구운 새우젓에 백김치 올려 먹은 조합 / 직원분이 직접 구워주신 것">{{ form.highlight if form else '' }}</textarea>
     </label>
 
     <label>아쉬운 점 <span class="muted small">(솔직한 게 글을 믿게 만들어)</span>
-      <input type="text" name="downside" maxlength="300"
-             placeholder="예: 양이 많아서 남겼어 / 웨이팅까지 할 만큼 인상 깊진 않았어"
-             value="{{ form.downside if form else '' }}" />
+      <textarea name="downside" rows="2" maxlength="2000"
+                placeholder="예: 양이 많아서 남겼어 / 웨이팅까지 할 만큼 인상 깊진 않았어">{{ form.downside if form else '' }}</textarea>
     </label>
 
     <label>검색해서 확인한 정보 <span class="muted small">(영업시간·휴무·주소·주차)</span>

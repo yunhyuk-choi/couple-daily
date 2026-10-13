@@ -64,6 +64,7 @@ import naver_api
 import onedrive
 import previews
 import thumbnail
+import userscripts
 from models import (
     Answer,
     Bet,
@@ -2111,6 +2112,15 @@ _scoring: set[int] = set()
 _SCORE_BATCH_DEFAULT = 24  # 한 패스당 채점 상한(배치 1콜 크기)
 
 
+def _taste_profile_sig(profile_text):
+    """취향 프로필 → 짧은 지문. '같은 질문인가'를 **SQL 에서** 비교하려고 쓴다.
+
+    채점 프롬프트에 들어가는 커플 쪽 입력은 이 문자열 하나뿐이다(``ai.score_events``
+    가 그걸 그대로 박는다). 그래서 이 해시가 같으면 커플 쪽 질문도 글자 하나 같다.
+    """
+    return hashlib.sha256((profile_text or "").encode("utf-8")).hexdigest()[:32]
+
+
 def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
     """백그라운드 워커: 이 커플에 아직 점수 없는 진행 중 행사들을 배치로 채점한다.
 
@@ -2118,12 +2128,32 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
     캡션과 공유하는 _CAPTION_SEM으로 claude 배치 콜을 직렬화하고, 모든 예외를
     삼키며 스레드 밖으로 절대 raise 안 하고, finally에서 가드 키를 해제한다.
 
-    선택: 진행 중(end_date NULL 또는 >= 오늘) 행사 중 이 커플에 'ready' 점수가
-    없는(행 없거나 status!='ready') 것들을 마감 임박 순으로 최대 ``limit``개.
-    없으면 그냥 반환. 선택된 것들에 'pending' 행을 만들어(UI가 "분석 중" 표시)
-    두고, 프로필을 한 번 만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번'
-    호출한다. 돌아온 ref → score/reason/status='ready'; 안 돌아온 ref →
-    status='failed'(이 패스에서 무한 재시도 방지; 이후 패스가 재시도 가능).
+    선택: 진행 중(end_date NULL 또는 >= 오늘) 행사 중 이 커플에 **아직 물어볼
+    것이 남은** 것들을 마감 임박 순으로 최대 ``limit``개. 없으면 그냥 반환.
+    선택된 것들에 'pending' 행을 만들어(UI가 "분석 중" 표시) 두고, 프로필을 한 번
+    만들고, 배치 페이로드를 꾸려 ai.score_events를 '한 번' 호출한다.
+
+    ⭐ **같은 실패를 영원히 반복하지 않는다 — 그러나 영구히 포기하지도 않는다.**
+    예전엔 선택 조건이 ``status != 'ready'`` 라 ``'failed'`` 를 매번 다시 골랐다.
+    그래서 항상 실패하는 행사가 몇 건만 있어도 ``/dates`` **페이지 로드마다**,
+    그리고 **매일 밤**, 결과가 바뀔 이유가 하나도 없는 claude 콜이 버려졌다
+    (실측: 실패 3건일 때 페이지 5회 = claude 5콜, 매일 밤 1콜).
+
+    줄인 것은 **낭비**이지 기능이 아니다 — 건수 캡도, 시간 백오프도 넣지 않았다.
+    가른 기준은 *그 재시도가 성공할 수 있는가* 하나이고, 그 답은 호출 결과에 이미
+    들어 있다:
+
+      * ``ai.score_events`` 가 **None** (콜이 답을 못 냈다 — 프로세스·파싱·취소)
+        → 그 배치의 어떤 행사에 대해서도 배운 게 없다 → 전부 ``'failed'``,
+        **다음 패스가 그대로 재시도한다**(일시 장애는 지나간다).
+      * 리스트를 받았는데 **이 ref 만 빠졌다** → 모델이 답은 했고 이 행사를 고르지
+        않았다. 같은 프롬프트면 같은 답이다 → ``'unscorable'`` + 그때의
+        **입력 지문**(프로필 해시 · 본 ``EventItem.updated_at``)을 함께 적는다.
+
+    채점 프롬프트의 입력은 둘뿐이라(커플 프로필 · 행사 내용) 지문이 그대로면 질문이
+    같다 — 다시 묻지 않는다. 프로필이 자라거나 야간 upsert 가 행사 내용을 바꾸면
+    질문이 달라지므로 **그때 다시 묻는다.** 그래서 선택 쿼리가 프로필 해시를 알아야
+    하고, 프로필 조립이 행 선택보다 **앞으로** 왔다(DB 읽기뿐 — claude 안 쓴다).
 
     반환값: 이 패스에서 새로 'ready'가 된 행사 수(int). 채점할 게 없거나
     이미 이 커플 채점 중이거나 에러면 0. 선채점 루프(prewarm_scores)가 이 값이
@@ -2142,8 +2172,14 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     return 0
                 today = date.today()
 
-                # 진행 중 행사 중 이 커플에 'ready' 점수가 없는 것 — 마감 임박 순.
-                # LEFT JOIN으로 EventScore가 없거나 ready가 아닌 행만 고른다.
+                # 프로필을 **먼저** 만든다 — 아래 선택 쿼리가 그 해시로 '이미 같은
+                # 질문을 해서 못 고른 행사'를 걸러낸다. claude 는 안 쓰는 DB 읽기다.
+                profile_text = build_couple_taste_profile(couple)
+                profile_sig = _taste_profile_sig(profile_text)
+
+                # 진행 중 행사 중 이 커플에 **아직 물어볼 것이 남은** 것 — 마감 임박 순.
+                # LEFT JOIN 으로 EventScore 가 없거나, 'ready' 가 아니면서
+                # '이 입력으로는 못 고른다(unscorable)'가 **아직 유효하지 않은** 행만.
                 rows = (
                     db.session.query(EventItem, EventScore)
                     .outerjoin(
@@ -2160,7 +2196,19 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         ),
                         db.or_(
                             EventScore.id.is_(None),
-                            EventScore.status != "ready",
+                            db.and_(
+                                EventScore.status != "ready",
+                                db.or_(
+                                    # 'unscorable' 이 아니면(=pending/failed) 재시도 대상.
+                                    EventScore.status != "unscorable",
+                                    # 지문을 모르는 옛 행 → 한 번은 다시 묻는다.
+                                    EventScore.input_sig.is_(None),
+                                    EventScore.event_seen_at.is_(None),
+                                    # 질문이 달라졌다 → 답도 달라질 수 있다.
+                                    EventScore.input_sig != profile_sig,
+                                    EventItem.updated_at > EventScore.event_seen_at,
+                                ),
+                            ),
                         ),
                     )
                     .order_by(
@@ -2193,8 +2241,7 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                     db.session.rollback()
                     return 0
 
-                # 프로필 1회 + 배치 페이로드.
-                profile_text = build_couple_taste_profile(couple)
+                # 배치 페이로드(프로필은 위에서 이미 한 번 만들었다).
                 batch = [
                     {
                         "ref": ev.id,
@@ -2216,17 +2263,25 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         log.exception(
                             "claude event scoring raised (couple=%s)", couple_id
                         )
-                        results = []
+                        # ⛔ ``[]`` 가 아니라 ``None`` — 여기까지 예외가 올라왔다는
+                        # 건 **답을 못 받았다**는 뜻이다. ``[]`` 로 적으면 아래에서
+                        # '모델이 답은 했는데 아무도 안 골랐다'로 읽혀 배치 전체가
+                        # 영구 포기(unscorable)로 찍힌다.
+                        results = None
                 finally:
                     _CAPTION_SEM.release()
 
+                # ⭐ **답을 받았나**가 영구·일시를 가르는 단 하나의 신호다.
+                # None = 콜이 답을 못 냈다(배운 것 없음) / 리스트 = 모델이 답했다.
+                answered = results is not None
                 by_ref = {}
                 for r in results or []:
                     ref = r.get("ref")
                     if ref is not None:
                         by_ref[ref] = r
 
-                # 결과 반영: 받은 ref → ready, 안 받은 ref → failed.
+                # 결과 반영: 받은 ref → ready / 답은 왔는데 빠진 ref → unscorable
+                # (지문과 함께) / 답 자체가 없었으면 전부 failed(그대로 재시도).
                 # scored = 이 패스에서 새로 ready가 된 수(선채점 루프 종료 신호).
                 now = datetime.utcnow()
                 scored = 0
@@ -2236,9 +2291,19 @@ def score_events_for_couple(app, couple_id, limit=_SCORE_BATCH_DEFAULT):
                         sc_row.score = r.get("score")
                         sc_row.reason = (r.get("reason") or "")[:1000]
                         sc_row.status = "ready"
+                        sc_row.input_sig = None
+                        sc_row.event_seen_at = None
                         scored += 1
+                    elif answered:
+                        # 이 질문으로는 못 고른다 — 질문이 바뀌기 전엔 다시 안 묻는다.
+                        sc_row.status = "unscorable"
+                        sc_row.input_sig = profile_sig
+                        sc_row.event_seen_at = ev.updated_at
                     else:
+                        # 일시 장애 — 이 행사에 대해 아무것도 배우지 못했다.
                         sc_row.status = "failed"
+                        sc_row.input_sig = None
+                        sc_row.event_seen_at = None
                     sc_row.updated_at = now
                 try:
                     db.session.commit()
@@ -3306,6 +3371,16 @@ def generate_review(app, review_id):
                 # 메모에 남는다). 아무도 안 넣었으면 조사는 그냥 꺼진다.
                 creds, key_owner = _naver_credentials_for(review)
 
+                # ⭐ **사람이 고친 키워드가 있으면 조사를 다시 돌리지 않는다.**
+                # 조사가 내놓는 것의 본체는 메인·보조 키워드인데 그건 어차피
+                # override 에 밀려 버려진다 — 버려질 답을 받으려고 claude 를 두 번
+                # 더 부르고 네이버 API 를 왕복하는 것은 낭비다. 근거(후보별 검색
+                # 결과·트렌드)는 지난 조사 메모에 그대로 살아 있고, 화면도 그걸
+                # 보여 준다. 다시 조사하고 싶으면 화면에서 '조사 결과로 되돌리기'로
+                # override 를 지우면 된다(그 다음 생성부터 조사가 다시 돈다).
+                prior_research = review.research
+                keyword_override = keyword_research.read_override(prior_research)
+
                 # ---- 진척 계획 — 화면이 "4/8단계"를 말할 수 있게 ----------
                 # 이 파이프라인의 단계는 **claude 를 부르는 횟수**가 아니라 사람이
                 # 기다리는 구간이다: 조사 3(키가 있을 때만) + 본문 1 + 사진당 1.
@@ -3313,7 +3388,7 @@ def generate_review(app, review_id):
                 # 쓰기 전엔 모른다) — 실제 수가 나오면 분모를 고친다.
                 research_on = bool(
                     (creds[0] or "").strip() and (creds[1] or "").strip()
-                )
+                ) and keyword_override is None
                 prog = _JobProgress(
                     f"review:{review_id}",
                     (len(keyword_research.STEPS) if research_on else 0)
@@ -3347,19 +3422,31 @@ def generate_review(app, review_id):
                         # (1) 키워드 조사 → (2) 본문 생성. 조사는 **절대 생성을 막지
                         # 않는다** — 키가 없으면 skipped, 실패하면 failed를 메모로
                         # 남기고 지금까지와 똑같이 쓴다.
-                        try:
-                            research = keyword_research.research(
-                                topic, location, prose, overall, details,
-                                client_id=creds[0], client_secret=creds[1],
-                                key_owner=key_owner, on_step=prog.step,
+                        if keyword_override is not None:
+                            # 사람이 고른 키워드가 이긴다 — 지난 메모를 그대로 들고
+                            # 간다(조사 근거는 거기 살아 있고, override 도 거기 있다).
+                            research = prior_research
+                        else:
+                            try:
+                                research = keyword_research.research(
+                                    topic, location, prose, overall, details,
+                                    client_id=creds[0], client_secret=creds[1],
+                                    key_owner=key_owner, on_step=prog.step,
+                                )
+                            except ai.Cancelled:
+                                raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
+                            except Exception:  # noqa: BLE001 — 조사는 best-effort
+                                log.exception(
+                                    "keyword research raised (review=%s)", review_id
+                                )
+                                research = {"status": "failed", "reason": "exception"}
+                            # ⚠️ 새 조사 결과에도 사람의 선택을 **다시 얹는다.**
+                            # 지금은 override 가 없을 때만 여기 오지만, 이 한 줄이
+                            # 없으면 나중에 누가 위 분기를 건드리는 순간 사람이 고친
+                            # 것이 조용히 사라진다(이 기능이 무의미해지는 자리다).
+                            research = keyword_research.apply_override(
+                                research, keyword_override
                             )
-                        except ai.Cancelled:
-                            raise  # 사람이 멈췄다 — best-effort 로 삼키지 않는다
-                        except Exception:  # noqa: BLE001 — 조사는 best-effort
-                            log.exception(
-                                "keyword research raised (review=%s)", review_id
-                            )
-                            research = {"status": "failed", "reason": "exception"}
                         prog.step("본문 쓰는 중")
                         try:
                             result = ai.write_review(
@@ -4322,6 +4409,52 @@ def _review_screen_html(html):
 def _gen_export_key():
     """유저스크립트 인증용 URL-safe 토큰(~24자)."""
     return secrets.token_urlsafe(18)
+
+
+def _record_uploader_version(user, sent_version):
+    """업로더가 말한 버전을 사용자 행에 적는다. **절대 raise 하지 않는다.**
+
+    값이 그대로면 쓰지 않는다 — 네이버 글 하나 올리는 동안 이 엔드포인트가 여러 번
+    불릴 수 있는데 매번 UPDATE 를 날릴 이유가 없다. ``uploader_seen_at`` 은
+    '마지막 소식'이지 '마지막 호출'이 아니다.
+
+    ⚠️ **버전을 안 보낸 것도 소식이다.** 그 경우 ``uploader_version`` 은 계속 NULL
+    이지만 ``uploader_seen_at`` 은 반드시 찍혀야 한다 — 화면이 "말할 게 있나"를
+    그 시각 하나로 판정하기 때문에(``uploader_status``), 안 찍으면 **버전을 안
+    보내는 옛 사본에 대해서만 영원히 침묵**한다. 정확히 말해야 할 사람들이다.
+    """
+    try:
+        if (user.uploader_version or "") == (sent_version or "") and (
+            user.uploader_seen_at is not None
+        ):
+            return
+        user.uploader_version = sent_version or None
+        user.uploader_seen_at = datetime.utcnow()
+        db.session.commit()
+    except Exception:  # noqa: BLE001 — 기록 실패가 발행을 막지 않는다
+        db.session.rollback()
+        log.exception("업로더 버전 기록 실패 (user=%s)", getattr(user, "id", None))
+
+
+def uploader_status(user):
+    """앱 화면이 "네 업로더가 뒤처졌다"고 말할 재료. 말할 게 없으면 ``None``.
+
+    ⛔ **한 번도 소식이 없으면 아무 말도 하지 않는다** — 업로더를 안 쓰는 사람에게
+    "업데이트해라"는 소음이다. ``uploader_seen_at`` 이 있다는 건 그 사람이 실제로
+    그 스크립트를 돌렸다는 뜻이고, 그때만 말한다.
+    """
+    if user is None or getattr(user, "uploader_seen_at", None) is None:
+        return None
+    warn = userscripts.version_warning(getattr(user, "uploader_version", None))
+    if not warn:
+        return None
+    return {
+        "warning": warn,
+        "installed": getattr(user, "uploader_version", None)
+        or userscripts.LEGACY_VERSION,
+        "expected": userscripts.expected_version(),
+        "seen_at": user.uploader_seen_at,
+    }
 
 
 def _ensure_export_key(u):
@@ -7730,6 +7863,8 @@ def _register_routes(app: Flask):
             # 값이 아니라 **불리언만** 넘긴다 — 템플릿이 키를 다시 그릴 방법 자체를
             # 안 갖게 한다.
             naver_keys_set=u.has_naver_api_keys,
+            # 설치된 업로더가 뒤처졌나 — 말할 게 없으면 None(설치 안 한 사람 무소음).
+            uploader=uploader_status(u),
         )
 
     # ---- in-app notifications ----
@@ -8210,14 +8345,18 @@ def _register_routes(app: Flask):
         컬럼 정의에 맞춰 자른다 — 폼이 maxlength를 걸지만 서버에서도 강제한다.
         키 순서는 ``BlogReview.DETAIL_FIELDS``(= 글의 흐름 순서)를 따른다.
         """
+        # ⚠️ 이 숫자는 **컬럼 정의와 폼 maxlength 와 같아야 한다**(세 군데가
+        # 갈라지면 사람이 적은 글이 조용히 잘린다). 서술형 칸은 전부 2,000 —
+        # 본문 하한 1,200자를 채울 재료가 들어가야 한다(모델 컬럼 주석이 정본).
+        # 짧은 사실을 적는 칸(언제·웨이팅)만 좁게 둔다.
         limits = {
             "visited_when": 100,
-            "visit_reason": 300,
-            "access_note": 300,
+            "visit_reason": 2000,
+            "access_note": 2000,
             "waiting": 200,
             "order_items": 2000,
-            "highlight": 300,
-            "downside": 300,
+            "highlight": 2000,
+            "downside": 2000,
             "researched": 2000,
         }
         return {
@@ -8443,7 +8582,15 @@ def _register_routes(app: Flask):
             # 조사 메모 카드 재료. research는 dict(없으면 None)이고, 키 보유 여부는
             # **불리언만** 넘어간다(값은 템플릿에 절대 안 간다).
             research=review.research,
+            # 글에 실제로 먹는 키워드(사람이 고쳤으면 그것) — 화면과 프롬프트가
+            # **같은 함수**를 본다. 안 그러면 "화면엔 내가 고친 게 보이는데 글은
+            # 딴 말"이 생긴다.
+            keywords=keyword_research.effective_keywords(review.research),
             naver_keys_set=u.has_naver_api_keys,
+            # 📤 가 보낼 상대(네이버 업로더)가 뒤처졌는지 — 여기서 말해야 한다.
+            # 뒤처진 사본은 자기 화면에 경고를 띄울 줄도 모른다(그 기능이 나중에
+            # 생겼다). 앱이 받아 적어 둔 버전으로 **앱이 대신** 말한다.
+            uploader=uploader_status(u),
             # 'pending' 두 건(초안·썸네일)의 생성이 실제로 살아 있는지 — 화면이
             # '작성중'만 반복하지 않고 무슨 일이 났는지 말하게 하는 재료.
             review_state=review_pending_verdict(review),
@@ -8518,6 +8665,18 @@ def _register_routes(app: Flask):
         404가 아니라 **200 ``{"pending": false}``** 로 낸다 — 브라우저가 CORS로 막힌 404를
         읽지 못해 fetch가 NetworkError로 reject되던 문제를 피하고, "할 일 없음"을 깔끔히
         전달한다. 키 유무는 누설하지 않는다(잘못된 키·무대기 모두 pending:false). 쿠키 불필요.
+
+        ⭐ **이 호출이 스크립트가 앱에 거는 유일한 연락이다** — 그래서 여기에 버전을
+        싣는다(``?v=``). 앱은 둘을 한다:
+
+          1. ``version_warning`` 을 **모든 응답 경로**에 실어 돌려준다. 버전을 보낼 줄
+             아는 사본은 그걸 오버레이 맨 위에 띄운다.
+          2. 받은 버전을 **사용자 행에 적어 둔다.** 뒤처진 사본은 (1)을 띄울 줄도
+             모르기 때문이다 — 버전을 보내는 기능 자체가 나중에 생겼다. 적어 두면
+             앱 화면(설정·후기 상세)이 다음에 대신 말해 준다.
+
+        버전이 안 와도 **아무것도 깨지지 않는다** — "어떤 사본인지 모르겠다"로 안내할
+        뿐이고, 페이로드 전달은 예전과 똑같이 진행된다(``userscripts.version_warning``).
         """
         def _cors(resp):
             resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -8533,13 +8692,21 @@ def _register_routes(app: Flask):
             return resp
 
         key = (request.args.get("k") or "").strip()
+        sent_version = userscripts.normalize_sent(request.args.get("v"))
+        # 기대값과 다르면(안 보냈으면 '모르겠다'로) 이 문장이 모든 응답에 실린다.
+        warn = userscripts.version_warning(sent_version)
         if not key:  # 진짜 잘못된 요청만 400 — 단, ACAO는 반드시 붙인다.
-            return _cors(jsonify(pending=False, error="missing_key")), 400
+            return _cors(jsonify(pending=False, error="missing_key",
+                                 version_warning=warn)), 400
 
         try:
+            user = User.query.filter_by(export_key=key).first()
+            # 버전은 **대기 유무와 무관하게** 적어 둔다 — 설치본이 살아 있다는 사실
+            # 자체가 앱 화면이 말해야 할 재료다. 실패해도 본업을 막지 않는다.
+            if user is not None:
+                _record_uploader_version(user, sent_version)
             rid = _naver_export_take(key)  # clear-on-serve
             if rid:
-                user = User.query.filter_by(export_key=key).first()
                 review = db.session.get(BlogReview, rid)
                 if user is not None and review is not None and review.couple_id == user.couple_id:
                     doc_data, images = _build_export_payload(review)
@@ -8548,12 +8715,13 @@ def _register_routes(app: Flask):
                         payload["pending"] = True
                         payload["rid"] = rid
                         payload["images"] = images or []
+                        payload["version_warning"] = warn
                         return _cors(jsonify(payload))
         except Exception:  # noqa: BLE001 — 어떤 실패든 CORS 붙은 응답으로(누설·NetworkError 방지)
             db.session.rollback()
             log.exception("naver-export pending 처리 실패")
         # 무대기 / 잘못된 키 / 만료 / 내부 실패 → 200 {"pending": false} (+ACAO)
-        return _cors(jsonify(pending=False))
+        return _cors(jsonify(pending=False, version_warning=warn))
 
     @app.route("/reviews/<int:rid>/edit", methods=["GET", "POST"])
     @active_couple_required
@@ -8639,6 +8807,53 @@ def _register_routes(app: Flask):
         db.session.commit()
         flash("후기를 삭제했어.", "success")
         return redirect(url_for("reviews"))
+
+    @app.route("/reviews/<int:rid>/keywords", methods=["POST"])
+    @active_couple_required
+    def review_keywords(rid):
+        """사람이 고친 키워드를 저장한다 — **다음 생성부터** 쓰인다.
+
+        왜 이 라우트가 있나 — 키워드는 지금까지 **추천만 되고 사람이 조율할 수
+        없었다.** 방향이 틀렸을 때 고칠 창구가 없으면 그 뒤 글 전체가 틀린 방향으로
+        간다. 여기서 받은 것은 조사 메모의 ``override`` 자리에 들어가고,
+        ``ai.format_keyword_block`` 이 **AI 조사보다 먼저** 본다.
+
+        입력은 ``keywords`` 한 칸이다 — **한 줄에 하나, 첫 줄이 메인.** 화면의 배지
+        편집기는 이 textarea 를 보기 좋게 감싼 것일 뿐이라, JS 가 없어도 같은 폼이
+        그대로 동작한다(서버가 파싱하는 모양이 하나뿐이라 둘이 갈라질 자리가 없다).
+
+        ⛔ **여기서 재생성을 걸지 않는다.** 이미 선 초안을 자동으로 다시 쓰는 것은
+        사람이 누르지 않은 claude 호출이다. 다시 쓰려면 화면의 「이 키워드로 다시
+        쓰기」를 사람이 누른다(그게 ``review_regenerate`` 다).
+        """
+        u = current_user()
+        review = db.session.get(BlogReview, rid)
+        if review is None or review.couple_id != u.couple_id:
+            abort(404)
+
+        if request.form.get("reset"):
+            override = None
+        else:
+            raw = request.form.get("keywords") or ""
+            override = keyword_research.normalize_override(raw.splitlines())
+
+        merged = keyword_research.apply_override(review.research, override)
+        try:
+            review.research_json = json.dumps(merged, ensure_ascii=False)
+            review.updated_at = datetime.utcnow()
+            db.session.commit()
+        except Exception:  # noqa: BLE001
+            db.session.rollback()
+            log.exception("키워드 저장 실패 (review=%s)", rid)
+            flash("키워드를 저장하지 못했어 🙏", "deny")
+            return redirect(url_for("review_detail", rid=rid))
+
+        if override is None:
+            flash("키워드를 조사 결과로 되돌렸어. 다음 생성부터 적용돼.", "success")
+        else:
+            flash("키워드를 저장했어. **다음 생성부터** 적용돼 — 지금 초안에 "
+                  "반영하려면 '이 키워드로 다시 쓰기'를 눌러줘.", "success")
+        return redirect(url_for("review_detail", rid=rid))
 
     @app.route("/reviews/<int:rid>/regenerate", methods=["POST"])
     @active_couple_required

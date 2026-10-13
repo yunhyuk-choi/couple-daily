@@ -26,7 +26,7 @@
 보안: 자격증명은 **인자로만** 흐르고 산출 dict·로그·프롬프트 어디에도 들어가지 않는다.
 """
 import logging
-from datetime import date
+from datetime import date, datetime
 
 import ai
 import naver_api
@@ -185,6 +185,104 @@ def _public_evidence(candidates, evidence):
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 사람이 고친 키워드 (override) — **사람 손이 닿은 것이 이긴다**
+# --------------------------------------------------------------------------- #
+# 조사는 추천일 뿐인데, 추천이 그대로 글이 되면 사람에게는 **고칠 창구가 없다.**
+# 그래서 조사 메모 dict 안에 사람의 선택을 **따로** 적는 자리를 둔다::
+#
+#     {"status": "ok", "selection": {...AI 가 고른 것...},
+#      "override": {"main": "...", "supporting": [...], "at": "<iso>"}}
+#
+# ⭐ **왜 selection 을 덮어쓰지 않고 옆에 두나** — 다음 생성이 selection 을 새로
+# 쓰기 때문이다. 같은 칸에 적으면 사람이 고친 것이 **다음 생성에서 조용히 사라진다**
+# (그러면 이 기능은 있으나 마나다). 옆에 두면 조사 결과는 근거로 남고, 글에 먹이는
+# 쪽은 언제나 override 가 이긴다(``ai.format_keyword_block``).
+#
+# 적용 시점은 **다음 생성부터**다. 이미 선 초안을 자동으로 다시 쓰지 않는다 —
+# 그건 사람이 누르지 않은 claude 호출이다. 다시 쓰려면 화면의
+# 「이 키워드로 다시 쓰기」를 사람이 누른다.
+
+#: 키워드 한 개의 길이 상한 — AI 쪽(``ai.normalize_selection``)과 같은 값.
+MAX_KEYWORD_LEN = 60
+#: 보조 키워드 개수 상한. AI 는 4개까지 고르지만 사람은 더 넣고 싶을 수 있어 넉넉히
+#: 둔다 — 상한이 아예 없으면 프롬프트가 부풀고 화면이 깨진다.
+MAX_SUPPORTING = 8
+
+
+def normalize_override(keywords):
+    """사람이 적은 키워드 줄들 → ``{"main", "supporting"}``. 비면 ``None``.
+
+    순수 함수(테스트가 쉽다). 규칙은 셋뿐이다 — **첫 줄이 메인**, 공백·중복 제거,
+    길이·개수 상한. 사람이 적은 말은 그 외에 아무것도 고치지 않는다(AI 가 '더 나은
+    표현'으로 바꾸는 순간 고친 보람이 사라진다).
+    """
+    out = []
+    for raw in keywords or []:
+        kw = " ".join(str(raw).split())[:MAX_KEYWORD_LEN]
+        if kw and kw not in out:
+            out.append(kw)
+        if len(out) > MAX_SUPPORTING:       # 메인 1 + 보조 MAX_SUPPORTING
+            break
+    if not out:
+        return None
+    return {"main": out[0], "supporting": out[1 : MAX_SUPPORTING + 1]}
+
+
+def read_override(research):
+    """조사 메모에서 사람이 고친 키워드를 꺼낸다(없거나 깨졌으면 ``None``)."""
+    if not isinstance(research, dict):
+        return None
+    ov = research.get("override")
+    if not isinstance(ov, dict) or not (ov.get("main") or "").strip():
+        return None
+    return ov
+
+
+def apply_override(research, override, at=None):
+    """조사 메모에 사람의 선택을 **얹은** 새 dict. ``override=None`` 이면 지운다.
+
+    원본을 고치지 않고 새 dict 를 돌려준다 — 이 값은 DB(``research_json``)에
+    그대로 들어가므로, 호출부가 '얹었는데 원본도 바뀌어 있다'로 헷갈릴 자리를
+    만들지 않는다. ``research`` 가 없으면(조사를 아예 안 한 후기) **사람의 선택만
+    든 메모**를 만든다 — 키가 없어도 키워드를 직접 넣을 수 있어야 하기 때문이다.
+    """
+    base = dict(research) if isinstance(research, dict) else {"status": "skipped",
+                                                              "reason": "no_credentials"}
+    if override is None:
+        base.pop("override", None)
+        return base
+    base["override"] = {
+        "main": override["main"],
+        "supporting": list(override.get("supporting") or []),
+        "at": at or datetime.utcnow().isoformat(timespec="seconds"),
+    }
+    return base
+
+
+def effective_keywords(research):
+    """글에 실제로 먹일 키워드 ``{"main", "supporting", "by_human"}``. 없으면 ``None``.
+
+    **사람 > AI** 라는 규칙이 사는 단 한 곳이다 — 화면과 프롬프트가 같은 이 함수를
+    봐야 "화면엔 내가 고친 게 보이는데 글은 딴 말"이 생기지 않는다.
+    """
+    ov = read_override(research)
+    if ov:
+        return {
+            "main": ov["main"],
+            "supporting": list(ov.get("supporting") or []),
+            "by_human": True,
+        }
+    sel = (research or {}).get("selection") if isinstance(research, dict) else None
+    if isinstance(sel, dict) and (sel.get("main") or "").strip():
+        return {
+            "main": sel["main"],
+            "supporting": list(sel.get("supporting") or []),
+            "by_human": False,
+        }
+    return None
 
 
 #: 이 조사가 밟는 단계 이름 — 화면이 "2/8단계 (검색으로 후보 확인하는 중)" 처럼

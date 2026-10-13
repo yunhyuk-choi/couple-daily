@@ -83,6 +83,60 @@
   {% endif %}
 </div>
 
+{# ---- 키워드 (사람이 조율하는 자리) --------------------------------------
+   예전엔 AI 가 고른 키워드가 그대로 글이 됐고 사람에겐 **고칠 창구가 없었다.**
+   여기서 배지로 보여 주고 지우기·고치기·더하기를 한다. 저장한 값은 조사 메모의
+   `override` 자리에 들어가 **AI 조사보다 먼저** 읽힌다(ai.format_keyword_block).
+
+   ⛔ 적용은 **다음 생성부터**다 — 저장이 claude 를 부르지 않는다. 지금 초안에
+   반영하려면 사람이 「이 키워드로 다시 쓰기」를 누른다.
+
+   ⭐ 폼의 정본은 textarea `keywords`(한 줄에 하나·첫 줄이 메인) **하나**다.
+   배지 UI 는 그걸 감싼 것일 뿐이라 JS 가 없어도 같은 폼이 그대로 동작한다. #}
+{% if review.status != 'pending' %}
+<div class="card" style="margin-bottom:14px;">
+  <div class="rv-copy-head">
+    <strong>키워드</strong>
+    <span class="muted rv-copy-hint">
+      {% if keywords and keywords.by_human %}사람이 고친 것 — 다음 생성에서 이게 이겨
+      {% elif keywords %}AI 가 조사해서 고른 것 — 틀렸으면 여기서 고쳐
+      {% else %}아직 없어 — 직접 넣을 수 있어{% endif %}
+    </span>
+  </div>
+
+  <form method="post" action="{{ url_for('review_keywords', rid=review.id) }}"
+        id="kw-form" class="stack-sm">
+    <div id="kw-badges" class="kw-badges" hidden></div>
+    <label class="small" id="kw-plain">
+      <span class="muted">한 줄에 하나 · <b>첫 줄이 메인 키워드</b></span>
+      <textarea name="keywords" id="kw-text" rows="4" spellcheck="false"
+                style="width:100%;box-sizing:border-box;">{% if keywords %}{{ keywords.main }}{% for k in keywords.supporting %}
+{{ k }}{% endfor %}{% endif %}</textarea>
+    </label>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button type="submit" class="btn primary sm">키워드 저장</button>
+      <span class="muted small">저장해도 지금 초안은 그대로야 — 다음 생성부터 적용돼.</span>
+    </div>
+  </form>
+
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+    {% if review.status == 'ready' %}
+    <form method="post" action="{{ url_for('review_regenerate', rid=review.id) }}"
+          onsubmit="return confirm('이 키워드로 초안을 다시 쓸까? 편집한 내용은 새 초안으로 바뀌어.');">
+      <button type="submit" class="btn ghost sm">✍️ 이 키워드로 다시 쓰기</button>
+    </form>
+    {% endif %}
+    {% if keywords and keywords.by_human %}
+    <form method="post" action="{{ url_for('review_keywords', rid=review.id) }}"
+          onsubmit="return confirm('내가 고친 키워드를 버리고 AI 조사 결과로 되돌릴까?');">
+      <input type="hidden" name="reset" value="1" />
+      <button type="submit" class="btn ghost sm">조사 결과로 되돌리기</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
 {# ---- 키워드 조사 메모 (Step 3) ------------------------------------------
    gf-blog 워크플로우에서 사람이 손으로 남기던 '조사 메모'를 앱이 대신 남긴 것.
    후보 / 근거 / 선정·제외 이유 / 데이터 한계를 그대로 보여준다 — 그래야
@@ -96,7 +150,10 @@
     <span class="muted rv-copy-hint">네이버 블로그 검색 · 검색어 트렌드(52주/8주)로 확인한 것</span>
   </div>
   <p style="margin:8px 0 0;">
-    메인 키워드 — <strong>{{ sel.main }}</strong>
+    AI 가 고른 메인 — <strong>{{ sel.main }}</strong>
+    {% if keywords and keywords.by_human and keywords.main != sel.main %}
+    <span class="muted small">(지금 쓰는 건 사람이 고친 <b>{{ keywords.main }}</b>)</span>
+    {% endif %}
   </p>
   {% if sel.supporting %}
   <p class="muted small" style="margin:4px 0 0;">
@@ -693,6 +750,16 @@
   {# 📤 의 **보이는 결과창**. 성공도 실패도 여기서 말한다 — 토스트는 1.8초 뒤
      사라지므로 "계속 실패"만 남고 이유가 안 남는 자리였다. 실패하면 페이로드를
      이 칸에 띄워 손으로 복사할 길을 준다(모바일 window.prompt 는 긴 값을 못 쓴다). #}
+  {# ⚠ 설치된 네이버 업로더가 뒤처졌다 — **앱이 말한다.** 그 사본은 자기 입으로
+     말할 줄 모른다(버전을 보내는 기능 자체가 나중에 생겼다). 📤 가 보낼 상대가
+     옛 코드면 조용히 이상하게 동작하므로, 누르기 전에 보여 준다. 한 번도 소식이
+     없으면 uploader 가 None 이라 이 칸은 아예 안 그려진다. #}
+  {% if uploader %}
+  <p class="small" style="margin:8px 0 0;padding:8px 10px;border-radius:8px;
+            background:#fff3bf;color:#5f3f00;border:1px solid #f0c000;">
+    ⚠ {{ uploader.warning }}
+  </p>
+  {% endif %}
   <div id="export-result" class="rv-export-result" hidden>
     <p id="export-msg" class="rv-export-msg"></p>
     <textarea id="export-payload" class="rv-export-payload" rows="4" readonly hidden></textarea>
@@ -1223,6 +1290,111 @@
 })();
 </script>
 {% endif %}
+
+{# 배지 편집기 — textarea(`#kw-text`)가 정본이고 이건 그 **표현**이다.
+   JS 가 없거나 깨지면 textarea 가 그대로 보이고 폼은 멀쩡히 동작한다. #}
+<script>
+(function () {
+  var form = document.getElementById('kw-form');
+  var ta = document.getElementById('kw-text');
+  var wrap = document.getElementById('kw-badges');
+  var plain = document.getElementById('kw-plain');
+  if (!form || !ta || !wrap || !plain) return;
+
+  function read() {
+    return ta.value.split(/\r?\n/).map(function (s) { return s.trim(); })
+             .filter(function (s) { return s; });
+  }
+  function write(list) {
+    // ⭐ 모든 변경은 **textarea 를 고치는 것**으로 끝난다 — 제출되는 값과 화면이
+    // 갈라질 자리를 만들지 않는다(배지에 따로 상태를 들지 않는다).
+    ta.value = list.join('\n');
+    render();
+  }
+  function chip(label, title, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.title = title;
+    b.textContent = label;
+    b.style.cssText = 'border:0;background:transparent;cursor:pointer;' +
+                      'font-size:12px;line-height:1;padding:0 2px;color:inherit;opacity:.65;';
+    b.addEventListener('click', onClick);
+    return b;
+  }
+  function render() {
+    var list = read();
+    wrap.textContent = '';
+    wrap.hidden = false;
+    plain.hidden = true;
+
+    list.forEach(function (kw, i) {
+      var main = (i === 0);
+      var badge = document.createElement('span');
+      badge.className = 'kw-badge' + (main ? ' kw-badge-main' : '');
+      var text = document.createElement('span');
+      text.textContent = (main ? '메인 · ' : '') + kw;
+      text.style.cssText = 'cursor:text;';
+      text.title = '눌러서 고치기';
+      text.addEventListener('click', function () { edit(i); });
+      badge.appendChild(text);
+      if (!main) {
+        badge.appendChild(chip('⬆', '메인으로 올리기', function () {
+          var l = read(); l.unshift(l.splice(i, 1)[0]); write(l);
+        }));
+      }
+      badge.appendChild(chip('✕', '지우기', function () {
+        var l = read(); l.splice(i, 1); write(l);
+      }));
+      wrap.appendChild(badge);
+    });
+
+    var add = document.createElement('input');
+    add.type = 'text';
+    add.placeholder = list.length ? '+ 키워드 추가' : '+ 첫 키워드(메인) 추가';
+    add.className = 'kw-add';
+    add.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();                 // 폼이 통째로 제출되지 않게
+      var v = (add.value || '').trim();
+      if (!v) return;
+      var l = read(); l.push(v); write(l);
+      var next = wrap.querySelector('.kw-add');
+      if (next) next.focus();
+    });
+    wrap.appendChild(add);
+
+    var hint = document.createElement('div');
+    hint.className = 'muted small';
+    hint.style.cssText = 'flex-basis:100%;margin-top:2px;';
+    hint.textContent = list.length
+      ? '배지를 눌러 고치고, ✕ 로 지우고, ⬆ 로 메인을 바꿔. 추가는 입력 후 Enter.'
+      : '아직 키워드가 없어 — 적고 Enter 를 눌러.';
+    wrap.appendChild(hint);
+  }
+  function edit(i) {
+    var list = read();
+    var cur = list[i];
+    var inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = cur;
+    inp.className = 'kw-add';
+    function commit() {
+      var v = (inp.value || '').trim();
+      var l = read();
+      if (v) { l[i] = v; } else { l.splice(i, 1); }
+      write(l);
+    }
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { render(); }
+    });
+    inp.addEventListener('blur', commit);
+    var badge = wrap.children[i];
+    if (badge) { wrap.replaceChild(inp, badge); inp.focus(); inp.select(); }
+  }
+  render();
+})();
+</script>
 
 <div class="review-detail-actions">
   <a class="btn ghost sm" href="{{ url_for('review_edit', rid=review.id) }}">✏️ 수정</a>

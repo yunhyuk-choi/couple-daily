@@ -313,6 +313,32 @@ def test_detail_fields_are_length_capped(client, flask_app):
     assert len(BlogReview.query.one().visited_when) == 100
 
 
+def test_narrative_material_fields_hold_more_than_the_body_floor(client, flask_app):
+    """⭐ 재료 칸이 좁으면 하한을 채울 재료가 없다.
+
+    본문 하한은 ``REVIEW_MIN_BODY_CHARS``(1,200자)인데 '계기·가는 길·기억에 남은
+    것·아쉬운 점' 넷은 **300자 한 줄 input** 이었다 — 넷을 다 채워도 하한을 못
+    넘긴다. 이미 2,000자인 ``order_items``·``researched`` 에 맞춰 올린다.
+    """
+    from models import BlogReview
+    long_text = ("길게 적은 재료 " * 150).strip()   # 저장 시 strip 되므로 미리 맞춘다
+    assert len(long_text) > ai.REVIEW_MIN_BODY_CHARS
+    client.post("/reviews/new", data=_form(
+        visit_reason=long_text, access_note=long_text,
+        highlight=long_text, downside=long_text,
+    ))
+    review = BlogReview.query.one()
+    for field in ("visit_reason", "access_note", "highlight", "downside"):
+        assert getattr(review, field) == long_text, field
+
+
+def test_narrative_material_fields_are_still_capped(client, flask_app):
+    """상한을 올린 것이지 없앤 게 아니다 — 2,000자에서 자른다."""
+    from models import BlogReview
+    client.post("/reviews/new", data=_form(highlight="가" * 5000))
+    assert len(BlogReview.query.one().highlight) == 2000
+
+
 def test_pick_title_swaps_title_and_resets_edited_text(client, flask_app, make_review):
     review = make_review(ai_json=json.dumps(_NEW_AI, ensure_ascii=False),
                          status="ready", edited_text="<p>손으로 고친 것</p>")
