@@ -79,6 +79,7 @@
 {% endblock %}
 
 {% block scripts %}
+{% include "_upload_token_js.html" %}
 <script>
 (function () {
   // ---- FAB opens the upload modal ----------------------------------------- #
@@ -127,6 +128,7 @@
     var captionInput = form.querySelector('input[name="caption"]');
     var MAX_SELECT = 100;   // 한 번에 고를 수 있는 사진 수(과다 선택 방지)
     var uploading = false;
+    var tokens = [];        // imgs 와 짝 — 고른 시점에 장마다 만든 업로드 멱등 키
 
     function setStatus(msg) {
       if (!status) return;
@@ -144,6 +146,8 @@
                   + MAX_SELECT + "장만 올릴게.");
         imgs = imgs.slice(0, MAX_SELECT);
       }
+      // 새로 고를 때마다 새 키 — 같은 사진을 일부러 다시 올리는 건 막지 않는다.
+      tokens = imgs.map(function () { return window.newUploadToken(); });
       if (!imgs.length) {
         preview.hidden = true;
         submit.disabled = true;
@@ -172,9 +176,10 @@
     // 선택한 사진을 한 요청에 몰아 보내지 않고 1장씩 fetch로 순차 전송한다. 작은
     // Render 워커/ OneDrive가 300MB 멀티파트 하나에 OOM/타임아웃 나던 걸 막는다.
     // JS가 없으면 이 핸들러가 안 붙고 폼이 그대로 전송된다(서버가 다중 파일 처리).
-    function uploadOne(file, withCaption) {
+    function uploadOne(file, withCaption, token) {
       var fd = new FormData();
       fd.append("photos", file, file.name);
+      if (token) fd.append("upload_token", token);  // 재전송돼도 서버가 한 번만 저장
       // 한마디(캡션)는 딱 1장일 때만 의미 있다.
       if (withCaption && captionInput && captionInput.value.trim()) {
         fd.append("caption", captionInput.value.trim());
@@ -215,7 +220,7 @@
         if (i >= total) return finish();
         submit.textContent = "업로드 중…";
         setStatus((i + 1) + "/" + total + " 업로드 중…");
-        uploadOne(imgs[i], withCaption).then(function (ok) {
+        uploadOne(imgs[i], withCaption, tokens[i]).then(function (ok) {
           done += 1;
           if (!ok) failedNames.push(imgs[i].name);
           step(i + 1);  // 반드시 이전 요청이 끝난 뒤 다음 장 전송

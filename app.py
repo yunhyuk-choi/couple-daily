@@ -7110,10 +7110,13 @@ def _register_routes(app: Flask):
             return jsonify(ok=False, error="not_found",
                            reason="OneDrive 에 그 영상이 없어 — 업로드가 끝까지 가지 "
                                   "못한 것 같아. 다시 올려줘."), 409
-        if Video.query.filter_by(onedrive_item_id=item["id"]).first():
+        def _already_claimed():
             _drop_pending_video(name)
             return jsonify(ok=False, error="already_claimed",
                            reason="이미 등록된 영상이야."), 409
+
+        if Video.query.filter_by(onedrive_item_id=item["id"]).first():
+            return _already_claimed()
 
         video = Video(
             couple_id=u.couple_id,
@@ -7127,7 +7130,16 @@ def _register_routes(app: Flask):
                           or gifmaker.content_type_for(original))[:100],
         )
         db.session.add(video)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # 같은 아이템의 요청이 **동시에** 와서 저쪽이 먼저 커밋했다 — 위 사전 조회로는
+            # 못 막는 경쟁을 유니크 인덱스(uq_videos_onedrive_item)가 막았다. 순차 중복과
+            # 똑같이 보이게 already_claimed 로 응답한다(500 아님).
+            db.session.rollback()
+            if Video.query.filter_by(onedrive_item_id=item["id"]).first() is None:
+                raise
+            return _already_claimed()
         _drop_pending_video(name)
         return jsonify(ok=True, video={
             "id": video.id,
@@ -7275,7 +7287,19 @@ def _register_routes(app: Flask):
             manual_caption = None
 
         saved_ids = []          # rows that need background captioning
-        saved_takens = []       # saved_ids와 짝: 각 사진의 taken_at(EXIF, 없으면 None)
+        # AJAX 응답이 알려 줄 사진(id·촬영일). 새로 만든 것뿐 아니라 **이미 저장돼 있던
+        # 중복 도착분**도 포함한다 — 캡션 대상(saved_ids)과 달리 응답용이다.
+        reported = []
+        couple_id = u.couple_id  # 롤백 뒤 u 를 다시 읽지 않으려고 미리 쥔다
+        # 멱등 키 — 파일 **한 장**의 업로드 시도 단위다(요청 단위가 아니다: AJAX
+        # 업로더는 파일마다 요청이 하나라 폼 전체에 토큰 하나를 붙이면 정상 다중
+        # 업로드가 막힌다). 클라이언트가 파일을 고를 때 장마다 만든 난수라, 같은 요청이
+        # 재전송되면 같은 값이고 같은 사진을 일부러 다시 고르면 새 값이다. 한 요청에
+        # 파일이 여럿(bulk 폼)이면 어느 토큰이 어느 파일인지 알 수 없으니 쓰지 않는다.
+        # 형식이 이상하거나 없으면(옛 폼·캐시된 화면) 막지 않고 토큰 없이 저장한다.
+        upload_token = (request.form.get("upload_token") or "").strip()
+        if len(files) != 1 or not re.fullmatch(r"[0-9a-f]{32}", upload_token):
+            upload_token = None
         warm_ids = []           # 미리보기 자산을 미리 만들어 둘 사진(캡션 유무 무관)
         saved = 0
         skipped = 0             # invalid / empty / too-big files
@@ -7310,6 +7334,19 @@ def _register_routes(app: Flask):
                 skipped += 1
                 reason = "사진 1장은 50MB 이하만 올릴 수 있어."
                 continue
+            # ⭐ 멱등 검사는 **OneDrive 업로드 전에** 한다 — 사후에 DB 중복만 막으면
+            #    OneDrive 에 쓰레기 파일이 남고 업로드 대역·시간이 두 배다. 이미 저장된
+            #    토큰이면 업로드·캡션·미리보기 전부 건너뛰고, 먼저 저장된 그 사진을
+            #    **성공으로** 알려 준다(에러면 업로더 화면이 깨진다).
+            if upload_token:
+                prior = Photo.query.filter_by(
+                    couple_id=couple_id, upload_token=upload_token
+                ).first()
+                if prior is not None:
+                    log.info("사진 중복 업로드 흡수 — photo=%s", prior.id)
+                    saved += 1
+                    reported.append((prior.id, prior.taken_at))
+                    continue
             # EXIF 촬영일시(DateTimeOriginal; HEIC 포함)는 **앞부분 몇십 KB** 안에
             # 있다(JPEG 는 SOI 바로 뒤 APP1, HEIC 는 meta 박스). 헤더 조각만 읽어
             # 뽑고, 거기서 못 찾으면 **업로드 뒤 Graph 가 서버에서 읽어 둔 값**
@@ -7357,17 +7394,41 @@ def _register_routes(app: Flask):
                 caption=caption,
                 caption_status="ready" if caption else "pending",
                 taken_at=taken,  # EXIF 촬영일(없으면 None → 캘린더는 created_at 폴백)
+                upload_token=upload_token,
             )
             db.session.add(photo)
             # Commit per photo so one later failure can't lose earlier successes.
-            db.session.commit()
+            try:
+                db.session.commit()
+            except IntegrityError:
+                # 같은 토큰의 요청이 **동시에** 와서 저쪽이 먼저 커밋했다(위 사전 조회를
+                # 둘 다 통과한 경쟁) — 유니크 인덱스가 막았다. 먼저 저장된 사진을
+                # 성공으로 알리고, 방금 올린 OneDrive 파일은 쓰레기라 지운다.
+                db.session.rollback()
+                prior = (
+                    Photo.query.filter_by(
+                        couple_id=couple_id, upload_token=upload_token
+                    ).first()
+                    if upload_token else None
+                )
+                if prior is None:
+                    raise
+                if item_id != prior.onedrive_item_id:
+                    try:
+                        onedrive.delete_photo(item_id)
+                    except onedrive.OneDriveError:
+                        log.exception("중복 업로드 고아 파일 삭제 실패 item=%s", item_id)
+                log.info("사진 중복 업로드 흡수(경쟁) — photo=%s", prior.id)
+                saved += 1
+                reported.append((prior.id, prior.taken_at))
+                continue
             saved += 1
+            reported.append((photo.id, taken))
             # 미리보기 자산을 **지금** 만들어 둔다 — 갤러리를 처음 열 때 Graph 를
             # 기다리지 않게. 업로드 응답은 이걸 기다리지 않는다(배경 스레드).
             warm_ids.append(photo.id)
             if caption is None:
                 saved_ids.append(photo.id)
-                saved_takens.append(taken)
 
         # 미리보기 자산을 **업로드 직후** 만들어 둔다(배경). 갤러리를 처음 열 때
         # Graph 를 기다리는 일이 아예 없어진다 — claude 와 무관한 값싼 HTTP 한 번이라
@@ -7387,8 +7448,7 @@ def _register_routes(app: Flask):
             # 후기 작성 폼의 갤러리 업로더(1장/요청)를 위해 방금 만든 Photo의 id와
             # 촬영일(taken_at)을 추가로 돌려준다 — 클라이언트가 촬영일 순으로 정렬해
             # 선택 스트립에 담는다. 기존 필드는 그대로라 추억 페이지 업로더는 무영향.
-            new_photo_id = saved_ids[0] if saved_ids else None
-            new_taken = saved_takens[0] if saved_takens else None
+            new_photo_id, new_taken = reported[0] if reported else (None, None)
             return jsonify(
                 ok=(saved > 0),
                 saved=saved,

@@ -1,0 +1,14 @@
+<script>
+// 업로드 멱등 키 — 사진 **한 장의 업로드 시도**마다 하나. 파일을 고르는 시점에 장마다
+// 만들어 요청에 실어 보낸다(서버: /memories/upload 의 upload_token). 같은 요청이
+// 재전송되면(아이폰 Safari) 같은 값이라 서버가 한 번만 저장하고, 같은 사진을 일부러
+// 다시 고르면 새 값이다. crypto.randomUUID 는 옛 iOS·비보안 컨텍스트에 없어
+// getRandomValues → Math.random 순으로 물러난다. 서버 형식은 32자리 소문자 hex.
+window.newUploadToken = function () {
+  var a = new Uint8Array(16), i, out = "";
+  try { (window.crypto || window.msCrypto).getRandomValues(a); }
+  catch (_) { for (i = 0; i < 16; i++) a[i] = Math.floor(Math.random() * 256); }
+  for (i = 0; i < 16; i++) out += (a[i] < 16 ? "0" : "") + a[i].toString(16);
+  return out;
+};
+</script>

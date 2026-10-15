@@ -161,6 +161,45 @@ def run_startup_migrations():
                     log.info("startup migration: added photos.taken_at")
                 except Exception:  # noqa: BLE001
                     log.exception("startup migration: failed adding photos.taken_at")
+            # photos.upload_token: 파일 한 장의 업로드 시도 멱등 키. 없으면 NULL
+            # (옛 사진·토큰 없는 옛 폼). 컬럼이 있어야 인덱스를 만들 수 있다.
+            if "upload_token" not in pcols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("ALTER TABLE photos ADD COLUMN upload_token VARCHAR(64)")
+                        )
+                    log.info("startup migration: added photos.upload_token")
+                except Exception:  # noqa: BLE001
+                    log.exception("startup migration: failed adding photos.upload_token")
+            # create_all 은 이미 있는 테이블에 인덱스를 붙이지 않으므로 여기서 붙인다.
+            # IF NOT EXISTS 는 PG·SQLite 모두 지원하고 반복 실행에 멱등하다.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_photos_couple_upload_token "
+                        "ON photos (couple_id, upload_token)"
+                    ))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup migration: failed creating uq_photos_couple_upload_token"
+                )
+        # videos.onedrive_item_id 유니크 — /videos/complete 의 '조회 후 삽입' 경쟁 방어.
+        # 컬럼 추가 없이 인덱스만이다. 운영 DB 에 이미 중복 행이 있으면 생성이
+        # 실패하고(로그만 남기고 부팅은 계속) 코드 동작은 예전과 같다.
+        if "videos" in insp.get_table_names():
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_videos_onedrive_item "
+                        "ON videos (onedrive_item_id)"
+                    ))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup migration: uq_videos_onedrive_item 유니크 인덱스를 못 만들었다 "
+                    "— videos 에 onedrive_item_id 중복 행이 있을 가능성이 크다. 중복을 "
+                    "정리하기 전까지 /videos/complete 동시 요청 보호가 **없다**"
+                )
 
         # 4) monthly_reports: 월간 '우리 리포트'의 구조화된 전문(JSON) 컬럼.
         #    monthly_reports 테이블은 프로덕션에 이미 존재하므로 create_all이
@@ -636,7 +675,17 @@ class Photo(db.Model):
     # EXIF 촬영일시(DateTimeOriginal 등). null = 알 수 없음 → 캘린더는 업로드시각
     # (created_at)으로 폴백한다. 업로드 시 exifutil.extract_taken_at으로 채운다.
     taken_at = db.Column(db.DateTime, nullable=True)
+    # **업로드 토큰** — 클라이언트가 파일을 고르는 시점에 파일마다 만든 난수. 같은
+    # 파일의 같은 업로드 시도가 두 번 도착해도(아이폰 요청 재전송) 사진·OneDrive
+    # 파일·캡션 claude 가 하나만 생기게 하는 멱등 키다. 같은 사진을 일부러 다시
+    # 고르면 새 토큰이라 통과한다. NULL(옛 폼·옛 행)은 유니크에서 충돌하지 않는다.
+    upload_token = db.Column(db.String(64), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        db.Index("uq_photos_couple_upload_token", "couple_id", "upload_token",
+                 unique=True),
+    )
 
     uploader = db.relationship("User")
 
@@ -779,6 +828,11 @@ class Video(db.Model):
     # 직접-스트리밍 가능 여부 실측 결과(JSON). NULL = 아직 재 보지 않음.
     cors_probe = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    # 같은 OneDrive 아이템이 두 행이 되지 않게 — /videos/complete 의 조회-삽입 경쟁 방어.
+    __table_args__ = (
+        db.Index("uq_videos_onedrive_item", "onedrive_item_id", unique=True),
+    )
 
     uploader = db.relationship("User")
 
