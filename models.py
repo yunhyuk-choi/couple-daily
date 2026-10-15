@@ -195,7 +195,11 @@ def run_startup_migrations():
                         "ON videos (onedrive_item_id)"
                     ))
             except Exception:  # noqa: BLE001
-                log.exception("startup migration: failed creating uq_videos_onedrive_item")
+                log.exception(
+                    "startup migration: uq_videos_onedrive_item 유니크 인덱스를 못 만들었다 "
+                    "— videos 에 onedrive_item_id 중복 행이 있을 가능성이 크다. 중복을 "
+                    "정리하기 전까지 /videos/complete 동시 요청 보호가 **없다**"
+                )
 
         # 4) monthly_reports: 월간 '우리 리포트'의 구조화된 전문(JSON) 컬럼.
         #    monthly_reports 테이블은 프로덕션에 이미 존재하므로 create_all이

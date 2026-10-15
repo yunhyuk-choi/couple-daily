@@ -7110,10 +7110,13 @@ def _register_routes(app: Flask):
             return jsonify(ok=False, error="not_found",
                            reason="OneDrive 에 그 영상이 없어 — 업로드가 끝까지 가지 "
                                   "못한 것 같아. 다시 올려줘."), 409
-        if Video.query.filter_by(onedrive_item_id=item["id"]).first():
+        def _already_claimed():
             _drop_pending_video(name)
             return jsonify(ok=False, error="already_claimed",
                            reason="이미 등록된 영상이야."), 409
+
+        if Video.query.filter_by(onedrive_item_id=item["id"]).first():
+            return _already_claimed()
 
         video = Video(
             couple_id=u.couple_id,
@@ -7127,7 +7130,16 @@ def _register_routes(app: Flask):
                           or gifmaker.content_type_for(original))[:100],
         )
         db.session.add(video)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # 같은 아이템의 요청이 **동시에** 와서 저쪽이 먼저 커밋했다 — 위 사전 조회로는
+            # 못 막는 경쟁을 유니크 인덱스(uq_videos_onedrive_item)가 막았다. 순차 중복과
+            # 똑같이 보이게 already_claimed 로 응답한다(500 아님).
+            db.session.rollback()
+            if Video.query.filter_by(onedrive_item_id=item["id"]).first() is None:
+                raise
+            return _already_claimed()
         _drop_pending_video(name)
         return jsonify(ok=True, video={
             "id": video.id,

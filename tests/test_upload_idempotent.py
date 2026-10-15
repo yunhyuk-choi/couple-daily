@@ -196,6 +196,7 @@ def test_concurrent_same_token_unique_index_catches_race(flask_app, couple_user,
 
     사전 조회만 있었다면 사진이 2개가 된다. 진 쪽은 성공으로 응답하고, 방금 올린
     OneDrive 고아 파일을 지우며, 캡션 claude 를 돌리지 않는다."""
+    uid = couple_user.id  # 워커 스레드에서 main 세션의 만료 속성을 읽지 않게 미리 쥔다
     barrier = threading.Barrier(2, timeout=10)
     hit = []
 
@@ -214,7 +215,7 @@ def test_concurrent_same_token_unique_index_catches_race(flask_app, couple_user,
         with app_module.app.app_context():
             c = app_module.app.test_client()
             with c.session_transaction() as s:
-                s["user_id"] = couple_user.id
+                s["user_id"] = uid
             r = _ajax(c, [_img()], TOKEN)
             results.append((r.status_code, r.get_json()))
             db.session.remove()
