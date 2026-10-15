@@ -127,17 +127,22 @@ def test_concurrent_posts_unique_index_catches_race(flask_app, couple_user,
             except threading.BrokenBarrierError:
                 pass
 
+    uid = couple_user.id  # 워커 스레드가 main 세션의 만료 속성을 동시에 읽으면 터진다
     event.listen(BlogReview, "before_insert", wait_both)
     results = []
+    errs = []
 
     def worker():
-        with app_module.app.app_context():
-            c = app_module.app.test_client()
-            with c.session_transaction() as s:
-                s["user_id"] = couple_user.id
-            r = c.post("/reviews/new", data=_form(token))
-            results.append((r.status_code, r.headers.get("Location")))
-            db.session.remove()
+        try:
+            with app_module.app.app_context():
+                c = app_module.app.test_client()
+                with c.session_transaction() as s:
+                    s["user_id"] = uid
+                r = c.post("/reviews/new", data=_form(token))
+                results.append((r.status_code, r.headers.get("Location")))
+                db.session.remove()
+        except BaseException as e:  # 스레드 안 예외를 삼키지 않고 메인에서 assert 한다
+            errs.append(repr(e)[:400])
 
     try:
         ts = [threading.Thread(target=worker) for _ in range(2)]
@@ -145,6 +150,7 @@ def test_concurrent_posts_unique_index_catches_race(flask_app, couple_user,
         [t.join(30) for t in ts]
     finally:
         event.remove(BlogReview, "before_insert", wait_both)
+    assert not errs, f"워커 스레드 예외: {errs}"
     assert len(hit) == 2, "두 요청이 모두 INSERT 직전까지 가야 경쟁이 재현된다"
     assert len(results) == 2, results
     assert all(code == 302 for code, _ in results), results

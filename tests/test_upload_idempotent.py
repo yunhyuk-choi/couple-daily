@@ -210,15 +210,19 @@ def test_concurrent_same_token_unique_index_catches_race(flask_app, couple_user,
 
     event.listen(Photo, "before_insert", wait_both)
     results = []
+    errs = []
 
     def worker():
-        with app_module.app.app_context():
-            c = app_module.app.test_client()
-            with c.session_transaction() as s:
-                s["user_id"] = uid
-            r = _ajax(c, [_img()], TOKEN)
-            results.append((r.status_code, r.get_json()))
-            db.session.remove()
+        try:
+            with app_module.app.app_context():
+                c = app_module.app.test_client()
+                with c.session_transaction() as s:
+                    s["user_id"] = uid
+                r = _ajax(c, [_img()], TOKEN)
+                results.append((r.status_code, r.get_json()))
+                db.session.remove()
+        except BaseException as e:  # 스레드 안 예외를 삼키지 않고 메인에서 assert 한다
+            errs.append(repr(e)[:400])
 
     try:
         ts = [threading.Thread(target=worker) for _ in range(2)]
@@ -226,6 +230,7 @@ def test_concurrent_same_token_unique_index_catches_race(flask_app, couple_user,
         [t.join(30) for t in ts]
     finally:
         event.remove(Photo, "before_insert", wait_both)
+    assert not errs, f"워커 스레드 예외: {errs}"
     assert len(hit) == 2, "두 요청이 모두 INSERT 직전까지 가야 경쟁이 재현된다"
     assert len(results) == 2
     assert all(code == 200 and j["ok"] and j["saved"] == 1 for code, j in results)
