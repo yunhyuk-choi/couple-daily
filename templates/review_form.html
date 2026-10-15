@@ -158,6 +158,7 @@
 {% endblock %}
 
 {% block scripts %}
+{% include "_upload_token_js.html" %}
 <script>
 (function () {
   // ===== 중복 제출 가드 (UX) ============================================ //
@@ -366,9 +367,10 @@
       function setHint(msg) { if (galHint) galHint.textContent = msg; }
 
       // 사진 1장 순차 업로드 → { ok, id, taken }. 실패는 ok:false로 집계(폼은 절대 안 깨짐).
-      function uploadOne(file) {
+      function uploadOne(file, token) {
         var fd = new FormData();
         fd.append('photos', file, file.name);   // 서버 필드명은 memories 업로더와 동일
+        if (token) fd.append('upload_token', token);  // 재전송돼도 서버가 한 번만 저장
         return fetch('/memories/upload?ajax=1', {
           method: 'POST',
           headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' },
@@ -399,6 +401,8 @@
         uploading = true;
         galBtn.disabled = true;
         var total = files.length;
+        // 고른 시점에 장마다 만든 멱등 키 — 같은 사진을 다시 고르면 새 키다.
+        var tokens = files.map(function () { return window.newUploadToken(); });
         var okItems = [];        // { id, taken, ord }
         var failed = 0;
 
@@ -406,7 +410,7 @@
         function step(i) {
           if (i >= total) return finish();
           setHint((i + 1) + '/' + total + ' 업로드 중…');
-          uploadOne(files[i]).then(function (r) {
+          uploadOne(files[i], tokens[i]).then(function (r) {
             if (r.ok) okItems.push({ id: r.id, taken: r.taken, ord: i });
             else failed += 1;
             step(i + 1);
