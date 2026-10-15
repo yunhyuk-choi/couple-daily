@@ -8,8 +8,12 @@
   <h1>{{ '후기 수정' if editing else '데이트 후기 쓰기' }}</h1>
 </div>
 
-<form class="stack" method="post"
+<form class="stack" method="post" id="review-form"
       action="{{ url_for('review_edit', rid=editing.id) if editing else url_for('review_new') }}">
+  {# 1회용 제출 토큰(새 후기만) — 같은 폼이 두 번 POST 돼도 서버가 후기를 하나만 만든다.
+     클라이언트 가드(아래 스크립트)는 사람의 더블탭용 UX 일 뿐, 진짜 방어는 서버다. #}
+  {% if submit_token %}<input type="hidden" name="submit_token" value="{{ submit_token }}" />{% endif %}
+
   <label>주제 / 장소 <span class="muted small">(필수)</span>
     <input type="text" name="topic" maxlength="200" required
            placeholder="예: 성수동 감성 카페 데이트"
@@ -144,7 +148,8 @@
               placeholder="그날 있었던 일을 떠오르는 대로 편하게 적어줘. 길어도 괜찮아 — 네 말투가 그대로 글이 돼.&#10;&#10;· 들어가서 뭘 보고 뭘 느꼈는지&#10;· 맛·식감·향·소스, 뭐랑 같이 먹었는지&#10;· 둘이 나눈 말, 웃겼던 순간&#10;· 다시 올 것 같은지">{{ form.prose if form else '' }}</textarea>
   </label>
 
-  <button class="btn primary" type="submit">{{ '수정 → 초안 다시 생성' if editing else '등록 → AI 초안 생성' }}</button>
+  <button class="btn primary" type="submit" id="review-submit"
+          data-busy="{{ '수정 중… 잠깐만' if editing else '등록 중… 잠깐만' }}">{{ '수정 → 초안 다시 생성' if editing else '등록 → AI 초안 생성' }}</button>
   {% if editing %}
   <a class="btn ghost sm" href="{{ url_for('review_detail', rid=editing.id) }}"
      style="align-self:center;">취소</a>
@@ -155,6 +160,33 @@
 {% block scripts %}
 <script>
 (function () {
+  // ===== 중복 제출 가드 (UX) ============================================ //
+  // 응답이 느려 멈춘 줄 알고 한 번 더 누르는 것을 막는다. ⚠️ 함정 둘:
+  //  1) submit 핸들러 안에서 버튼을 **즉시** disabled 하면 일부 브라우저가 제출을
+  //     취소한다 → 제출이 이미 나간 **다음 틱**에 비활성화한다. 버튼은 name/value 가
+  //     없어 비활성이어도 잃는 전송값이 없다(토큰·폼값은 hidden/input 이 싣는다).
+  //  2) iOS bfcache: 뒤로가기로 돌아오면 비활성 상태가 그대로 얼어 있다 → pageshow 로 복구.
+  var rform = document.getElementById('review-form');
+  var rbtn = document.getElementById('review-submit');
+  if (rform && rbtn) {
+    var idleLabel = rbtn.textContent;
+    var submitting = false;
+    function setBusy(on) {
+      submitting = on;
+      rbtn.disabled = on;
+      rbtn.textContent = on ? rbtn.getAttribute('data-busy') : idleLabel;
+      rbtn.setAttribute('aria-busy', on ? 'true' : 'false');
+    }
+    rform.addEventListener('submit', function (e) {
+      if (submitting) { e.preventDefault(); return; }  // 두 번째 제출은 여기서 끊는다
+      submitting = true;
+      setTimeout(function () { setBusy(true); }, 0);   // 제출이 나간 뒤에 잠근다
+    });
+    window.addEventListener('pageshow', function (ev) {
+      if (ev.persisted || submitting) setBusy(false);
+    });
+  }
+
   // ===== 반쪽별 별점 위젯 (드래그 · 탭 · 키보드) ========================= //
   var star = document.getElementById('star-rate');
   var starVal = document.getElementById('star-rate-val');

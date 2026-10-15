@@ -8352,13 +8352,20 @@ def _register_routes(app: Flask):
         for f in BlogReview.DETAIL_FIELDS:
             setattr(review, f, (details.get(f) or "").strip() or None)
 
-    def _review_form_error(u, form, editing=None):
-        """작성/수정 폼을 입력값을 유지한 채 다시 렌더(유효성 오류 경로)."""
+    def _review_form_error(u, form, editing=None, submit_token=None):
+        """작성/수정 폼을 입력값을 유지한 채 다시 렌더(유효성 오류 경로).
+
+        새 후기 경로는 검증에서 떨어졌어도 토큰이 **쓰이지 않았다** — 같은 토큰을
+        그대로 돌려줘 다음 제출이 정상 처리되게 한다(없으면 새로 발급)."""
         return render_template(
             "review_form.html",
             photos=_couple_photos_for_picker(u.couple_id),
             editing=editing,
             form=form,
+            submit_token=(
+                None if editing is not None
+                else (submit_token or secrets.token_hex(16))
+            ),
         )
 
     @app.route("/reviews")
@@ -8373,18 +8380,40 @@ def _register_routes(app: Flask):
         )
         return render_template("reviews.html", reviews=rows)
 
+    def _review_already_submitted(review):
+        """이미 처리된 제출의 중복 도착 — 에러 없이 그 후기로 보낸다. 새 후기도,
+        새 claude 도 만들지 않는다(사용자 눈에는 정상 등록과 같다)."""
+        log.info("후기 중복 제출 흡수 — review=%s", review.id)
+        flash("등록 완료! AI가 블로그 초안을 쓰는 중이야 ✍️", "success")
+        return redirect(url_for("review_detail", rid=review.id))
+
     @app.route("/reviews/new", methods=["GET", "POST"])
     @active_couple_required
     def review_new():
         """데이트 후기 작성 — GET은 폼, POST는 저장(status='draft'). AI 없음(P1)."""
         u = current_user()
         if request.method == "GET":
+            # 폼마다 **새** 제출 토큰 — 같은 사람이 후기를 연달아 두 건 쓰는 건 정상이라
+            # 토큰은 한 번 쓰이면 끝이고, 다음 폼은 다음 토큰이다.
             return render_template(
                 "review_form.html",
                 photos=_couple_photos_for_picker(u.couple_id),
                 editing=None,
                 form=None,
+                submit_token=secrets.token_hex(16),
             )
+
+        # 멱등 키 — 같은 폼이 두 번 와도(iOS 요청 재전송·더블탭) 후기는 하나다.
+        # 형식이 이상한 값은 없는 것으로 친다(그냥 토큰 없이 만든다).
+        token = (request.form.get("submit_token") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", token):
+            token = None
+        if token:
+            prior = BlogReview.query.filter_by(
+                couple_id=u.couple_id, submit_token=token
+            ).first()
+            if prior is not None:
+                return _review_already_submitted(prior)
 
         topic = (request.form.get("topic") or "").strip()[:200]
         location = (request.form.get("location") or "").strip()[:300] or None
@@ -8413,13 +8442,13 @@ def _register_routes(app: Flask):
         }
         if not topic:
             flash("주제/장소를 입력해줘.", "error")
-            return _review_form_error(u, form)
+            return _review_form_error(u, form, submit_token=token)
         if not prose:
             flash("느낀점을 한두 줄이라도 남겨줘.", "error")
-            return _review_form_error(u, form)
+            return _review_form_error(u, form, submit_token=token)
         if score is None:
             flash("별점을 매겨줘.", "error")
-            return _review_form_error(u, form)
+            return _review_form_error(u, form, submit_token=token)
 
         review = BlogReview(
             couple_id=u.couple_id,
@@ -8430,10 +8459,25 @@ def _register_routes(app: Flask):
             overall_score=score,
             photo_ids=json.dumps(photo_ids) if photo_ids else None,
             status="pending",  # (P2) 바로 백그라운드 초안 생성으로.
+            submit_token=token,
         )
         _apply_review_details(review, details)
         db.session.add(review)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # 같은 토큰의 요청이 **동시에** 와서 저쪽이 먼저 커밋했다 — 조회 후 삽입으론
+            # 못 막는 경쟁을 유니크 인덱스가 막았다. 먼저 만들어진 후기로 보낸다.
+            db.session.rollback()
+            prior = (
+                BlogReview.query.filter_by(
+                    couple_id=u.couple_id, submit_token=token
+                ).first()
+                if token else None
+            )
+            if prior is None:
+                raise
+            return _review_already_submitted(prior)
         # (P2) 백그라운드로 네이버 블로그 초안 생성을 시작한다(요청 경로 아님).
         _spawn_generate_review(current_app._get_current_object(), review.id)
         flash("등록 완료! AI가 블로그 초안을 쓰는 중이야 ✍️", "success")

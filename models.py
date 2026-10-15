@@ -259,6 +259,8 @@ def run_startup_migrations():
                 # 옛 후기는 '아직 안 보냈다'가 되고, 그 후기를 다시 돌릴 때만
                 # 알림이 간다(과거 것이 소급해서 울리지 않는다).
                 ("ai_notified_at", "TIMESTAMP"),
+                # 새 후기 폼의 1회용 제출 토큰(멱등 키). 없으면 NULL.
+                ("submit_token", "VARCHAR(64)"),
             ):
                 if col in rcols:
                     continue
@@ -272,6 +274,19 @@ def run_startup_migrations():
                     log.exception(
                         "startup migration: failed adding blog_reviews.%s", col
                     )
+            # 멱등 키의 유니크 인덱스. 컬럼이 있어야 만들 수 있다. IF NOT EXISTS 는
+            # PG·SQLite 모두 지원하고 반복 실행에 멱등하다. create_all 은 이미 있는
+            # 테이블에 인덱스를 붙이지 않으므로 여기서 붙인다.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_blog_reviews_couple_token "
+                        "ON blog_reviews (couple_id, submit_token)"
+                    ))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup migration: failed creating uq_blog_reviews_couple_token"
+                )
 
         # 8) ai_jobs 진척 칸 — '아직도 작성중'을 사람이 읽을 수 있게 하는 세 칸.
         #    ai_jobs 는 직전 배포에서 brand-new 로 만들어졌으므로 **이미 존재하는**
@@ -1355,6 +1370,13 @@ class BlogReview(db.Model):
     # 세 번 받는다. 새 사이클을 세울 때(``_spawn_generate_review``) NULL 로 지우고,
     # 그 사이클이 끝날 때 **한 번만** 채운다.
     ai_notified_at = db.Column(db.DateTime, nullable=True)
+    # **제출 토큰** — 새 후기 폼 GET 마다 발급되는 1회용 난수. 같은 폼이 두 번 POST
+    # 돼도(아이폰 Safari 의 요청 재전송·더블탭) 후기가 하나만 생기게 하는 멱등 키다.
+    # (couple_id, submit_token) 유니크 인덱스가 **경쟁 조건까지** 막는다 — 동시에 온
+    # 둘 중 하나는 커밋에서 IntegrityError 를 맞고 먼저 만들어진 후기로 보내진다.
+    # NULL 은 유니크에서 서로 충돌하지 않는다(PG·SQLite 모두) — 토큰 없이 만든 옛
+    # 후기·수정 경로는 영향이 없다.
+    submit_token = db.Column(db.String(64), nullable=True)
     status = db.Column(db.String(16), default="draft", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(
@@ -1362,6 +1384,11 @@ class BlogReview(db.Model):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
         nullable=False,
+    )
+
+    __table_args__ = (
+        db.Index("uq_blog_reviews_couple_token", "couple_id", "submit_token",
+                 unique=True),
     )
 
     creator = db.relationship("User")
