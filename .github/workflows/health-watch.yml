@@ -3,24 +3,33 @@ name: health-watch
 # 앱이 죽어 있으면 **워크플로가 실패**해서 GitHub 가 알린다(2026-10 사고: 사용자가
 # 앱을 열어 보고서야 죽은 걸 알았다 — 아무도 안 보고 있었다).
 #
-# 주기: 30분마다(:17·:47 — 정각은 GitHub cron 이 몰려 밀리고 가끔 누락된다).
-#   * GitHub Actions: 이 리포는 public 이라 분이 무료·무제한이다. private 로 바뀌면
-#     실행당 ~1분 × 48회/일 ≈ 1,440분/월 이 되어 무료 한도(2,000분/월)의 대부분을 쓴다 —
-#     그때는 주기를 늘려라.
-#   * ⚠️ /readyz 는 DB 왕복(SELECT 1)을 한다 → Neon 컴퓨트를 30분마다 깨운다. 무료 플랜의
-#     컴퓨트 시간 한도가 걱정되면 주기를 늘려라(비용은 '깨어 있는 시간' 이다).
-#   * ⚠️ 30분 간격은 Render 무료 인스턴스의 15분 유휴 슬립을 막지 못한다 — 감시가 올
-#     때마다 콜드스타트를 거친다(그래서 첫 요청에 넉넉한 타임아웃·재시도를 준다).
+# ⛔ 이 감시는 Neon 컴퓨트를 먹지 않게 짜야 한다(2026-10-26: 무료 플랜 월 컴퓨트 한도를
+#   11일 만에 소진 → 운영 중단). Neon 은 마지막 쿼리 뒤 5분을 더 깨어 있으므로, 쿼리 한 번의
+#   비용은 '5분 가동'이다.
+#   * /healthz — DB 를 안 탄다. 자주 봐도 된다. **하지만** Render 무료 인스턴스는 15분
+#     유휴면 잠들고, 깨어날 때마다 부팅(`create_all`·마이그레이션 = DB 쿼리)이 돈다. 즉 핑이
+#     올 때마다 콜드스타트면 그게 곧 DB 호출이다. 30분 주기면 48회/일 × 5분 ≈ 월 120h 로
+#     한도(191h)의 대부분이다 → **3시간 주기**(8회/일 ≈ 월 20h 상한)로 낮췄다. 죽음 감지
+#     지연은 최악 3시간이다(사용자가 열어 보고서야 안 것보다는 낫다). 더 촘촘히 보고 싶으면
+#     Render 를 깨워 두는 쪽(≤10분 주기)이 DB 비용은 0 이다 — 그건 Render 시간(월 750h)과
+#     맞바꾸는 별도 결정이다.
+#   * /readyz — DB 왕복(SELECT 1)이라 컴퓨트를 깨운다. **하루 1회**(≈5분 가동, 월 ≈2.5h =
+#     한도의 1.3%)만 본다. 마이그레이션 실패·스키마 고장 같은 '프로세스는 사는데 DB 가 고장'
+#     류는 하루 한 번이면 늦지 않다. 엔드포인트 자체는 남아 있어 사람이 눌러 볼 수 있다.
+#   * GitHub Actions: 이 리포는 public 이라 분이 무료·무제한이다.
 #   * 이 워크플로는 60일 동안 리포 활동이 없으면 GitHub 가 스케줄을 자동 중지한다
 #     (public 리포의 규칙). 감시가 조용히 꺼지지 않게 가끔 커밋이 있어야 한다.
+#   * 정각은 GitHub cron 이 몰려 밀리고 가끔 누락되어 :17·:47 을 쓴다.
 #
 # 확인하는 것:
-#   /healthz  200 + {"status":"ok"}   — 프로세스가 산다(DB 안 탄다)
-#   /readyz   200 + {"status":"ok"}   — DB 왕복 + 마이그레이션 성공까지
+#   /healthz  200 + {"status":"ok"}   — 프로세스가 산다(DB 안 탄다). 매 실행.
+#   /readyz   200 + {"status":"ok"}   — DB 왕복 + 마이그레이션 성공까지. 하루 1회 스케줄과
+#                                       수동 실행(workflow_dispatch)에서만.
 # 실패하면 응답 본문(자격증명 없음 — 코드 쪽이 예외 클래스 이름만 싣는다)을 로그에 찍는다.
 on:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "17 */3 * * *"   # /healthz 만
+    - cron: "47 4 * * *"     # /healthz + /readyz (하루 1회, 13:47 KST)
   workflow_dispatch: {}
 
 # Optional repository variable:
@@ -40,6 +49,8 @@ jobs:
       - name: Check /healthz and /readyz
         env:
           APP_URL: ${{ vars.APP_URL || 'https://couple-daily.onrender.com' }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           # 의도적으로 `set -e` 를 쓰지 않는다 — 한쪽이 실패해도 다른 쪽 결과를 같이 보고
           # 마지막에 한 번에 실패시킨다. curl 뒤의 `|| true` 는 종료코드 대신 아래에서
@@ -66,5 +77,10 @@ jobs:
           }
 
           check healthz || fail=1
-          check readyz  || fail=1
+          # /readyz 는 DB 를 깨운다 — 하루 1회 스케줄과 사람이 누른 실행에서만 본다.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$SCHEDULE" = "47 4 * * *" ]; then
+            check readyz || fail=1
+          else
+            echo "readyz 건너뜀 (DB 를 깨운다 — 일 1회 스케줄·수동 실행에서만)"
+          fi
           exit "$fail"

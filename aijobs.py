@@ -64,12 +64,28 @@ _handlers: dict = {}
 # 누가 이미지 바이트를 base64 로 끼워 넣으려 하면 여기서 막힌다.
 MAX_PAYLOAD_BYTES = int(os.environ.get("AI_JOB_MAX_PAYLOAD", "4096"))
 
-# 펌프가 큐를 확인하는 주기(빈 큐일 때). 짧게 잡아도 비용은 인덱스 조회 한 번이다.
-POLL_SEC = float(os.environ.get("AI_JOB_POLL_SEC", "2"))
-
 # 'running' 인데 이 시간 넘게 갱신이 없으면 주인이 죽은 것으로 보고 되돌린다.
 # 상한은 가장 긴 작업(후기 초안: 사진 5장 최악 21분)보다 넉넉해야 한다.
 STALE_RUNNING_SEC = int(os.environ.get("AI_JOB_STALE_SEC", "2700"))
+
+# ⛔ 빈 큐일 때 펌프는 DB 를 **건드리지 않는다.** 깨우는 건 ``enqueue`` 가 세우는
+# ``_wake`` 이벤트다(생산자와 소비자가 같은 프로세스다). 예전엔 빈 큐에서도 2초마다
+# ``claim_next()`` 를 때렸다 — 하루 43,200 쿼리. Neon 무료 플랜은 유휴 5분이면 컴퓨트가
+# 자는데 그 폴링 때문에 **절대 못 잤고**, 월 컴퓨트 한도를 11일 만에 소진해 운영이
+# 멎었다(2026-10-26).
+#
+# 폴링은 폴백으로만 남는다 — 이벤트가 닿지 못하는 경우가 둘 있다:
+#   (a) 다른 프로세스가 넣은 작업(WEB_CONCURRENCY 를 올리면 생긴다. 지금은 1).
+#   (b) 주인이 죽은 ``running`` 행 복구(``recover``, 기준 ``STALE_RUNNING_SEC``).
+# 폴백 주기는 ``STALE_RUNNING_SEC`` 와 같다(45분). 근거:
+#   * 비용 — Neon 은 마지막 쿼리 뒤 5분을 더 깨어 있다. 주기 P(>5분)의 유휴 가동률은
+#     5/P 다: 5분 주기면 100%, 15분이면 33%(월 ≈240h > 한도 191h), 45분이면 11%
+#     (월 ≈80h 상한). 분 단위로 짧게 잡을수록 '폴링 때문에 못 잠'이 그대로 돌아온다.
+#   * (b) — 'stale' 이 되는 데 어차피 45분이 걸린다. 그보다 촘촘히 봐도 복구가 빨라지지
+#     않는다(한 번 놓쳐도 다음 틱에 잡힌다: 최악 ≈90분).
+#   * (a) — 지금은 해당 없다. WEB_CONCURRENCY 를 올릴 땐 이 값을 낮추거나
+#     (``AI_JOB_FALLBACK_SEC``), 그때 LISTEN/NOTIFY 를 검토한다. 그 비용은 그때 정한다.
+FALLBACK_POLL_SEC = float(os.environ.get("AI_JOB_FALLBACK_SEC", str(STALE_RUNNING_SEC)))
 
 # 같은 잡이 계속 터지면 큐를 막는다 — 이 횟수를 넘으면 버린다(기능은 degrade 하고,
 # 사람이 화면에서 다시 요청하면 새 행으로 들어온다).
@@ -80,6 +96,8 @@ _OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 _pump_lock = threading.Lock()
 _pump_thread = None
 _pump_stop = threading.Event()
+# 일이 들어왔다는 신호 — ``enqueue`` 가 세우고 펌프가 비운다(``_pump_loop`` 참고).
+_wake = threading.Event()
 # 테스트·진단용 카운터(처리한 잡 수). 운영 로직은 이 값을 보지 않는다.
 processed = 0
 
@@ -96,7 +114,10 @@ processed = 0
 _last_tick = None
 _current_key = None
 
-# 펌프가 '멎었다'고 볼 간격. 루프는 빈 큐에서도 POLL_SEC 마다 한 바퀴 돈다.
+# 펌프가 '멎었다'고 볼 간격: **일이 들어온 뒤** 이만큼 지나도 펌프가 한 바퀴도 안 돌았으면
+# 멎은 것이다. 빈 큐의 펌프는 ``FALLBACK_POLL_SEC`` 동안 자는 게 정상이므로 '마지막 틱
+# 이후 조용한 시간' 그 자체는 신호가 아니다 — ``app._pump_looks_stalled`` 가 일이 들어온
+# 시각과 비교한다.
 PUMP_SILENT_SEC = float(os.environ.get("AI_JOB_PUMP_SILENT_SEC", "30"))
 
 
@@ -160,6 +181,7 @@ def enqueue(kind, key, payload=None, couple_id=None):
             status="queued",
         ))
         db.session.commit()
+        _wake.set()  # 커밋 **뒤** — 깬 펌프가 행을 볼 수 있어야 한다
         return True
     except Exception:  # noqa: BLE001 — 유니크 충돌(동시 enqueue) 포함
         db.session.rollback()
@@ -461,14 +483,21 @@ def _pump_loop(app):
             # 한 바퀴 돌 때마다 심장박동을 찍는다 — 화면이 '아무도 안 집어간다'를
             # 추측이 아니라 **사실**로 말할 수 있게 하는 유일한 근거다.
             _last_tick = time.monotonic()
+            # 신호는 큐를 **보기 전에** 비운다. 순서가 반대면 '비었음을 보고 → 넣음+신호 →
+            # 신호를 비움 → 잠듦' 으로 일을 놓친다. 이 순서면 최악이 '헛걸음 한 번'이다.
+            _wake.clear()
             try:
                 did = run_one(app)
             except Exception:  # noqa: BLE001 — 펌프는 절대 죽지 않는다
                 log.exception("ai job: 펌프 루프 예외")
                 did = False
             if not did:
-                _pump_stop.wait(POLL_SEC)
-                if time.time() - last_recover > STALE_RUNNING_SEC:
+                # 빈 큐: DB 를 놔두고 잔다. 신호가 오면(= 새 일) 즉시 깬다.
+                # 신호 없이 시간이 다 차면 폴백 — 다른 프로세스의 일을 줍고 죽은 행을 복구한다.
+                woken = _wake.wait(FALLBACK_POLL_SEC)
+                if _pump_stop.is_set():
+                    break
+                if not woken or time.time() - last_recover >= STALE_RUNNING_SEC:
                     try:
                         recover()
                     except Exception:  # noqa: BLE001
@@ -500,6 +529,7 @@ def stop_pump(timeout=5):
     """테스트·종료용. 펌프를 세운다."""
     global _pump_thread
     _pump_stop.set()
+    _wake.set()  # 잠든 펌프를 깨워 종료 신호를 보게 한다
     th = _pump_thread
     if th is not None:
         th.join(timeout=timeout)

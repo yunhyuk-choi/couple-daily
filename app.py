@@ -951,11 +951,23 @@ def _bootstrap_db(app) -> str:
         return _db_boot["status"]
 
 
+# 재시도 백오프 상한. DB 가 죽어 있는 이유가 무료 플랜 컴퓨트 한도 소진일 수 있고(2026-10-26
+# 실사고), 그때 1분마다 두드리면 한도가 풀리는 순간부터 또 컴퓨트를 먹는다. 상한은 5분 —
+# Neon 자동 휴면(유휴 5분)과 같은 자릿수라 '죽은 DB 를 두드려 못 자게 하는' 일이 없고,
+# DB 가 돌아온 뒤 최악 5분 안에 붙는다(그 사이 일반 요청은 10초 refresh 의 503).
+_DB_BOOT_RETRY_MAX_SEC = 300
+
+
+def _db_boot_delay(attempt):
+    """``attempt`` 번째(0부터) 실패 뒤 기다릴 초 — 5·10·20·40·80·160·300·300…"""
+    return min(_DB_BOOT_RETRY_MAX_SEC, 5 * 2 ** min(attempt, 10))
+
+
 def _db_bootstrap_loop(app):
-    """DB 가 살아날 때까지 백오프로 재시도하고, 끝나면 펌프를 띄운다."""
+    """DB 가 살아날 때까지 백오프(상한 5분)로 재시도하고, 끝나면 펌프를 띄운다."""
     attempt = 0
     while _bootstrap_db(app) == "failed":
-        time.sleep(min(60, 5 * 2 ** min(attempt, 4)))  # 5·10·20·40·60초
+        time.sleep(_db_boot_delay(attempt))
         attempt += 1
     # 펌프는 스키마가 갖춰진 **뒤**에 띄운다 — 부팅 복구(recover)가 새 칸을 읽는다.
     if _pump_should_start():
@@ -2811,7 +2823,7 @@ def resume_review_if_failed(app_obj, review):
 #    이거나 **DB 가 아는 사실**(ahead·attempts·started_at)이고, 추정은 추정이라고 쓴다.
 
 # 큐에 서 있는데 아무도 'running' 이 아닌 채 이만큼 지나면 '집어갈 사람이 없다'로 본다.
-# 펌프는 빈 큐에서도 ``aijobs.POLL_SEC``(2초)마다 한 바퀴 돈다 — 90초면 넉넉하다.
+# 펌프는 일이 들어오면 이벤트로 즉시 깬다(``aijobs._wake``) — 90초면 넉넉하다.
 _QUEUE_STALL = timedelta(seconds=90)
 
 
@@ -2835,18 +2847,23 @@ def _review_eta(n_photos):
 def _pump_looks_stalled(snap, pump, now):
     """'줄에 있는데 아무도 집어가지 않는다'인가 — 두 신호를 **같이** 본다.
 
-    * 프로세스 안쪽 사실: 펌프 스레드가 죽었거나, 아무 잡도 안 쥔 채 오래 조용하다.
-      (잡을 쥐고 있으면 조용한 게 정상이다 — 한 잡이 21분까지 간다.)
+    * 프로세스 안쪽 사실: 펌프 스레드가 죽었거나, **이 일이 들어온 뒤로** 펌프가 한 바퀴도
+      안 돌았다(아무 잡도 안 쥔 채). 빈 큐의 펌프는 폴백 주기(``FALLBACK_POLL_SEC``, 수십 분)
+      동안 자는 게 정상이라 '마지막 틱 이후 조용한 시간' 자체는 신호가 못 된다 — 일이 들어온
+      순간 이벤트로 깨어 틱을 찍어야 하므로, 틱이 일의 도착보다 **옛날**이면 깨우기가 안 닿은
+      것이다. (잡을 쥐고 있으면 조용한 게 정상이다 — 한 잡이 21분까지 간다.)
     * DB 쪽 사실: 오래 queued 인데 **running 인 행이 하나도 없다**. 펌프가 이
       프로세스 밖에 있는 배치에서도 성립하는 신호다.
     """
     if not pump["alive"]:
         return True
     silent = pump["silent_sec"]
-    if (pump["current_key"] is None and silent is not None
-            and silent > aijobs.PUMP_SILENT_SEC):
-        return True
     waited = now - (snap["created_at"] or now)
+    waited_sec = waited.total_seconds()
+    if (pump["current_key"] is None and silent is not None
+            and waited_sec > aijobs.PUMP_SILENT_SEC
+            and silent > waited_sec):  # 마지막 틱이 이 일의 도착보다 옛날이다
+        return True
     return waited >= _QUEUE_STALL and not aijobs.anyone_running()
 
 
