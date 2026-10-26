@@ -46,7 +46,7 @@ from flask import (
     send_from_directory,
     url_for,
 )
-from sqlalchemy import func
+from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError
 from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -873,24 +873,145 @@ def create_app():
         # 실수) 요청은 여기서 막아 작은 Render 워커를 OOM/타임아웃에서 보호한다.
         # 업로드는 사진 단위로 쪼개 보내므로(memories.html) 이 상한이면 충분하다.
         MAX_CONTENT_LENGTH=55 * 1024 * 1024,  # 55 MB (사진 1장 + 멀티파트 여유)
-        SQLALCHEMY_ENGINE_OPTIONS={
-            "pool_pre_ping": True,   # 유휴 후 죽은 커넥션 자동 감지·재연결 (콜드스타트 500 원인 제거)
-            "pool_recycle": 280,     # Neon/프록시가 끊기 전에 선제 재활용 (초)
-        },
+        SQLALCHEMY_ENGINE_OPTIONS=_engine_options(db_url),
     )
 
     db.init_app(app)
-    with app.app_context():
-        db.create_all()
-        # Bring pre-existing tables (live Postgres) up to date for Kakao login.
-        run_startup_migrations()
-        # Seed the configurable app name once.
-        if Setting.get("app_name") is None:
-            Setting.set("app_name", DEFAULT_APP_NAME)
-            db.session.commit()
-
+    # ⛔ 여기서 DB 를 만지지 않는다. create_all·마이그레이션·시드는 ``_bootstrap_db`` 가
+    #    **부팅을 막지 않는 자리**(백그라운드 스레드)에서 한다. 예전엔 이 자리에서 돌아서
+    #    DB 가 응답하지 않으면 라우트 등록(아래)까지 못 가 ``/healthz`` 조차 없었다
+    #    (2026-10 사고 — 코드 변경 없이 DB 만 흔들렸는데 앱이 통째로 무응답).
+    #    불변식: **DB 가 완전히 죽어 있어도 앱은 뜨고 /healthz 는 200 이다.**
     _register_routes(app)
+    app.before_request(_require_db_bootstrapped)
     return app
+
+
+# --------------------------------------------------------------------------- #
+# DB 부팅 — 스키마 생성·마이그레이션·시드. 부팅을 막지 않는다.
+# --------------------------------------------------------------------------- #
+# 죽은 DB 가 소켓을 열어 놓고 무응답이면 libpq 는 **영원히** 기다린다(기본값이 무제한).
+# 5초인 근거: (1) 이 레포가 가진 유일한 헬스체크 설정(fly.toml)의 timeout 이 5s 다 —
+# 연결 시도 하나가 그 안에 끝나야 한다. (2) gunicorn 은 워커 1개(sync)라 DB 에 매달린
+# 요청 하나가 /healthz 까지 막는다(--timeout 180 이 유일한 상한이었다). (3) Neon 콜드
+# 스타트(서스펜드된 컴퓨트 깨우기)는 보통 1초 안팎이라 5초면 정상 깨움은 통과한다.
+# Render 의 헬스체크 타임아웃은 이 레포 어디에도 없어 근거로 쓰지 않았다(대시보드 값).
+# ⚠️ libpq 의 connect_timeout 은 DNS 조회를 덮지 않는다.
+_DB_CONNECT_TIMEOUT_SEC = 5
+# /readyz 가 DB 왕복을 기다리는 상한. 풀이 고갈돼 체크아웃이 매달려도 이 엔드포인트는 안 매달린다.
+_READYZ_DB_TIMEOUT_SEC = 4.0
+
+
+def _engine_options(db_url: str) -> dict:
+    opts = {
+        "pool_pre_ping": True,   # 유휴 후 죽은 커넥션 자동 감지·재연결 (콜드스타트 500 원인 제거)
+        "pool_recycle": 280,     # Neon/프록시가 끊기 전에 선제 재활용 (초)
+    }
+    if not db_url.startswith("sqlite"):  # sqlite3 는 이 인자를 모른다
+        opts["connect_args"] = {"connect_timeout": _DB_CONNECT_TIMEOUT_SEC}
+    return opts
+
+
+_db_boot_lock = threading.Lock()
+# status: pending(아직 안 돌았다) · running · ok · degraded(마이그레이션 일부 실패 — 서빙은 한다)
+#         · failed(스키마 생성 자체가 안 됐다 — DB 불통 등. 백오프로 재시도 중)
+_db_boot = {
+    "status": "pending",
+    "attempts": 0,
+    "error": None,           # 예외 **클래스 이름**만 — 메시지엔 호스트/자격증명이 들 수 있다
+    "failures": [],          # 마이그레이션 단계별 실패 문장(로그에도 같은 문장 + 트레이스백)
+    "finished_at": None,
+}
+_DB_SERVABLE = ("ok", "degraded")
+
+
+def _bootstrap_db(app) -> str:
+    """create_all → 마이그레이션 → 시드. 어떤 실패도 raise 하지 않고 ``_db_boot`` 에 적는다."""
+    with _db_boot_lock:
+        _db_boot.update(status="running", attempts=_db_boot["attempts"] + 1, error=None)
+        try:
+            with app.app_context():
+                db.create_all()
+                # Bring pre-existing tables (live Postgres) up to date.
+                failures = run_startup_migrations()
+                # Seed the configurable app name once.
+                if Setting.get("app_name") is None:
+                    Setting.set("app_name", DEFAULT_APP_NAME)
+                    db.session.commit()
+        except Exception as e:  # noqa: BLE001 — 부팅 실패가 앱 전체를 죽이면 안 된다
+            log.exception("db bootstrap: 실패(시도 %s) — 앱은 떠 있고 /readyz 가 503 이다",
+                          _db_boot["attempts"])
+            _db_boot.update(status="failed", error=type(e).__name__,
+                            finished_at=time.time())
+            return "failed"
+        _db_boot.update(status="degraded" if failures else "ok",
+                        failures=list(failures), finished_at=time.time())
+        if failures:
+            log.error("db bootstrap: 마이그레이션 %s건 실패 — /readyz 가 503 이다", len(failures))
+        return _db_boot["status"]
+
+
+def _db_bootstrap_loop(app):
+    """DB 가 살아날 때까지 백오프로 재시도하고, 끝나면 펌프를 띄운다."""
+    attempt = 0
+    while _bootstrap_db(app) == "failed":
+        time.sleep(min(60, 5 * 2 ** min(attempt, 4)))  # 5·10·20·40·60초
+        attempt += 1
+    # 펌프는 스키마가 갖춰진 **뒤**에 띄운다 — 부팅 복구(recover)가 새 칸을 읽는다.
+    if _pump_should_start():
+        aijobs.start_pump(app)
+
+
+def _start_db_bootstrap(app):
+    if "pytest" in sys.modules:
+        # 테스트는 import 직후 스키마가 있어야 하고 스레드는 결정적이지 않다 — 동기로 한 번.
+        _bootstrap_db(app)
+        return
+    threading.Thread(target=_db_bootstrap_loop, args=(app,), daemon=True,
+                     name="db-bootstrap").start()
+
+
+# DB·세션 없이 답하는 것만 — 이 목록이 늘면 '죽은 DB 에서도 뜬다' 가 거짓이 된다.
+_DB_FREE_ENDPOINTS = frozenset({"healthz", "readyz", "static", "service_worker"})
+
+
+def _require_db_bootstrapped():
+    """스키마가 준비되기 전의 요청은 매달지 않고 바로 503 으로 돌려보낸다.
+
+    gunicorn 워커가 1개(sync)라 여기서 기다리면 /healthz 까지 줄을 선다.
+    """
+    if request.endpoint in _DB_FREE_ENDPOINTS or _db_boot["status"] in _DB_SERVABLE:
+        return None
+    body = (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv=refresh content=10><title>잠시만요</title>"
+        "<body style='font-family:sans-serif;text-align:center;padding:4rem 1rem'>"
+        "<h1>잠깐 쉬고 있어요</h1><p>데이터베이스가 준비되는 중이에요. 곧 다시 열려요.</p>"
+    )
+    return body, 503, {"Retry-After": "10", "Content-Type": "text/html; charset=utf-8"}
+
+
+def _probe_db(app, timeout=_READYZ_DB_TIMEOUT_SEC) -> dict:
+    """DB 왕복 1회. 별도 스레드 + join(timeout) 이라 어떤 이유로 매달려도 우리는 안 매달린다."""
+    box = {}
+
+    def _run():
+        t0 = time.monotonic()
+        try:
+            with app.app_context():
+                with db.engine.connect() as conn:
+                    conn.execute(sa_text("SELECT 1"))
+            box.update(ok=True, ms=round((time.monotonic() - t0) * 1000))
+        except Exception as e:  # noqa: BLE001
+            box.update(ok=False, error=type(e).__name__)
+
+    th = threading.Thread(target=_run, daemon=True, name="readyz-db-probe")
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return {"ok": False, "error": "Timeout"}
+    return box
 
 
 # --------------------------------------------------------------------------- #
@@ -9547,6 +9668,23 @@ def _register_routes(app: Flask):
         # 키는 **추가만** 하고 기존 키·값은 건드리지 않는다.
         return {"status": "ok", **build_info()}
 
+    @app.route("/readyz")
+    def readyz():
+        # /healthz 는 '프로세스가 산다'(DB 안 탄다 — 계약). 이쪽은 '일을 할 수 있다'.
+        # DB 왕복 1회 + 마이그레이션 상태. 하나라도 아니면 503 — 감시(.github/workflows/
+        # health-watch.yml)가 이 코드를 본다.
+        dbr = _probe_db(app)
+        mig = {
+            "status": _db_boot["status"],
+            "attempts": _db_boot["attempts"],
+            "failed_steps": len(_db_boot["failures"]),
+            "error": _db_boot["error"],
+        }
+        ready = dbr.get("ok") is True and _db_boot["status"] == "ok"
+        body = {"status": "ok" if ready else "unavailable", "db": dbr,
+                "migrations": mig, **build_info()}
+        return body, (200 if ready else 503)
+
     # ---- themed error handlers ----
     @app.errorhandler(404)
     @app.errorhandler(405)
@@ -9688,11 +9826,10 @@ def _pump_should_start():
 
 
 app = create_app()
-
-if _pump_should_start():
-    # 부팅 즉시 띄운다 — 지난 프로세스가 남긴 'running' 행을 되돌려 **아무도 화면을
-    # 열지 않아도** 이어서 한다. 2026-10-07 사고('작성중' 영구 고착)의 구조적 해소점.
-    aijobs.start_pump(app)
+# 스키마 준비 → (끝나면) 펌프 시작. 부팅을 막지 않는다 — 펌프는 지난 프로세스가 남긴
+# 'running' 행을 되돌려 **아무도 화면을 열지 않아도** 이어서 한다(2026-10-07 사고
+# '작성중' 영구 고착의 구조적 해소점). 그 시작이 이제 스키마 뒤로 옮겨졌다.
+_start_db_bootstrap(app)
 
 if __name__ == "__main__":
     # Local dev only. Production uses gunicorn (see Dockerfile / fly.toml).
