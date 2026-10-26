@@ -53,6 +53,28 @@
   `_STUCK_REVIEW`=25분, 단발 콜짜리는 `_STUCK_GENERATING`=5분). 회귀 테스트는
   `tests/test_stuck_recovery.py`.
 
+## ⛔ 부팅은 DB 에 의존하지 않는다 (2026-10 사고 — 앱이 통째로 무응답)
+
+코드 변경 없이 DB 만 응답하지 않았는데 앱이 **아무 응답도 못 했다.** `create_app()` 이 import
+시점에 `create_all`→마이그레이션→시드를 돌렸고 라우트 등록이 그 **뒤**라 `/healthz` 조차 없었다.
+
+* **불변식: DB 가 완전히 죽어 있어도 앱은 뜨고 `/healthz` 는 200 + `status: ok` 다.**
+  `create_app()` 에 DB 호출을 다시 넣지 않는다. 스키마 작업은 `_bootstrap_db`(백그라운드
+  스레드, 실패 시 5·10·20·40·60초 백오프 재시도)가 한다. 끝나면 그제야 `aijobs` 펌프를 띄운다.
+* **마이그레이션은 여전히 부팅 때 돈다**(`models.run_startup_migrations`). 단 **실패 문장 목록을
+  반환**한다 — 삼키지 않는다. 비어 있지 않으면 `_db_boot.status == "degraded"`(서빙은 한다)이고
+  `/readyz` 가 503 이다. 새 마이그레이션 단계의 `except` 는 `log.exception` 이 아니라 안쪽
+  헬퍼 `_mig_fail(...)` 을 부른다(로그 + 반환값에 같이 남는다).
+* **스키마 준비 전 일반 요청은 503**(`_require_db_bootstrapped`). gunicorn 워커가 1개(sync)라
+  거기서 기다리면 `/healthz` 까지 줄을 선다 — 기다리지 않는다. 예외 목록 `_DB_FREE_ENDPOINTS`
+  에는 DB·세션을 안 타는 것만 넣는다.
+* `connect_timeout`(`_DB_CONNECT_TIMEOUT_SEC`=5, Postgres 만)이 죽은 DB 앞의 무한 대기를 끊는다.
+  ⚠️ libpq 는 DNS 조회에 이걸 적용하지 않는다.
+* `/healthz` = 프로세스 생존(DB 안 탄다, 키는 **추가만**). `/readyz` = DB 왕복 + 마이그레이션
+  상태, 아니면 503. `/readyz` 의 DB 왕복은 별도 스레드 + `join(4s)` 라 안 매달린다.
+* 감시: `.github/workflows/health-watch.yml` 이 30분마다 둘 다 본다(실패 = 워크플로 실패).
+* 회귀 테스트: `tests/test_boot_without_db.py`(죽은 DB 로 **새 프로세스**를 띄워 본다).
+
 ## ⛔ 512MB 규율 — 실측으로 밝힌 것들 (2026-10-07 OOM)
 
 Render 무료티어는 **512MB 한 칸**에 파이썬 워커 + `claude -p` 가 같이 산다. 실측:

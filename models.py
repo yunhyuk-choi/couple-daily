@@ -25,15 +25,27 @@ def run_startup_migrations():
       * add the ``kakao_id`` column if missing,
       * drop NOT NULL on ``email`` / ``password_hash`` (Kakao users have neither).
 
-    Works on both SQLite and PostgreSQL, and is safe to run repeatedly. Any
-    failure is logged and swallowed so a migration hiccup never crashes boot.
+    Works on both SQLite and PostgreSQL, and is safe to run repeatedly. A
+    migration hiccup never raises (one failed column must not block the rest),
+    but it is **never silent**: every failure is logged AND returned.
+
+    Returns the list of failure messages — empty means every step succeeded.
+    The caller (``app._bootstrap_db``) surfaces it on ``/readyz``.
     """
+    failures = []
+
+    def _mig_fail(msg, *args):
+        # log.exception 은 except 블록 안에서 불려야 트레이스백이 붙는다 — 호출처가
+        # 전부 except 안이다. 로그에 남기는 것과 같은 문장을 호출자에게도 돌려준다.
+        log.exception(msg, *args)
+        failures.append((msg % args) if args else msg)
+
     engine = db.engine
     dialect = engine.dialect.name  # 'sqlite' | 'postgresql' | ...
     try:
         insp = inspect(engine)
         if "users" not in insp.get_table_names():
-            return  # fresh DB — create_all() already made the current schema
+            return failures  # fresh DB — create_all() already made the current schema
 
         cols = {c["name"]: c for c in insp.get_columns("users")}
 
@@ -44,7 +56,7 @@ def run_startup_migrations():
                     conn.execute(text("ALTER TABLE users ADD COLUMN kakao_id VARCHAR"))
                 log.info("startup migration: added users.kakao_id")
             except Exception:  # noqa: BLE001
-                log.exception("startup migration: failed adding users.kakao_id")
+                _mig_fail("startup migration: failed adding users.kakao_id")
 
         # 1b) add profile_image_url (Kakao profile photo) if it's missing
         if "profile_image_url" not in cols:
@@ -55,7 +67,7 @@ def run_startup_migrations():
                     )
                 log.info("startup migration: added users.profile_image_url")
             except Exception:  # noqa: BLE001
-                log.exception(
+                _mig_fail(
                     "startup migration: failed adding users.profile_image_url"
                 )
 
@@ -66,7 +78,7 @@ def run_startup_migrations():
                     conn.execute(text("ALTER TABLE users ADD COLUMN export_key VARCHAR"))
                 log.info("startup migration: added users.export_key")
             except Exception:  # noqa: BLE001
-                log.exception("startup migration: failed adding users.export_key")
+                _mig_fail("startup migration: failed adding users.export_key")
 
         # 1d) 네이버 API HUB 자격증명(키워드 조사용) — **사용자별**. 두 사람의 키가
         #     다를 수 있어 커플이 아니라 users에 둔다. 둘 다 nullable이라 기존 행은
@@ -83,7 +95,7 @@ def run_startup_migrations():
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
                 log.info("startup migration: added users.%s", col)
             except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                log.exception("startup migration: failed adding users.%s", col)
+                _mig_fail("startup migration: failed adding users.%s", col)
 
         # 2) drop NOT NULL on email / password_hash so Kakao users can exist.
         #    SQLite cannot ALTER a column's nullability in place; older SQLite
@@ -100,7 +112,7 @@ def run_startup_migrations():
                             )
                         log.info("startup migration: dropped NOT NULL on users.%s", col)
                     except Exception:  # noqa: BLE001
-                        log.exception(
+                        _mig_fail(
                             "startup migration: failed dropping NOT NULL on users.%s", col
                         )
 
@@ -118,7 +130,7 @@ def run_startup_migrations():
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
                 log.info("startup migration: added users.%s", col)
             except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                log.exception("startup migration: failed adding users.%s", col)
+                _mig_fail("startup migration: failed adding users.%s", col)
 
         # 3) photos: Phase-2 vision captioning columns (tags + caption_status).
         #    The `photos` table pre-exists from Phase 1; add the two new columns
@@ -134,7 +146,7 @@ def run_startup_migrations():
                         conn.execute(text("ALTER TABLE photos ADD COLUMN tags TEXT"))
                     log.info("startup migration: added photos.tags")
                 except Exception:  # noqa: BLE001
-                    log.exception("startup migration: failed adding photos.tags")
+                    _mig_fail("startup migration: failed adding photos.tags")
             if "caption_status" not in pcols:
                 try:
                     with engine.begin() as conn:
@@ -146,7 +158,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added photos.caption_status")
                 except Exception:  # noqa: BLE001
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding photos.caption_status"
                     )
             # photos.taken_at: EXIF 촬영일시 컬럼. 없을 때만 추가한다. Postgres·
@@ -160,7 +172,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added photos.taken_at")
                 except Exception:  # noqa: BLE001
-                    log.exception("startup migration: failed adding photos.taken_at")
+                    _mig_fail("startup migration: failed adding photos.taken_at")
             # photos.upload_token: 파일 한 장의 업로드 시도 멱등 키. 없으면 NULL
             # (옛 사진·토큰 없는 옛 폼). 컬럼이 있어야 인덱스를 만들 수 있다.
             if "upload_token" not in pcols:
@@ -171,7 +183,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added photos.upload_token")
                 except Exception:  # noqa: BLE001
-                    log.exception("startup migration: failed adding photos.upload_token")
+                    _mig_fail("startup migration: failed adding photos.upload_token")
             # create_all 은 이미 있는 테이블에 인덱스를 붙이지 않으므로 여기서 붙인다.
             # IF NOT EXISTS 는 PG·SQLite 모두 지원하고 반복 실행에 멱등하다.
             try:
@@ -181,7 +193,7 @@ def run_startup_migrations():
                         "ON photos (couple_id, upload_token)"
                     ))
             except Exception:  # noqa: BLE001
-                log.exception(
+                _mig_fail(
                     "startup migration: failed creating uq_photos_couple_upload_token"
                 )
         # videos.onedrive_item_id 유니크 — /videos/complete 의 '조회 후 삽입' 경쟁 방어.
@@ -195,7 +207,7 @@ def run_startup_migrations():
                         "ON videos (onedrive_item_id)"
                     ))
             except Exception:  # noqa: BLE001
-                log.exception(
+                _mig_fail(
                     "startup migration: uq_videos_onedrive_item 유니크 인덱스를 못 만들었다 "
                     "— videos 에 onedrive_item_id 중복 행이 있을 가능성이 크다. 중복을 "
                     "정리하기 전까지 /videos/complete 동시 요청 보호가 **없다**"
@@ -218,7 +230,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added monthly_reports.report_json")
                 except Exception:  # noqa: BLE001
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding monthly_reports.report_json"
                     )
 
@@ -236,7 +248,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added calendar_schedules.end_date")
                 except Exception:  # noqa: BLE001
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding calendar_schedules.end_date"
                     )
             # 일정 시작 시각(선택) start_time. 없을 때만 추가한다. Postgres·SQLite
@@ -251,7 +263,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added calendar_schedules.start_time")
                 except Exception:  # noqa: BLE001
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding calendar_schedules.start_time"
                     )
 
@@ -266,7 +278,7 @@ def run_startup_migrations():
                         conn.execute(text("ALTER TABLE bets ADD COLUMN end_date DATE"))
                     log.info("startup migration: added bets.end_date")
                 except Exception:  # noqa: BLE001
-                    log.exception("startup migration: failed adding bets.end_date")
+                    _mig_fail("startup migration: failed adding bets.end_date")
 
         # 7) blog_reviews: v2 '재료' 칸 8개. blog_reviews 테이블은 프로덕션에 이미
         #    존재하므로 create_all이 ALTER하지 않는다 — 없는 컬럼만 추가한다.
@@ -310,7 +322,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added blog_reviews.%s", col)
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding blog_reviews.%s", col
                     )
             # 멱등 키의 유니크 인덱스. 컬럼이 있어야 만들 수 있다. IF NOT EXISTS 는
@@ -323,7 +335,7 @@ def run_startup_migrations():
                         "ON blog_reviews (couple_id, submit_token)"
                     ))
             except Exception:  # noqa: BLE001
-                log.exception(
+                _mig_fail(
                     "startup migration: failed creating uq_blog_reviews_couple_token"
                 )
 
@@ -346,7 +358,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added ai_jobs.%s", col)
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                    log.exception("startup migration: failed adding ai_jobs.%s", col)
+                    _mig_fail("startup migration: failed adding ai_jobs.%s", col)
 
         # 8b) blog_reviews 서술형 네 칸을 VARCHAR(300) → TEXT 로 넓힌다.
         #     본문 하한(1,200자)을 채울 재료가 들어가야 한다 — 근거는 모델의 컬럼
@@ -370,7 +382,7 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: widened blog_reviews.%s to TEXT", col)
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed widening blog_reviews.%s", col
                     )
 
@@ -394,11 +406,12 @@ def run_startup_migrations():
                         )
                     log.info("startup migration: added event_scores.%s", col)
                 except Exception:  # noqa: BLE001 — 한 컬럼 실패가 나머지를 막지 않게
-                    log.exception(
+                    _mig_fail(
                         "startup migration: failed adding event_scores.%s", col
                     )
-    except Exception:  # noqa: BLE001 — never let a migration hiccup crash boot
-        log.exception("startup migration: unexpected error; continuing boot")
+    except Exception:  # noqa: BLE001 — never raise out of here (boot must not die)
+        _mig_fail("startup migration: unexpected error; continuing boot")
+    return failures
 
 
 class Couple(db.Model):
